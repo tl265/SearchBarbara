@@ -42,7 +42,8 @@ Options:
 - `--resume-from` resume from a previous checkpoint state JSON
 - `--report-file` optional custom path for final report output
 - `--quiet` disable progress logs
-- `--model` OpenAI model name (defaults to `OPENAI_MODEL` or `gpt-4.1`)
+- `--model` research model for planning/search/synthesis/sufficiency (defaults to `OPENAI_MODEL` or `gpt-4.1`)
+- `--report-model` final report model (defaults to `OPENAI_REPORT_MODEL` or `gpt-5.2`)
 
 ## Notes
 

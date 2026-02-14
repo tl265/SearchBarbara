@@ -241,6 +241,7 @@ class DeepResearchAgent:
     def __init__(
         self,
         model: str,
+        report_model: str,
         max_rounds: int,
         results_per_query: int,
         trace_file: str = "",
@@ -249,6 +250,7 @@ class DeepResearchAgent:
         verbose: bool = True,
     ) -> None:
         self.llm = LLM(model=model)
+        self.report_llm = LLM(model=report_model)
         self.search = WebSearch(model=model)
         self.max_rounds = max_rounds
         self.results_per_query = results_per_query
@@ -322,6 +324,7 @@ class DeepResearchAgent:
             trace = {
                 "task": task,
                 "model": self.llm.model,
+                "report_model": self.report_llm.model,
                 "started_at": started_at,
                 "max_rounds": self.max_rounds,
                 "results_per_query": self.results_per_query,
@@ -630,7 +633,7 @@ Known success criteria:
                 evidence_note=evidence_note,
                 search_stats=trace["search_stats"],
             )
-            report = self.llm.text(SYSTEM_REPORT, report_prompt)
+            report = self.report_llm.text(SYSTEM_REPORT, report_prompt)
             trace["finished_at"] = self._now_iso()
             trace["final_sufficiency"] = final_suff
             trace["report"] = report
@@ -1088,7 +1091,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Deep Research Agent")
     parser.add_argument("task", help="Research task prompt")
     parser.add_argument(
-        "--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1"), help="OpenAI model"
+        "--model", default=os.getenv("OPENAI_MODEL", "gpt-4.1"), help="Research model"
+    )
+    parser.add_argument(
+        "--report-model",
+        default=os.getenv("OPENAI_REPORT_MODEL", "gpt-5.2"),
+        help="Final report model",
     )
     parser.add_argument(
         "--max-rounds", type=int, default=4, help="Max iterative research rounds"
@@ -1131,6 +1139,7 @@ def main() -> None:
 
     agent = DeepResearchAgent(
         model=args.model,
+        report_model=args.report_model,
         max_rounds=args.max_rounds,
         results_per_query=args.results_per_query,
         trace_file=args.trace_file,
