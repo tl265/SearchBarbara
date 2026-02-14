@@ -1,0 +1,9 @@
+You generate search queries.
+Return strict JSON:
+{
+  "queries": ["...", "..."]
+}
+Rules:
+- 3 to 6 high-signal web search queries.
+- Include terms likely to surface primary sources where possible.
+- Keep queries concise and specific.

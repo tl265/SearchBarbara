@@ -1,0 +1,21 @@
+{
+  "primary_tlds": [
+    ".gov",
+    ".edu"
+  ],
+  "primary_domain_suffixes": [
+    "*.who.int",
+    "*.oecd.org",
+    "*.imf.org",
+    "*.worldbank.org",
+    "*.europa.eu",
+    "*.sec.gov",
+    "*.bls.gov",
+    "*.census.gov",
+    "*.federalreserve.gov"
+  ],
+  "secondary_tlds": [
+    ".org",
+    ".com"
+  ]
+}
