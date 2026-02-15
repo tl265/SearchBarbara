@@ -122,41 +122,244 @@ class SubQuestionFinding:
     uncertainties: List[str] = field(default_factory=list)
 
 
+class UsageTracker:
+    def __init__(
+        self,
+        enabled: bool,
+        cost_enabled: bool,
+        pricing_source: str,
+        pricing_models: Dict[str, Dict[str, float]],
+        pricing_default: Dict[str, float],
+    ) -> None:
+        self.enabled = enabled
+        self.cost_enabled = cost_enabled
+        self.pricing_source = pricing_source
+        self.pricing_models = pricing_models
+        self.pricing_default = pricing_default
+        self.events: List[Dict[str, Any]] = []
+
+    def record(
+        self,
+        stage: str,
+        provider: str,
+        model: str,
+        usage: Any,
+        attempt: int,
+        metadata: Dict[str, Any] | None = None,
+    ) -> None:
+        if not self.enabled:
+            return
+        input_tokens, output_tokens, total_tokens, usage_missing = self._extract_usage(
+            usage
+        )
+        cost = self._estimate_cost(model, input_tokens, output_tokens)
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage": stage,
+            "provider": provider,
+            "model": model,
+            "attempt": attempt,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+            "estimated_cost_usd": round(cost, 8),
+            "metadata": metadata or {},
+        }
+        if usage_missing:
+            event["metadata"]["usage_missing"] = True
+        if self.cost_enabled and self._model_missing_in_pricing(model):
+            event["metadata"]["pricing_fallback"] = True
+        self.events.append(event)
+
+    def _extract_usage(self, usage: Any) -> tuple[int, int, int, bool]:
+        if usage is None:
+            return 0, 0, 0, True
+
+        def pick_int(obj: Any, keys: List[str]) -> int:
+            for key in keys:
+                val = None
+                if isinstance(obj, dict):
+                    val = obj.get(key)
+                else:
+                    val = getattr(obj, key, None)
+                if isinstance(val, int):
+                    return val
+            return 0
+
+        input_tokens = pick_int(usage, ["prompt_tokens", "input_tokens"])
+        output_tokens = pick_int(usage, ["completion_tokens", "output_tokens"])
+        total_tokens = pick_int(usage, ["total_tokens"])
+        if total_tokens == 0:
+            total_tokens = input_tokens + output_tokens
+        return input_tokens, output_tokens, total_tokens, False
+
+    def _model_missing_in_pricing(self, model: str) -> bool:
+        if not self.cost_enabled:
+            return False
+        return model not in self.pricing_models
+
+    def _estimate_cost(self, model: str, input_tokens: int, output_tokens: int) -> float:
+        if not self.cost_enabled:
+            return 0.0
+        rates = self.pricing_models.get(model, self.pricing_default)
+        in_rate = float(rates.get("input_per_1m", 0.0))
+        out_rate = float(rates.get("output_per_1m", 0.0))
+        return (input_tokens / 1_000_000.0) * in_rate + (
+            output_tokens / 1_000_000.0
+        ) * out_rate
+
+    def to_dict(self) -> Dict[str, Any]:
+        by_stage: Dict[str, Dict[str, float]] = {}
+        by_model: Dict[str, Dict[str, float]] = {}
+        totals = {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "estimated_cost_usd": 0.0,
+            "calls": len(self.events),
+        }
+        for e in self.events:
+            stage = e["stage"]
+            model = e["model"]
+            for bucket, key in ((by_stage, stage), (by_model, model)):
+                if key not in bucket:
+                    bucket[key] = {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "estimated_cost_usd": 0.0,
+                        "calls": 0,
+                    }
+                bucket[key]["input_tokens"] += e["input_tokens"]
+                bucket[key]["output_tokens"] += e["output_tokens"]
+                bucket[key]["total_tokens"] += e["total_tokens"]
+                bucket[key]["estimated_cost_usd"] += e["estimated_cost_usd"]
+                bucket[key]["calls"] += 1
+            totals["input_tokens"] += e["input_tokens"]
+            totals["output_tokens"] += e["output_tokens"]
+            totals["total_tokens"] += e["total_tokens"]
+            totals["estimated_cost_usd"] += e["estimated_cost_usd"]
+
+        totals["estimated_cost_usd"] = round(totals["estimated_cost_usd"], 8)
+        for bucket in (by_stage, by_model):
+            for key in bucket:
+                bucket[key]["estimated_cost_usd"] = round(
+                    bucket[key]["estimated_cost_usd"], 8
+                )
+
+        return {
+            "enabled": self.enabled,
+            "cost_enabled": self.cost_enabled,
+            "pricing_source": self.pricing_source,
+            "events": self.events,
+            "by_stage": by_stage,
+            "by_model": by_model,
+            "total": totals,
+        }
+
+    def load_from_dict(self, data: Any) -> None:
+        if not isinstance(data, dict):
+            return
+        events = data.get("events", [])
+        if isinstance(events, list):
+            self.events = [e for e in events if isinstance(e, dict)]
+
+
+def load_pricing_config(path_str: str) -> tuple[Dict[str, Dict[str, float]], Dict[str, float], str]:
+    path = Path(path_str)
+    if not path.exists():
+        return {}, {"input_per_1m": 0.0, "output_per_1m": 0.0}, f"{path} (missing)"
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    models_raw = raw.get("models", {}) if isinstance(raw, dict) else {}
+    default_raw = raw.get("default", {}) if isinstance(raw, dict) else {}
+    models: Dict[str, Dict[str, float]] = {}
+    if isinstance(models_raw, dict):
+        for model, rates in models_raw.items():
+            if not isinstance(rates, dict):
+                continue
+            models[str(model)] = {
+                "input_per_1m": float(rates.get("input_per_1m", 0.0)),
+                "output_per_1m": float(rates.get("output_per_1m", 0.0)),
+            }
+    default = {
+        "input_per_1m": float(default_raw.get("input_per_1m", 0.0))
+        if isinstance(default_raw, dict)
+        else 0.0,
+        "output_per_1m": float(default_raw.get("output_per_1m", 0.0))
+        if isinstance(default_raw, dict)
+        else 0.0,
+    }
+    return models, default, str(path)
+
+
 class LLM:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, usage_tracker: UsageTracker | None = None) -> None:
         self.client = OpenAI()
         self.model = model
         self.max_retries = 3
+        self.usage_tracker = usage_tracker
 
-    def json(self, system_prompt: str, user_prompt: str) -> Dict[str, Any]:
+    def json(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        stage: str = "unknown",
+        metadata: Dict[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         rsp = self._chat_completion(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             response_format={"type": "json_object"},
+            stage=stage,
+            metadata=metadata,
         )
         text = rsp.choices[0].message.content or "{}"
         return json.loads(text)
 
-    def text(self, system_prompt: str, user_prompt: str) -> str:
+    def text(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        stage: str = "unknown",
+        metadata: Dict[str, Any] | None = None,
+    ) -> str:
         rsp = self._chat_completion(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ]
+            ],
+            stage=stage,
+            metadata=metadata,
         )
         return rsp.choices[0].message.content or ""
 
-    def _chat_completion(self, messages: List[Dict[str, str]], **kwargs: Any) -> Any:
+    def _chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        stage: str,
+        metadata: Dict[str, Any] | None,
+        **kwargs: Any,
+    ) -> Any:
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
-                return self.client.chat.completions.create(
+                rsp = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     **kwargs,
                 )
+                if self.usage_tracker:
+                    self.usage_tracker.record(
+                        stage=stage,
+                        provider="chat.completions",
+                        model=self.model,
+                        usage=getattr(rsp, "usage", None),
+                        attempt=attempt + 1,
+                        metadata=metadata,
+                    )
+                return rsp
             except RateLimitError as exc:
                 last_exc = exc
                 # Exponential backoff for transient rate-limit pressure.
@@ -170,9 +373,10 @@ class LLM:
 
 
 class WebSearch:
-    def __init__(self, model: str) -> None:
+    def __init__(self, model: str, usage_tracker: UsageTracker | None = None) -> None:
         self.client = OpenAI()
         self.model = model
+        self.usage_tracker = usage_tracker
         # Default to the current Responses API web search tool first,
         # with a compatibility fallback.
         tool_types = os.getenv(
@@ -208,6 +412,15 @@ class WebSearch:
                     tool_choice={"type": tool_type},
                     input=prompt,
                 )
+                if self.usage_tracker:
+                    self.usage_tracker.record(
+                        stage="web_search",
+                        provider="responses",
+                        model=self.model,
+                        usage=getattr(rsp, "usage", None),
+                        attempt=1,
+                        metadata={"query": query, "tool_type": tool_type},
+                    )
                 data = self._parse_results_json(rsp.output_text)
                 items = data.get("results", [])[:k]
                 return [
@@ -247,21 +460,61 @@ class DeepResearchAgent:
         trace_file: str = "",
         state_file: str = "",
         resume_from: str = "",
+        token_breakdown: bool = True,
+        usage_file: str = "",
+        pricing_file: str = "pricing.json",
+        cost_estimate_enabled: bool = True,
         verbose: bool = True,
     ) -> None:
-        self.llm = LLM(model=model)
-        self.report_llm = LLM(model=report_model)
-        self.search = WebSearch(model=model)
+        pricing_error = ""
+        if cost_estimate_enabled:
+            try:
+                pricing_models, pricing_default, pricing_source = load_pricing_config(
+                    pricing_file
+                )
+            except Exception as exc:
+                pricing_models, pricing_default, pricing_source = (
+                    {},
+                    {"input_per_1m": 0.0, "output_per_1m": 0.0},
+                    f"{pricing_file} (invalid)",
+                )
+                pricing_error = str(exc)
+        else:
+            pricing_models, pricing_default, pricing_source = (
+                {},
+                {"input_per_1m": 0.0, "output_per_1m": 0.0},
+                f"{pricing_file} (skipped: cost estimation disabled)",
+            )
+        self.usage_tracker = UsageTracker(
+            enabled=token_breakdown,
+            cost_enabled=cost_estimate_enabled,
+            pricing_source=pricing_source,
+            pricing_models=pricing_models,
+            pricing_default=pricing_default,
+        )
+        self.llm = LLM(model=model, usage_tracker=self.usage_tracker)
+        self.report_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
+        self.search = WebSearch(model=model, usage_tracker=self.usage_tracker)
         self.max_rounds = max_rounds
         self.results_per_query = results_per_query
         self.trace_file = trace_file
         self.state_file = state_file
         self.resume_from = resume_from
+        self.token_breakdown = token_breakdown
+        self.usage_file = usage_file
+        self.pricing_file = pricing_file
+        self.cost_estimate_enabled = cost_estimate_enabled
+        self.pricing_error = pricing_error
         self.verbose = verbose
         self.source_policy = load_source_policy()
 
     def run(self, task: str) -> str:
         self._log("Starting deep research run.")
+        if self.pricing_error:
+            self._log(
+                "Pricing config invalid; cost estimation falling back to zeros. "
+                f"error={self.pricing_error}"
+            )
         started_at = self._now_iso()
         state_path = self._resolve_state_path(task, started_at)
         query_history: List[Dict[str, Any]] = []
@@ -316,6 +569,7 @@ class DeepResearchAgent:
                     "completed_query_steps",
                 )
             )
+            self.usage_tracker.load_from_dict(resume_state.get("token_usage", {}))
             start_round = max(1, int(resume_state.get("next_round", 1)))
             self._log(
                 f"Resuming from {state_path} at round {start_round}."
@@ -325,6 +579,9 @@ class DeepResearchAgent:
                 "task": task,
                 "model": self.llm.model,
                 "report_model": self.report_llm.model,
+                "token_breakdown_enabled": self.token_breakdown,
+                "cost_estimate_enabled": self.cost_estimate_enabled,
+                "pricing_source": self.usage_tracker.pricing_source,
                 "started_at": started_at,
                 "max_rounds": self.max_rounds,
                 "results_per_query": self.results_per_query,
@@ -332,7 +589,12 @@ class DeepResearchAgent:
                 "source_policy_file": str(SOURCE_POLICY_PATH),
             }
             self._log("Decomposing task into sub-questions and success criteria.")
-            plan = self.llm.json(SYSTEM_DECOMPOSE, f"Task:\n{task}")
+            plan = self.llm.json(
+                SYSTEM_DECOMPOSE,
+                f"Task:\n{task}",
+                stage="decompose",
+                metadata={"task": self._trim_text(task, 120)},
+            )
             sub_questions = self._normalize_llm_list(
                 plan.get("sub_questions"), "sub_questions"
             )
@@ -407,7 +669,15 @@ Sub-question:
 Known success criteria:
 {json.dumps(success_criteria, ensure_ascii=True)}
 """
-                    qobj = self.llm.json(SYSTEM_QUERY_GEN, query_prompt)
+                    qobj = self.llm.json(
+                        SYSTEM_QUERY_GEN,
+                        query_prompt,
+                        stage="query_gen",
+                        metadata={
+                            "round": round_i,
+                            "sub_question": self._trim_text(sq, 120),
+                        },
+                    )
                     generated_queries = self._normalize_llm_list(
                         qobj.get("queries"), "queries"
                     )
@@ -493,11 +763,26 @@ Known success criteria:
                         synth_prompt = self._format_synthesis_prompt(
                             sq, query, selected_results
                         )
-                        sobj = self.llm.json(SYSTEM_SYNTHESIZE, synth_prompt)
+                        sobj = self.llm.json(
+                            SYSTEM_SYNTHESIZE,
+                            synth_prompt,
+                            stage="synthesize",
+                            metadata={
+                                "round": round_i,
+                                "sub_question": self._trim_text(sq, 120),
+                                "query": self._trim_text(query, 140),
+                            },
+                        )
                         self._log("Synthesis completed for this query.")
-                        findings[sq].summaries.append(sobj.get("summary", ""))
-                        findings[sq].facts.extend(sobj.get("facts", []))
-                        findings[sq].uncertainties.extend(sobj.get("uncertainties", []))
+                        findings[sq].summaries.append(str(sobj.get("summary", "")))
+                        findings[sq].facts.extend(
+                            self._normalize_synth_facts(sobj.get("facts", []))
+                        )
+                        findings[sq].uncertainties.extend(
+                            self._normalize_llm_list(
+                                sobj.get("uncertainties"), "synthesis_uncertainties"
+                            )
+                        )
                         step_data = {
                             "round": round_i,
                             "sub_question": sq,
@@ -550,6 +835,8 @@ Known success criteria:
                         findings=findings,
                         round_i=round_i,
                     ),
+                    stage="sufficiency",
+                    metadata={"round": round_i},
                 )
                 final_suff = suff
                 round_trace["sufficiency"] = suff
@@ -633,12 +920,22 @@ Known success criteria:
                 evidence_note=evidence_note,
                 search_stats=trace["search_stats"],
             )
-            report = self.report_llm.text(SYSTEM_REPORT, report_prompt)
+            report = self.report_llm.text(
+                SYSTEM_REPORT,
+                report_prompt,
+                stage="report",
+                metadata={"task": self._trim_text(task, 120)},
+            )
             trace["finished_at"] = self._now_iso()
             trace["final_sufficiency"] = final_suff
             trace["report"] = report
+            trace["token_usage"] = self.usage_tracker.to_dict()
             trace_path = self._write_trace(trace)
             print(f"[trace] saved: {trace_path}")
+            self._print_token_summary(self.usage_tracker.to_dict())
+            if self.usage_file:
+                usage_path = self._write_usage_report(self.usage_tracker.to_dict())
+                print(f"[usage] saved: {usage_path}")
             self._save_state(
                 state_path=state_path,
                 status="completed",
@@ -662,6 +959,7 @@ Known success criteria:
             self._log("Run completed.")
             return report
         except Exception as exc:
+            trace["token_usage"] = self.usage_tracker.to_dict()
             self._save_state(
                 state_path=state_path,
                 status="failed",
@@ -812,6 +1110,8 @@ Known success criteria:
     def _compact_facts(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for fact in facts:
+            if not isinstance(fact, dict):
+                continue
             claim = self._trim_text(str(fact.get("claim", "")), 240)
             srcs = fact.get("sources", [])
             if not isinstance(srcs, list):
@@ -828,6 +1128,30 @@ Known success criteria:
         if len(text) <= max_len:
             return text
         return text[: max_len - 3] + "..."
+
+    def _normalize_synth_facts(self, value: Any) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            self._log("LLM field 'synthesis_facts' is non-list; coercing to empty list.")
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            claim = str(item.get("claim", "")).strip()
+            if not claim:
+                continue
+            srcs_raw = item.get("sources", [])
+            if not isinstance(srcs_raw, list):
+                srcs_raw = []
+            sources = [
+                s.strip()
+                for s in srcs_raw
+                if isinstance(s, str) and is_valid_absolute_http_url(s)
+            ]
+            out.append({"claim": claim, "sources": sources})
+        if len(out) != len(value):
+            self._log("LLM field 'synthesis_facts' contained invalid entries; cleaned.")
+        return out
 
     def _assess_evidence_strength(
         self,
@@ -937,10 +1261,16 @@ Known success criteria:
             if not isinstance(v, dict):
                 continue
             sq = str(v.get("sub_question", k))
+            facts_raw = v.get("facts", [])
+            facts: List[Dict[str, Any]] = []
+            if isinstance(facts_raw, list):
+                for item in facts_raw:
+                    if isinstance(item, dict):
+                        facts.append(item)
             out[str(k)] = SubQuestionFinding(
                 sub_question=sq,
                 summaries=as_clean_str_list(v.get("summaries", [])),
-                facts=v.get("facts", []) if isinstance(v.get("facts", []), list) else [],
+                facts=facts,
                 uncertainties=as_clean_str_list(v.get("uncertainties", [])),
             )
         return out
@@ -992,6 +1322,7 @@ Known success criteria:
             "status": status,
             "task": task,
             "model": self.llm.model,
+            "report_model": self.report_llm.model,
             "started_at": started_at,
             "updated_at": self._now_iso(),
             "next_round": next_round,
@@ -1009,6 +1340,7 @@ Known success criteria:
             },
             "query_history": query_history,
             "completed_query_steps": sorted(completed_query_steps),
+            "token_usage": self.usage_tracker.to_dict(),
             "trace": trace,
             "error": error,
         }
@@ -1027,6 +1359,37 @@ Known success criteria:
             path = runs_dir / f"research_trace_{ts}.json"
         path.write_text(json.dumps(trace, ensure_ascii=True, indent=2))
         return str(path)
+
+    def _write_usage_report(self, usage: Dict[str, Any]) -> str:
+        path = Path(self.usage_file)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(usage, ensure_ascii=True, indent=2), encoding="utf-8")
+        return str(path)
+
+    def _print_token_summary(self, usage: Dict[str, Any]) -> None:
+        if not self.token_breakdown:
+            return
+        total = usage.get("total", {})
+        by_stage = usage.get("by_stage", {})
+        print("[usage] token breakdown")
+        print(
+            "[usage] total "
+            f"in={total.get('input_tokens', 0)} "
+            f"out={total.get('output_tokens', 0)} "
+            f"all={total.get('total_tokens', 0)} "
+            f"calls={total.get('calls', 0)} "
+            f"cost_usd={total.get('estimated_cost_usd', 0.0)}"
+        )
+        top = sorted(
+            [
+                (stage, stats.get("total_tokens", 0), stats.get("estimated_cost_usd", 0.0))
+                for stage, stats in by_stage.items()
+            ],
+            key=lambda x: x[1],
+            reverse=True,
+        )[:6]
+        for stage, tok, cost in top:
+            print(f"[usage] stage={stage} tokens={tok} cost_usd={cost}")
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
@@ -1125,6 +1488,26 @@ def main() -> None:
         help="Optional path for final report output (markdown text)",
     )
     parser.add_argument(
+        "--usage-file",
+        default="",
+        help="Optional path for standalone token usage report JSON",
+    )
+    parser.add_argument(
+        "--pricing-file",
+        default=os.getenv("OPENAI_PRICING_FILE", "pricing.json"),
+        help="Pricing config JSON used for cost estimation",
+    )
+    parser.add_argument(
+        "--no-token-breakdown",
+        action="store_true",
+        help="Disable token usage tracking and summary output",
+    )
+    parser.add_argument(
+        "--no-cost-estimate",
+        action="store_true",
+        help="Disable USD cost estimation while keeping token tracking",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         default=True,
@@ -1145,6 +1528,10 @@ def main() -> None:
         trace_file=args.trace_file,
         state_file=args.state_file,
         resume_from=args.resume_from,
+        token_breakdown=not args.no_token_breakdown,
+        usage_file=args.usage_file,
+        pricing_file=args.pricing_file,
+        cost_estimate_enabled=not args.no_cost_estimate,
         verbose=(args.verbose and not args.quiet),
     )
     report = agent.run(args.task)

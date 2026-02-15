@@ -25,6 +25,7 @@ Optional model override:
 
 ```bash
 export OPENAI_MODEL=gpt-4.1
+export OPENAI_REPORT_MODEL=gpt-5.2
 ```
 
 ## Usage
@@ -41,6 +42,10 @@ Options:
 - `--state-file` optional custom path for incremental checkpoint state JSON
 - `--resume-from` resume from a previous checkpoint state JSON
 - `--report-file` optional custom path for final report output
+- `--usage-file` optional custom path for standalone token usage JSON
+- `--pricing-file` pricing config JSON for cost estimation (default `pricing.json`)
+- `--no-token-breakdown` disable token tracking and usage summary
+- `--no-cost-estimate` disable cost estimation while keeping token tracking
 - `--quiet` disable progress logs
 - `--model` research model for planning/search/synthesis/sufficiency (defaults to `OPENAI_MODEL` or `gpt-4.1`)
 - `--report-model` final report model (defaults to `OPENAI_REPORT_MODEL` or `gpt-5.2`)
@@ -56,6 +61,9 @@ Options:
 - Use `--resume-from path/to/state.json` to continue from the latest checkpoint.
 - Each run writes the final report to `reports/report_<query-slug>_<timestamp>.md` by default.
 - Use `--report-file path/to/report.md` to override the report output path.
+- Each run records per-call token usage and stage/model aggregates in trace/state by default.
+- Use `--usage-file path/to/usage.json` to export standalone token/cost breakdown.
+- Cost estimates are config-based and loaded from `pricing.json` (or `--pricing-file`).
 - Search results are quality-ranked to prioritize official and primary domains before synthesis.
 - Progress messages are printed during execution so you can monitor direction in real time.
 - If a query has no usable evidence, synthesis is skipped and the limitation is logged/traced.
