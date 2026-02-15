@@ -1,10 +1,10 @@
 # SearchBarbara
 
 Iterative deep research agent that:
-1. decomposes a research task into sub-questions
+1. starts from the original task as a single root node
 2. searches proactively for external evidence
-3. checks if evidence is sufficient
-4. repeats until sufficient or max rounds
+3. tries to answer each node directly, then decomposes deeper only if evidence is insufficient
+4. checks sufficiency and runs focused follow-up passes until sufficient or max rounds/depth
 5. outputs a final report using Barbara Minto's Pyramid Principle
 
 ## Setup
@@ -34,10 +34,33 @@ export OPENAI_REPORT_MODEL=gpt-5.2
 python deep_research_agent.py "Should our B2B SaaS expand into the German market in 2026?"
 ```
 
+## Web App (MVP)
+
+Run the local web interface:
+
+```bash
+python run_web.py
+```
+
+Then open:
+
+```text
+http://<your-vm-ip>:8000/
+```
+
+Key web endpoints:
+
+- `POST /api/runs`
+- `GET /api/runs/{run_id}`
+- `GET /api/runs/{run_id}/events` (SSE)
+- `GET /api/runs/{run_id}/report/download`
+- `POST /api/runs/{run_id}/abort` (temporary debug control)
+
 Options:
 
-- `--max-rounds` max iterative research rounds (default `4`)
-- `--results-per-query` results per web query (default `5`)
+- `--max-depth` max recursive decomposition depth per question node (default `4`)
+- `--max-rounds` max iterative research rounds (default `1`)
+- `--results-per-query` baseline results per web query before adaptive broadening (default `3`)
 - `--trace-file` optional custom path for execution trace JSON
 - `--state-file` optional custom path for incremental checkpoint state JSON
 - `--resume-from` resume from a previous checkpoint state JSON
@@ -69,6 +92,10 @@ Options:
 - If a query has no usable evidence, synthesis is skipped and the limitation is logged/traced.
 - Final reports explicitly acknowledge limitations when evidence quality is meager or absent.
 - Sufficiency follow-up queries are deduplicated and assigned once to the best-fit sub-question (no drop, no duplicate fan-out across all sub-questions).
+- Repeated queries are conditionally deduped with cache reuse by intent; reruns require explicit justification (freshness/errors/recheck).
+- When rerunning the same intent, retrieval is broadened progressively to increase information gain.
+- Frontier execution is depth-aware: unresolved nodes can decompose into child sub-questions until `--max-depth`.
+- Task traversal is lazy-first and depth-first: each node tries direct search first, then decomposes and explores children before moving to sibling branches.
 - Large evidence payloads are compacted before sufficiency/report calls to reduce token pressure.
 - LLM calls use retry with backoff on rate limits.
 
@@ -83,6 +110,18 @@ System prompts for each sub-agent are stored as separate files in `prompts/`:
 - `prompts/report.system.txt`
 
 Edit these files to change sub-agent behavior without changing Python code.
+
+## Search Policy Customization
+
+Query reuse/rerun controls are stored in `search_policy.json`:
+
+- `cache_ttl_seconds`
+- `max_broaden_steps`
+- `broaden_k_multipliers`
+- `min_new_fact_gain`
+- `max_no_gain_retries_per_intent`
+- `time_sensitive_terms`
+- `allow_rerun_on_search_error`
 
 ## Source Policy Customization
 

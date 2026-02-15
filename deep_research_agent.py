@@ -6,13 +6,25 @@ import textwrap
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from openai import OpenAI, RateLimitError
 
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 SOURCE_POLICY_PATH = Path(__file__).resolve().parent / "source_policy.json"
+SEARCH_POLICY_PATH = Path(__file__).resolve().parent / "search_policy.json"
+
+DEFAULT_SEARCH_POLICY: Dict[str, Any] = {
+    "cache_ttl_seconds": 3600,
+    "max_broaden_steps": 2,
+    "broaden_k_multipliers": [1, 2, 3],
+    "min_new_fact_gain": 1,
+    "max_no_gain_retries_per_intent": 2,
+    "time_sensitive_terms": ["latest", "today", "current", "update", "new"],
+    "allow_rerun_on_search_error": True,
+    "intent_collapse_similarity": 0.55,
+}
 
 
 def load_prompt(filename: str) -> str:
@@ -36,6 +48,43 @@ def load_source_policy() -> Dict[str, List[str]]:
         "primary_domain_suffixes": primary_domain_suffixes,
         "secondary_tlds": secondary_tlds,
     }
+
+
+def load_search_policy() -> Dict[str, Any]:
+    policy = dict(DEFAULT_SEARCH_POLICY)
+    if not SEARCH_POLICY_PATH.exists():
+        return policy
+    try:
+        raw = json.loads(SEARCH_POLICY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return policy
+    if not isinstance(raw, dict):
+        return policy
+
+    if isinstance(raw.get("cache_ttl_seconds"), int):
+        policy["cache_ttl_seconds"] = max(0, int(raw["cache_ttl_seconds"]))
+    if isinstance(raw.get("max_broaden_steps"), int):
+        policy["max_broaden_steps"] = max(0, int(raw["max_broaden_steps"]))
+    if isinstance(raw.get("min_new_fact_gain"), int):
+        policy["min_new_fact_gain"] = max(0, int(raw["min_new_fact_gain"]))
+    if isinstance(raw.get("max_no_gain_retries_per_intent"), int):
+        policy["max_no_gain_retries_per_intent"] = max(
+            0, int(raw["max_no_gain_retries_per_intent"])
+        )
+    if isinstance(raw.get("allow_rerun_on_search_error"), bool):
+        policy["allow_rerun_on_search_error"] = raw["allow_rerun_on_search_error"]
+    if isinstance(raw.get("intent_collapse_similarity"), (int, float)):
+        v = float(raw["intent_collapse_similarity"])
+        policy["intent_collapse_similarity"] = min(0.99, max(0.4, v))
+    if isinstance(raw.get("broaden_k_multipliers"), list):
+        vals = [int(v) for v in raw["broaden_k_multipliers"] if isinstance(v, int) and v > 0]
+        if vals:
+            policy["broaden_k_multipliers"] = vals
+    if isinstance(raw.get("time_sensitive_terms"), list):
+        terms = [str(v).strip().lower() for v in raw["time_sensitive_terms"] if str(v).strip()]
+        if terms:
+            policy["time_sensitive_terms"] = terms
+    return policy
 
 
 def matches_domain_rule(domain: str, rule: str) -> bool:
@@ -455,6 +504,7 @@ class DeepResearchAgent:
         self,
         model: str,
         report_model: str,
+        max_depth: int,
         max_rounds: int,
         results_per_query: int,
         trace_file: str = "",
@@ -465,6 +515,9 @@ class DeepResearchAgent:
         pricing_file: str = "pricing.json",
         cost_estimate_enabled: bool = True,
         verbose: bool = True,
+        event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+        run_id: str = "",
+        should_abort: Optional[Callable[[], bool]] = None,
     ) -> None:
         pricing_error = ""
         if cost_estimate_enabled:
@@ -495,6 +548,7 @@ class DeepResearchAgent:
         self.llm = LLM(model=model, usage_tracker=self.usage_tracker)
         self.report_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
         self.search = WebSearch(model=model, usage_tracker=self.usage_tracker)
+        self.max_depth = max(1, int(max_depth))
         self.max_rounds = max_rounds
         self.results_per_query = results_per_query
         self.trace_file = trace_file
@@ -506,19 +560,44 @@ class DeepResearchAgent:
         self.cost_estimate_enabled = cost_estimate_enabled
         self.pricing_error = pricing_error
         self.verbose = verbose
+        self.event_callback = event_callback
+        self.run_id = run_id
+        self.should_abort = should_abort
         self.source_policy = load_source_policy()
+        self.search_policy = load_search_policy()
+        self.query_memory: Dict[str, Dict[str, Any]] = {}
 
     def run(self, task: str) -> str:
         self._log("Starting deep research run.")
+        self._abort_if_requested("run_start")
+        self._emit("run_started", {"task": task})
         if self.pricing_error:
             self._log(
                 "Pricing config invalid; cost estimation falling back to zeros. "
                 f"error={self.pricing_error}"
             )
+
         started_at = self._now_iso()
         state_path = self._resolve_state_path(task, started_at)
         query_history: List[Dict[str, Any]] = []
         completed_query_steps: set[str] = set()
+        recheck_queries: List[str] = []
+        trace: Dict[str, Any] = {}
+        findings: Dict[str, SubQuestionFinding] = {}
+        sub_questions: List[str] = []
+        success_criteria: List[str] = []
+        extra_questions: List[str] = []
+        extra_queries: List[str] = []
+        unresolved_questions: List[str] = []
+        question_depths: Dict[str, int] = {}
+        question_parents: Dict[str, str] = {}
+        decomposed_questions: set[str] = set()
+        resolved_questions: set[str] = set()
+        final_suff: Dict[str, Any] = {}
+        total_search_calls = 0
+        failed_search_calls = 0
+        queries_with_evidence = 0
+        total_selected_results = 0
 
         if self.resume_from:
             resume_state = self._load_state(Path(self.resume_from))
@@ -548,6 +627,41 @@ class DeepResearchAgent:
             extra_queries = self._normalize_llm_list(
                 resume_state.get("extra_queries", []), "extra_queries"
             )
+            recheck_queries = self._normalize_llm_list(
+                resume_state.get("recheck_queries", []), "recheck_queries"
+            )
+            unresolved_questions = self._normalize_llm_list(
+                resume_state.get("unresolved_questions", []), "unresolved_questions"
+            )
+            if not unresolved_questions:
+                unresolved_questions = self._dedupe_preserve_order(
+                    sub_questions + extra_questions
+                )
+            raw_depths = resume_state.get("question_depths", {})
+            if isinstance(raw_depths, dict):
+                for q, depth in raw_depths.items():
+                    if isinstance(q, str) and isinstance(depth, int):
+                        question_depths[q] = max(1, depth)
+            for q in self._dedupe_preserve_order(
+                sub_questions + unresolved_questions + extra_questions
+            ):
+                question_depths.setdefault(q, 1)
+            raw_parents = resume_state.get("question_parents", {})
+            if isinstance(raw_parents, dict):
+                for q, parent in raw_parents.items():
+                    if isinstance(q, str) and isinstance(parent, str):
+                        question_parents[q] = parent
+            decomposed_questions = set(
+                self._normalize_llm_list(
+                    resume_state.get("decomposed_questions", []),
+                    "decomposed_questions",
+                )
+            )
+            resolved_questions = set(
+                self._normalize_llm_list(
+                    resume_state.get("resolved_questions", []), "resolved_questions"
+                )
+            )
             final_suff = (
                 resume_state.get("final_sufficiency", {})
                 if isinstance(resume_state.get("final_sufficiency", {}), dict)
@@ -570,10 +684,10 @@ class DeepResearchAgent:
                 )
             )
             self.usage_tracker.load_from_dict(resume_state.get("token_usage", {}))
+            qm = resume_state.get("query_memory", {})
+            self.query_memory = qm if isinstance(qm, dict) else {}
             start_round = max(1, int(resume_state.get("next_round", 1)))
-            self._log(
-                f"Resuming from {state_path} at round {start_round}."
-            )
+            self._log(f"Resuming from {state_path} at round {start_round}.")
         else:
             trace = {
                 "task": task,
@@ -584,80 +698,176 @@ class DeepResearchAgent:
                 "pricing_source": self.usage_tracker.pricing_source,
                 "started_at": started_at,
                 "max_rounds": self.max_rounds,
+                "max_depth": self.max_depth,
+                "execution_mode": "lazy_first_dfs",
                 "results_per_query": self.results_per_query,
                 "rounds": [],
                 "source_policy_file": str(SOURCE_POLICY_PATH),
+                "search_policy_file": str(SEARCH_POLICY_PATH),
             }
-            self._log("Decomposing task into sub-questions and success criteria.")
-            plan = self.llm.json(
-                SYSTEM_DECOMPOSE,
-                f"Task:\n{task}",
-                stage="decompose",
-                metadata={"task": self._trim_text(task, 120)},
-            )
-            sub_questions = self._normalize_llm_list(
-                plan.get("sub_questions"), "sub_questions"
-            )
-            success_criteria = self._normalize_llm_list(
-                plan.get("success_criteria"), "success_criteria"
-            )
-            self._log(
-                f"Plan ready: {len(sub_questions)} sub-questions, {len(success_criteria)} success criteria."
+            self._log("Initializing root task node (no upfront decomposition).")
+            root_question = task.strip() or "Research task"
+            sub_questions = [root_question]
+            success_criteria = []
+            self._emit(
+                "plan_created",
+                {
+                    "sub_questions": sub_questions,
+                    "success_criteria": success_criteria,
+                },
             )
             trace["plan"] = {
                 "sub_questions": sub_questions,
                 "success_criteria": success_criteria,
+                "planning_mode": "root_only",
             }
             findings = {sq: SubQuestionFinding(sub_question=sq) for sq in sub_questions}
-            extra_questions = []
-            extra_queries = []
-            final_suff = {}
-            total_search_calls = 0
-            failed_search_calls = 0
-            queries_with_evidence = 0
-            total_selected_results = 0
+            unresolved_questions = list(sub_questions)
+            for sq in sub_questions:
+                question_depths[sq] = 1
+                question_parents[sq] = ""
             start_round = 1
+            self.query_memory = {}
 
-        self._save_state(
-            state_path=state_path,
-            status="running",
-            task=task,
-            started_at=started_at,
-            next_round=start_round,
-            sub_questions=sub_questions,
-            success_criteria=success_criteria,
-            findings=findings,
-            extra_questions=extra_questions,
-            extra_queries=extra_queries,
-            final_suff=final_suff,
-            total_search_calls=total_search_calls,
-            failed_search_calls=failed_search_calls,
-            queries_with_evidence=queries_with_evidence,
-            total_selected_results=total_selected_results,
-            query_history=query_history,
-            completed_query_steps=completed_query_steps,
-            trace=trace,
+        unresolved_questions = self._dedupe_preserve_order(
+            [q for q in unresolved_questions if q not in resolved_questions]
         )
 
+        def save_checkpoint(
+            status: str,
+            next_round: int,
+            error: str = "",
+        ) -> None:
+            self._save_state(
+                state_path=state_path,
+                status=status,
+                task=task,
+                started_at=started_at,
+                next_round=next_round,
+                sub_questions=sub_questions,
+                success_criteria=success_criteria,
+                findings=findings,
+                extra_questions=extra_questions,
+                extra_queries=extra_queries,
+                recheck_queries=recheck_queries,
+                unresolved_questions=unresolved_questions,
+                question_depths=question_depths,
+                question_parents=question_parents,
+                decomposed_questions=decomposed_questions,
+                resolved_questions=resolved_questions,
+                final_suff=final_suff,
+                total_search_calls=total_search_calls,
+                failed_search_calls=failed_search_calls,
+                queries_with_evidence=queries_with_evidence,
+                total_selected_results=total_selected_results,
+                query_history=query_history,
+                completed_query_steps=completed_query_steps,
+                trace=trace,
+                error=error,
+            )
+
+        save_checkpoint(status="running", next_round=start_round)
         current_round = start_round
+
         try:
             for round_i in range(start_round, self.max_rounds + 1):
+                self._abort_if_requested("round_start")
                 current_round = round_i
-                self._log(f"Round {round_i}/{self.max_rounds}: gathering evidence.")
+                frontier_questions = self._dedupe_preserve_order(
+                    unresolved_questions + extra_questions
+                )
+                if not frontier_questions:
+                    self._log("No unresolved questions in frontier; stopping early.")
+                    break
+
+                self._log(
+                    f"Round {round_i}/{self.max_rounds}: processing {len(frontier_questions)} frontier questions."
+                )
+                self._emit(
+                    "round_started",
+                    {
+                        "round": round_i,
+                        "max_rounds": self.max_rounds,
+                        "frontier_count": len(frontier_questions),
+                    },
+                )
                 round_trace: Dict[str, Any] = {
                     "round": round_i,
+                    "frontier_questions": frontier_questions,
                     "questions": [],
                 }
-                all_questions = self._dedupe_preserve_order(
-                    sub_questions + extra_questions
-                )
+                round_new_fact_gain = 0
                 round_extra_queries_by_question = self._assign_follow_up_queries(
-                    all_questions, extra_queries
+                    frontier_questions, self._dedupe_preserve_order(extra_queries)
                 )
-                for sq in all_questions:
-                    self._log(f"Sub-question: {sq}")
+                round_recheck_intents = {
+                    self._normalize_query_intent(q)
+                    for q in self._normalize_llm_list(
+                        recheck_queries, "recheck_queries_for_recheck"
+                    )
+                }
+                next_unresolved: List[str] = []
+                processed_questions_in_pass: set[str] = set()
+                active_questions_in_branch: set[str] = set()
+
+                def process_question_dfs(
+                    sq: str, depth: int, parent: str, ancestry: List[str]
+                ) -> bool:
+                    nonlocal round_new_fact_gain, total_search_calls, failed_search_calls
+                    nonlocal queries_with_evidence, total_selected_results
+                    self._abort_if_requested("sub_question_start")
+                    if sq in processed_questions_in_pass:
+                        return sq in resolved_questions
+                    if sq in resolved_questions:
+                        processed_questions_in_pass.add(sq)
+                        return True
+                    if sq in active_questions_in_branch:
+                        self._emit(
+                            "node_unresolved",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "reason": "active_branch_cycle",
+                            },
+                        )
+                        next_unresolved.append(sq)
+                        processed_questions_in_pass.add(sq)
+                        return False
+                    if sq in ancestry:
+                        self._emit(
+                            "node_unresolved",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "reason": "cycle_detected",
+                            },
+                        )
+                        next_unresolved.append(sq)
+                        processed_questions_in_pass.add(sq)
+                        return False
+
+                    active_questions_in_branch.add(sq)
+                    question_depths[sq] = max(1, depth)
+                    if sq not in question_parents or not question_parents.get(sq, ""):
+                        question_parents[sq] = parent
+                    findings.setdefault(sq, SubQuestionFinding(sub_question=sq))
+                    self._log(f"Question (depth {depth}): {sq}")
+                    self._emit(
+                        "sub_question_started",
+                        {
+                            "round": round_i,
+                            "sub_question": sq,
+                            "depth": depth,
+                            "parent": parent,
+                        },
+                    )
+
                     question_trace: Dict[str, Any] = {
                         "sub_question": sq,
+                        "depth": depth,
+                        "parent": parent,
                         "query_steps": [],
                     }
                     query_prompt = f"""Original task:
@@ -665,6 +875,9 @@ class DeepResearchAgent:
 
 Sub-question:
 {sq}
+
+Question depth:
+{depth}
 
 Known success criteria:
 {json.dumps(success_criteria, ensure_ascii=True)}
@@ -675,6 +888,7 @@ Known success criteria:
                         stage="query_gen",
                         metadata={
                             "round": round_i,
+                            "depth": depth,
                             "sub_question": self._trim_text(sq, 120),
                         },
                     )
@@ -685,15 +899,167 @@ Known success criteria:
                         generated_queries + round_extra_queries_by_question.get(sq, [])
                     )
                     self._log(f"Generated {len(queries)} search queries.")
+                    self._emit(
+                        "queries_generated",
+                        {
+                            "round": round_i,
+                            "sub_question": sq,
+                            "depth": depth,
+                            "queries": queries,
+                            "count": len(queries),
+                        },
+                    )
+
+                    question_has_evidence = False
                     for query in queries:
+                        self._abort_if_requested("query_loop")
+                        raw_intent_key = self._normalize_query_intent(query)
+                        intent_key, collapse_score = self._resolve_execution_intent(
+                            raw_intent_key
+                        )
+                        if intent_key != raw_intent_key:
+                            self._log(
+                                "Query intent mapped to existing cache key. "
+                                f"raw='{self._trim_text(raw_intent_key, 120)}' "
+                                f"mapped='{self._trim_text(intent_key, 120)}' "
+                                f"similarity={collapse_score:.2f}"
+                            )
                         step_key = self._query_step_key(round_i, sq, query)
                         if step_key in completed_query_steps:
                             self._log(f"Skipping already completed query: {query}")
                             continue
 
+                        explicit_recheck = (
+                            raw_intent_key in round_recheck_intents
+                            or intent_key in round_recheck_intents
+                        )
+                        should_run, decision = self._decide_query_execution(
+                            intent_key=intent_key,
+                            explicit_recheck=explicit_recheck,
+                        )
+                        planned_k = self.results_per_query
+                        if should_run:
+                            planned_k, _ = self._effective_results_per_query(intent_key)
+                        else:
+                            cached = self.query_memory.get(intent_key, {})
+                            planned_k = int(
+                                cached.get("effective_k", self.results_per_query)
+                            )
+                        diagnostics = self._log_query_diagnostics(
+                            query=query,
+                            intent_key=raw_intent_key,
+                            decision=decision,
+                            effective_k=planned_k,
+                            explicit_recheck=explicit_recheck,
+                        )
+                        self._emit(
+                            "query_diagnostic",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "query": query,
+                                "raw_intent_key": raw_intent_key,
+                                "execution_intent_key": intent_key,
+                                "intent_mapped": bool(intent_key != raw_intent_key),
+                                "intent_map_similarity": float(collapse_score),
+                                **diagnostics,
+                            },
+                        )
+                        if not should_run:
+                            cache_entry = self.query_memory.get(intent_key, {})
+                            step_data = {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "query": query,
+                                "status": "cached" if decision == "cache_hit" else "skipped",
+                                "cache_hit": decision == "cache_hit",
+                                "rerun_reason": decision,
+                                "broadening_step": int(cache_entry.get("attempts", 0)),
+                                "effective_results_per_query": int(
+                                    cache_entry.get("effective_k", self.results_per_query)
+                                ),
+                                "search_error": cache_entry.get("search_error"),
+                                "selected_results_count": int(
+                                    cache_entry.get("selected_results_count", 0)
+                                ),
+                                "primary_count": int(cache_entry.get("primary_count", 0)),
+                                "blocked_by_diminishing_returns": decision
+                                == "blocked_diminishing_returns",
+                            }
+                            question_trace["query_steps"].append(step_data)
+                            query_history.append(step_data)
+                            completed_query_steps.add(step_key)
+                            if decision == "cache_hit":
+                                self._emit(
+                                    "query_skipped_cached",
+                                    {
+                                        "round": round_i,
+                                        "sub_question": sq,
+                                        "depth": depth,
+                                        "query": query,
+                                        "intent_key": intent_key,
+                                    },
+                                )
+                            else:
+                                self._emit(
+                                    "query_blocked_diminishing_returns",
+                                    {
+                                        "round": round_i,
+                                        "sub_question": sq,
+                                        "depth": depth,
+                                        "query": query,
+                                        "intent_key": intent_key,
+                                    },
+                                )
+                            save_checkpoint(status="running", next_round=round_i)
+                            continue
+
+                        rerun_reason = None if decision == "new_query" else decision
+                        if rerun_reason:
+                            self._emit(
+                                "query_rerun_allowed",
+                                {
+                                    "round": round_i,
+                                    "sub_question": sq,
+                                    "depth": depth,
+                                    "query": query,
+                                    "intent_key": intent_key,
+                                    "reason": rerun_reason,
+                                },
+                            )
+
+                        effective_k, broaden_step = self._effective_results_per_query(
+                            intent_key
+                        )
+                        if effective_k > self.results_per_query:
+                            self._emit(
+                                "query_broadened",
+                                {
+                                    "round": round_i,
+                                    "sub_question": sq,
+                                    "depth": depth,
+                                    "query": query,
+                                    "intent_key": intent_key,
+                                    "effective_results_per_query": effective_k,
+                                    "broadening_step": broaden_step,
+                                },
+                            )
+
                         self._log(f"Searching: {query}")
+                        self._emit(
+                            "query_started",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "query": query,
+                            },
+                        )
                         total_search_calls += 1
-                        raw_results = self.search.search(query, self.results_per_query)
+                        raw_results = self.search.search(query, effective_k)
+                        self._abort_if_requested("after_search")
                         search_error = self.search.last_error
                         if search_error:
                             failed_search_calls += 1
@@ -701,7 +1067,7 @@ Known success criteria:
                                 f"Search failed for this query; continuing. error={search_error}"
                             )
                         selected_results = self._select_high_quality_results(
-                            raw_results, self.results_per_query
+                            raw_results, max(effective_k, self.results_per_query)
                         )
                         primary_count = sum(
                             1
@@ -713,10 +1079,26 @@ Known success criteria:
                             f"{len(selected_results)} results "
                             f"({primary_count} primary/official)."
                         )
+                        self._emit(
+                            "search_completed",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "query": query,
+                                "intent_key": intent_key,
+                                "search_error": search_error,
+                                "raw_results_count": len(raw_results),
+                                "selected_results_count": len(selected_results),
+                                "primary_count": primary_count,
+                                "effective_results_per_query": effective_k,
+                                "broadening_step": broaden_step,
+                            },
+                        )
                         total_selected_results += len(selected_results)
                         if selected_results:
+                            question_has_evidence = True
                             queries_with_evidence += 1
-                        findings.setdefault(sq, SubQuestionFinding(sub_question=sq))
 
                         if not selected_results:
                             limitation = (
@@ -728,6 +1110,7 @@ Known success criteria:
                             step_data = {
                                 "round": round_i,
                                 "sub_question": sq,
+                                "depth": depth,
                                 "query": query,
                                 "search_error": search_error,
                                 "raw_results": [r.__dict__ for r in raw_results],
@@ -738,26 +1121,17 @@ Known success criteria:
                             question_trace["query_steps"].append(step_data)
                             query_history.append(step_data)
                             completed_query_steps.add(step_key)
-                            self._save_state(
-                                state_path=state_path,
-                                status="running",
-                                task=task,
-                                started_at=started_at,
-                                next_round=round_i,
-                                sub_questions=sub_questions,
-                                success_criteria=success_criteria,
-                                findings=findings,
-                                extra_questions=extra_questions,
-                                extra_queries=extra_queries,
-                                final_suff=final_suff,
-                                total_search_calls=total_search_calls,
-                                failed_search_calls=failed_search_calls,
-                                queries_with_evidence=queries_with_evidence,
-                                total_selected_results=total_selected_results,
-                                query_history=query_history,
-                                completed_query_steps=completed_query_steps,
-                                trace=trace,
+                            self._update_query_memory(
+                                intent_key=intent_key,
+                                query=query,
+                                round_i=round_i,
+                                effective_k=effective_k,
+                                selected_results=selected_results,
+                                search_error=search_error,
+                                rerun_reason=rerun_reason,
+                                new_fact_gain=0,
                             )
+                            save_checkpoint(status="running", next_round=round_i)
                             continue
 
                         synth_prompt = self._format_synthesis_prompt(
@@ -769,11 +1143,26 @@ Known success criteria:
                             stage="synthesize",
                             metadata={
                                 "round": round_i,
+                                "depth": depth,
                                 "sub_question": self._trim_text(sq, 120),
                                 "query": self._trim_text(query, 140),
                             },
                         )
+                        self._abort_if_requested("after_synthesis")
                         self._log("Synthesis completed for this query.")
+                        self._emit(
+                            "synthesis_completed",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "query": query,
+                                "summary": self._trim_text(
+                                    str(sobj.get("summary", "")), 300
+                                ),
+                            },
+                        )
+                        facts_before = len(findings[sq].facts)
                         findings[sq].summaries.append(str(sobj.get("summary", "")))
                         findings[sq].facts.extend(
                             self._normalize_synth_facts(sobj.get("facts", []))
@@ -783,10 +1172,14 @@ Known success criteria:
                                 sobj.get("uncertainties"), "synthesis_uncertainties"
                             )
                         )
+                        new_fact_gain = max(0, len(findings[sq].facts) - facts_before)
+                        round_new_fact_gain += new_fact_gain
                         step_data = {
                             "round": round_i,
                             "sub_question": sq,
+                            "depth": depth,
                             "query": query,
+                            "intent_key": intent_key,
                             "search_error": search_error,
                             "raw_results": [r.__dict__ for r in raw_results],
                             "selected_results": [
@@ -800,32 +1193,183 @@ Known success criteria:
                                 for r in selected_results
                             ],
                             "synthesis": sobj,
+                            "cache_hit": False,
+                            "rerun_reason": rerun_reason,
+                            "broadening_step": broaden_step,
+                            "effective_results_per_query": effective_k,
+                            "new_fact_gain": new_fact_gain,
+                            "blocked_by_diminishing_returns": False,
                         }
                         question_trace["query_steps"].append(step_data)
                         query_history.append(step_data)
                         completed_query_steps.add(step_key)
-                        self._save_state(
-                            state_path=state_path,
-                            status="running",
-                            task=task,
-                            started_at=started_at,
-                            next_round=round_i,
-                            sub_questions=sub_questions,
-                            success_criteria=success_criteria,
-                            findings=findings,
-                            extra_questions=extra_questions,
-                            extra_queries=extra_queries,
-                            final_suff=final_suff,
-                            total_search_calls=total_search_calls,
-                            failed_search_calls=failed_search_calls,
-                            queries_with_evidence=queries_with_evidence,
-                            total_selected_results=total_selected_results,
-                            query_history=query_history,
-                            completed_query_steps=completed_query_steps,
-                            trace=trace,
+                        self._update_query_memory(
+                            intent_key=intent_key,
+                            query=query,
+                            round_i=round_i,
+                            effective_k=effective_k,
+                            selected_results=selected_results,
+                            search_error=search_error,
+                            rerun_reason=rerun_reason,
+                            new_fact_gain=new_fact_gain,
+                        )
+                        save_checkpoint(status="running", next_round=round_i)
+
+                    try:
+                        node_suff: Dict[str, Any] = {
+                            "is_sufficient": False,
+                            "reasoning": "No node-level sufficiency run.",
+                            "gaps": [],
+                        }
+                        if question_has_evidence:
+                            node_suff = self.llm.json(
+                                SYSTEM_SUFFICIENCY,
+                                self._format_node_sufficiency_prompt(
+                                    task=task,
+                                    sub_question=sq,
+                                    success_criteria=success_criteria,
+                                    finding=findings[sq],
+                                    depth=depth,
+                                ),
+                                stage="node_sufficiency",
+                                metadata={
+                                    "round": round_i,
+                                    "depth": depth,
+                                    "sub_question": self._trim_text(sq, 120),
+                                },
+                            )
+                        else:
+                            findings[sq].uncertainties.append(
+                                "Insufficient direct evidence for this question in this pass."
+                            )
+                        node_is_sufficient = bool(node_suff.get("is_sufficient", False))
+                        node_reasoning = str(node_suff.get("reasoning", "")).strip()
+                        node_gaps = self._normalize_llm_list(node_suff.get("gaps"), "node_gaps")
+                        question_trace["node_sufficiency"] = {
+                            "is_sufficient": node_is_sufficient,
+                            "reasoning": node_reasoning,
+                            "gaps": node_gaps,
+                        }
+                        self._emit(
+                            "node_sufficiency_completed",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "is_sufficient": node_is_sufficient,
+                                "reasoning": self._trim_text(node_reasoning, 300),
+                                "gaps": node_gaps,
+                            },
                         )
 
-                    round_trace["questions"].append(question_trace)
+                        if node_is_sufficient:
+                            resolved_questions.add(sq)
+                            self._emit(
+                                "node_completed",
+                                {
+                                    "round": round_i,
+                                    "sub_question": sq,
+                                    "depth": depth,
+                                },
+                            )
+                            question_trace["status"] = "solved"
+                            round_trace["questions"].append(question_trace)
+                            save_checkpoint(status="running", next_round=round_i)
+                            return True
+
+                        if depth < self.max_depth:
+                            children = self._decompose_sub_question(
+                                task=task,
+                                sub_question=sq,
+                                success_criteria=success_criteria,
+                                node_gaps=node_gaps,
+                            )
+                            children = self._dedupe_preserve_order(children)
+                            if children:
+                                decomposed_questions.add(sq)
+                                self._emit(
+                                    "node_decomposed",
+                                    {
+                                        "round": round_i,
+                                        "sub_question": sq,
+                                        "depth": depth,
+                                        "children": children,
+                                    },
+                                )
+                                question_trace["children"] = children
+                                child_all_solved = True
+                                for child in children:
+                                    question_depths[child] = min(self.max_depth, depth + 1)
+                                    if child not in question_parents or not question_parents.get(child, ""):
+                                        question_parents[child] = sq
+                                    findings.setdefault(
+                                        child, SubQuestionFinding(sub_question=child)
+                                    )
+                                    child_solved = process_question_dfs(
+                                        child, min(self.max_depth, depth + 1), sq, ancestry + [sq]
+                                    )
+                                    child_all_solved = child_all_solved and child_solved
+                                if child_all_solved:
+                                    self._emit(
+                                        "node_completed",
+                                        {
+                                            "round": round_i,
+                                            "sub_question": sq,
+                                            "depth": depth,
+                                            "derived_from_children": True,
+                                        },
+                                    )
+                                    resolved_questions.add(sq)
+                                    question_trace["status"] = "solved_via_children"
+                                    round_trace["questions"].append(question_trace)
+                                    save_checkpoint(status="running", next_round=round_i)
+                                    return True
+                                self._emit(
+                                    "node_unresolved",
+                                    {
+                                        "round": round_i,
+                                        "sub_question": sq,
+                                        "depth": depth,
+                                        "reason": "children_insufficient",
+                                    },
+                                )
+                                question_trace["status"] = "unresolved"
+                                question_trace["unresolved_reason"] = "children_insufficient"
+                                next_unresolved.append(sq)
+                                round_trace["questions"].append(question_trace)
+                                save_checkpoint(status="running", next_round=round_i)
+                                return False
+
+                        reason = "depth_limit_reached" if depth >= self.max_depth else "decompose_failed"
+                        self._emit(
+                            "node_unresolved",
+                            {
+                                "round": round_i,
+                                "sub_question": sq,
+                                "depth": depth,
+                                "reason": reason,
+                            },
+                        )
+                        question_trace["status"] = "unresolved"
+                        question_trace["unresolved_reason"] = reason
+                        next_unresolved.append(sq)
+                        round_trace["questions"].append(question_trace)
+                        save_checkpoint(status="running", next_round=round_i)
+                        return False
+                    finally:
+                        active_questions_in_branch.discard(sq)
+                        processed_questions_in_pass.add(sq)
+
+                for sq in frontier_questions:
+                    if sq in resolved_questions:
+                        continue
+                    root_depth = max(1, int(question_depths.get(sq, 1)))
+                    root_parent = question_parents.get(sq, "")
+                    process_question_dfs(sq, root_depth, root_parent, [])
+
+                unresolved_questions = self._dedupe_preserve_order(
+                    [q for q in next_unresolved if q not in resolved_questions]
+                )
 
                 suff = self.llm.json(
                     SYSTEM_SUFFICIENCY,
@@ -838,65 +1382,72 @@ Known success criteria:
                     stage="sufficiency",
                     metadata={"round": round_i},
                 )
+                self._abort_if_requested("after_sufficiency")
                 final_suff = suff
                 round_trace["sufficiency"] = suff
+                round_trace["round_new_fact_gain"] = round_new_fact_gain
+                round_trace["frontier_remaining"] = unresolved_questions
                 trace["rounds"].append(round_trace)
+                self._emit(
+                    "sufficiency_completed",
+                    {
+                        "round": round_i,
+                        "is_sufficient": bool(suff.get("is_sufficient", False)),
+                        "reasoning": self._trim_text(str(suff.get("reasoning", "")), 300),
+                        "gaps": self._normalize_llm_list(suff.get("gaps"), "gaps"),
+                    },
+                )
                 if suff.get("is_sufficient", False):
                     self._log("Sufficiency check passed. Stopping iterative search.")
-                    self._save_state(
-                        state_path=state_path,
-                        status="running",
-                        task=task,
-                        started_at=started_at,
-                        next_round=round_i,
-                        sub_questions=sub_questions,
-                        success_criteria=success_criteria,
-                        findings=findings,
-                        extra_questions=extra_questions,
-                        extra_queries=extra_queries,
-                        final_suff=final_suff,
-                        total_search_calls=total_search_calls,
-                        failed_search_calls=failed_search_calls,
-                        queries_with_evidence=queries_with_evidence,
-                        total_selected_results=total_selected_results,
-                        query_history=query_history,
-                        completed_query_steps=completed_query_steps,
-                        trace=trace,
-                    )
+                    save_checkpoint(status="running", next_round=round_i)
                     break
-                self._log("Sufficiency check failed. Preparing follow-up search cycle.")
+
+                self._log("Sufficiency check failed. Preparing focused follow-up pass.")
                 extra_questions = self._normalize_llm_list(
                     suff.get("follow_up_questions"), "follow_up_questions"
                 )
-                extra_queries = self._normalize_llm_list(
-                    suff.get("follow_up_queries"), "follow_up_queries"
+                extra_queries = self._dedupe_preserve_order(
+                    self._normalize_llm_list(
+                        suff.get("follow_up_queries"), "follow_up_queries"
+                    )
                 )
-                self._save_state(
-                    state_path=state_path,
-                    status="running",
-                    task=task,
-                    started_at=started_at,
-                    next_round=round_i + 1,
-                    sub_questions=sub_questions,
-                    success_criteria=success_criteria,
-                    findings=findings,
-                    extra_questions=extra_questions,
-                    extra_queries=extra_queries,
-                    final_suff=final_suff,
-                    total_search_calls=total_search_calls,
-                    failed_search_calls=failed_search_calls,
-                    queries_with_evidence=queries_with_evidence,
-                    total_selected_results=total_selected_results,
-                    query_history=query_history,
-                    completed_query_steps=completed_query_steps,
-                    trace=trace,
+                recheck_queries = self._dedupe_preserve_order(
+                    self._normalize_llm_list(
+                        suff.get("recheck_queries"), "recheck_queries"
+                    )
                 )
+                for q in extra_questions:
+                    question_depths.setdefault(q, 1)
+                    question_parents.setdefault(q, "")
+                    findings.setdefault(q, SubQuestionFinding(sub_question=q))
+                unresolved_questions = self._dedupe_preserve_order(
+                    unresolved_questions + extra_questions
+                )
+                if (
+                    round_new_fact_gain == 0
+                    and not extra_questions
+                    and not extra_queries
+                    and not recheck_queries
+                ):
+                    self._log(
+                        "Stopping early due to no evidence gain and no targeted follow-up actions."
+                    )
+                    break
+                save_checkpoint(status="running", next_round=round_i + 1)
 
             trace["search_stats"] = {
                 "total_calls": total_search_calls,
                 "failed_calls": failed_search_calls,
                 "queries_with_evidence": queries_with_evidence,
                 "total_selected_results": total_selected_results,
+            }
+            trace["query_memory"] = self._query_memory_summary()
+            trace["question_tree"] = {
+                "depths": question_depths,
+                "parents": question_parents,
+                "resolved_questions": sorted(resolved_questions),
+                "decomposed_questions": sorted(decomposed_questions),
+                "unresolved_questions": unresolved_questions,
             }
             evidence_status, evidence_note = self._assess_evidence_strength(
                 total_search_calls=total_search_calls,
@@ -926,62 +1477,220 @@ Known success criteria:
                 stage="report",
                 metadata={"task": self._trim_text(task, 120)},
             )
+            self._abort_if_requested("after_report")
             trace["finished_at"] = self._now_iso()
             trace["final_sufficiency"] = final_suff
             trace["report"] = report
             trace["token_usage"] = self.usage_tracker.to_dict()
+            self._emit(
+                "run_completed",
+                {
+                    "report_chars": len(report),
+                    "evidence_status": evidence_status,
+                    "token_usage": self.usage_tracker.to_dict().get("total", {}),
+                },
+            )
             trace_path = self._write_trace(trace)
             print(f"[trace] saved: {trace_path}")
             self._print_token_summary(self.usage_tracker.to_dict())
             if self.usage_file:
                 usage_path = self._write_usage_report(self.usage_tracker.to_dict())
                 print(f"[usage] saved: {usage_path}")
-            self._save_state(
-                state_path=state_path,
-                status="completed",
-                task=task,
-                started_at=started_at,
-                next_round=self.max_rounds + 1,
-                sub_questions=sub_questions,
-                success_criteria=success_criteria,
-                findings=findings,
-                extra_questions=extra_questions,
-                extra_queries=extra_queries,
-                final_suff=final_suff,
-                total_search_calls=total_search_calls,
-                failed_search_calls=failed_search_calls,
-                queries_with_evidence=queries_with_evidence,
-                total_selected_results=total_selected_results,
-                query_history=query_history,
-                completed_query_steps=completed_query_steps,
-                trace=trace,
-            )
+            save_checkpoint(status="completed", next_round=self.max_rounds + 1)
             self._log("Run completed.")
             return report
         except Exception as exc:
+            if str(exc) == "Run aborted by user":
+                self._emit(
+                    "run_aborted",
+                    {"round": current_round, "error": str(exc)},
+                )
+            else:
+                self._emit(
+                    "run_failed",
+                    {"round": current_round, "error": str(exc)},
+                )
+            trace["query_memory"] = self._query_memory_summary()
             trace["token_usage"] = self.usage_tracker.to_dict()
-            self._save_state(
-                state_path=state_path,
-                status="failed",
-                task=task,
-                started_at=started_at,
-                next_round=current_round,
-                sub_questions=sub_questions,
-                success_criteria=success_criteria,
-                findings=findings,
-                extra_questions=extra_questions,
-                extra_queries=extra_queries,
-                final_suff=final_suff,
-                total_search_calls=total_search_calls,
-                failed_search_calls=failed_search_calls,
-                queries_with_evidence=queries_with_evidence,
-                total_selected_results=total_selected_results,
-                query_history=query_history,
-                completed_query_steps=completed_query_steps,
-                trace=trace,
-                error=str(exc),
-            )
+            save_checkpoint(status="failed", next_round=current_round, error=str(exc))
             raise
+
+    def _format_node_sufficiency_prompt(
+        self,
+        task: str,
+        sub_question: str,
+        success_criteria: List[str],
+        finding: SubQuestionFinding,
+        depth: int,
+    ) -> str:
+        compact = self._compact_findings(
+            findings={sub_question: finding},
+            summaries_limit=3,
+            facts_limit=10,
+            uncertainties_limit=6,
+            char_budget=9000,
+        )
+        return textwrap.dedent(
+            f"""
+            Original task:
+            {task}
+
+            Focused sub-question:
+            {sub_question}
+
+            Current depth:
+            {depth}
+
+            Success criteria:
+            {json.dumps(success_criteria, ensure_ascii=True)}
+
+            Evidence for this sub-question:
+            {json.dumps(compact, ensure_ascii=True)}
+
+            Evaluate only whether this specific sub-question is sufficiently answered.
+            """
+        ).strip()
+
+    def _decompose_sub_question(
+        self,
+        task: str,
+        sub_question: str,
+        success_criteria: List[str],
+        node_gaps: List[str],
+    ) -> List[str]:
+        prompt = textwrap.dedent(
+            f"""
+            Original task:
+            {task}
+
+            Parent question to decompose:
+            {sub_question}
+
+            Known unresolved gaps:
+            {json.dumps(node_gaps, ensure_ascii=True)}
+
+            Success criteria:
+            {json.dumps(success_criteria, ensure_ascii=True)}
+
+            Return only 2 to 4 child sub-questions focused on unresolved evidence gaps.
+            """
+        ).strip()
+        try:
+            plan = self.llm.json(
+                SYSTEM_DECOMPOSE,
+                prompt,
+                stage="decompose_child",
+                metadata={"sub_question": self._trim_text(sub_question, 120)},
+            )
+        except Exception as exc:
+            self._log(f"Child decomposition failed: {exc}")
+            return []
+        children = self._normalize_llm_list(
+            plan.get("sub_questions"), "child_sub_questions"
+        )
+        filtered = [q for q in children if q.strip() and q.strip() != sub_question.strip()]
+        return self._enforce_mece_children(
+            task=task,
+            parent_question=sub_question,
+            success_criteria=success_criteria,
+            node_gaps=node_gaps,
+            candidates=filtered,
+        )
+
+    def _enforce_mece_children(
+        self,
+        task: str,
+        parent_question: str,
+        success_criteria: List[str],
+        node_gaps: List[str],
+        candidates: List[str],
+    ) -> List[str]:
+        cleaned = self._dedupe_preserve_order(
+            [q.strip() for q in candidates if q.strip() and q.strip() != parent_question.strip()]
+        )
+        if len(cleaned) <= 1:
+            return cleaned
+        # If overlap is high, ask once for a stricter MECE rewrite.
+        overlap_pairs = self._find_overlapping_question_pairs(cleaned, threshold=0.55)
+        if overlap_pairs:
+            self._log(
+                "Child decomposition overlap detected; running MECE rewrite. "
+                f"parent='{self._trim_text(parent_question, 120)}' "
+                f"overlap_pairs={len(overlap_pairs)}"
+            )
+            rewrite_prompt = textwrap.dedent(
+                f"""
+                Original task:
+                {task}
+
+                Parent question:
+                {parent_question}
+
+                Unresolved gaps:
+                {json.dumps(node_gaps, ensure_ascii=True)}
+
+                Success criteria:
+                {json.dumps(success_criteria, ensure_ascii=True)}
+
+                Candidate child questions (overlapping):
+                {json.dumps(cleaned, ensure_ascii=True)}
+
+                Rewrite into 2 to 4 child questions that are MECE:
+                - Mutually Exclusive: no overlap/paraphrase.
+                - Collectively Exhaustive: covers unresolved scope.
+                - Specific and researchable.
+                Return strict JSON only.
+                """
+            ).strip()
+            try:
+                rewritten = self.llm.json(
+                    SYSTEM_DECOMPOSE,
+                    rewrite_prompt,
+                    stage="decompose_child_mece_rewrite",
+                    metadata={"sub_question": self._trim_text(parent_question, 120)},
+                )
+                cleaned = self._normalize_llm_list(
+                    rewritten.get("sub_questions"), "child_sub_questions_mece_rewrite"
+                )
+            except Exception as exc:
+                self._log(f"MECE rewrite failed; keeping original children. error={exc}")
+        # Final overlap cleanup to avoid near-duplicate siblings.
+        return self._drop_near_duplicate_questions(cleaned, threshold=0.72)
+
+    def _find_overlapping_question_pairs(
+        self, questions: List[str], threshold: float
+    ) -> List[tuple[str, str, float]]:
+        out: List[tuple[str, str, float]] = []
+        for i in range(len(questions)):
+            qi = questions[i]
+            ti = self._tokenize(qi)
+            if not ti:
+                continue
+            for j in range(i + 1, len(questions)):
+                qj = questions[j]
+                tj = self._tokenize(qj)
+                if not tj:
+                    continue
+                score = len(ti & tj) / float(len(ti | tj))
+                if score >= threshold:
+                    out.append((qi, qj, score))
+        return out
+
+    def _drop_near_duplicate_questions(
+        self, questions: List[str], threshold: float
+    ) -> List[str]:
+        kept: List[str] = []
+        for q in questions:
+            qn = self._normalize_query_intent(q)
+            is_dup = False
+            for k in kept:
+                kn = self._normalize_query_intent(k)
+                if self._query_similarity(qn, kn) >= threshold:
+                    is_dup = True
+                    break
+            if not is_dup:
+                kept.append(q)
+        return kept
 
     def _format_synthesis_prompt(
         self, sub_question: str, query: str, results: List[EvaluatedResult]
@@ -1195,6 +1904,234 @@ Known success criteria:
             out.append(key)
         return out
 
+    def _normalize_query_intent(self, query: str) -> str:
+        cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in query)
+        tokens = [t for t in cleaned.split() if t]
+        return " ".join(tokens)
+
+    def _query_similarity(self, intent_a: str, intent_b: str) -> float:
+        ta = set(intent_a.split())
+        tb = set(intent_b.split())
+        if not ta or not tb:
+            return 0.0
+        return len(ta & tb) / float(len(ta | tb))
+
+    def _nearest_prior_intent(self, intent_key: str) -> tuple[str, Dict[str, Any], float]:
+        best_key = ""
+        best_entry: Dict[str, Any] = {}
+        best_score = 0.0
+        for k, entry in self.query_memory.items():
+            score = self._query_similarity(intent_key, str(k))
+            if score > best_score:
+                best_key = str(k)
+                best_entry = entry if isinstance(entry, dict) else {}
+                best_score = score
+        return best_key, best_entry, best_score
+
+    def _resolve_execution_intent(self, raw_intent_key: str) -> tuple[str, float]:
+        if raw_intent_key in self.query_memory:
+            return raw_intent_key, 1.0
+        nearest_key, _, score = self._nearest_prior_intent(raw_intent_key)
+        collapse_threshold = float(
+            self.search_policy.get("intent_collapse_similarity", 0.55)
+        )
+        if nearest_key and score >= collapse_threshold:
+            return nearest_key, score
+        return raw_intent_key, 0.0
+
+    def _log_query_diagnostics(
+        self,
+        query: str,
+        intent_key: str,
+        decision: str,
+        effective_k: int,
+        explicit_recheck: bool,
+    ) -> Dict[str, Any]:
+        diagnostics: Dict[str, Any] = {
+            "classification": "first_intent",
+            "prior_query": "",
+            "similarity": 0.0,
+            "new_tokens": [],
+            "dropped_tokens": [],
+            "is_broadened": bool(effective_k > self.results_per_query),
+            "base_k": int(self.results_per_query),
+            "effective_k": int(effective_k),
+            "decision": decision,
+            "explicit_recheck": bool(explicit_recheck),
+        }
+        collapse_threshold = float(
+            self.search_policy.get("intent_collapse_similarity", 0.55)
+        )
+        current_tokens = set(intent_key.split())
+        if intent_key in self.query_memory:
+            prior = self.query_memory.get(intent_key, {})
+            diagnostics["classification"] = "exact_redundant"
+            diagnostics["prior_query"] = str(prior.get("query", ""))
+            self._log(
+                "Query intent: redundant exact-match to prior intent. "
+                f"query='{self._trim_text(query, 140)}' "
+                f"prior_query='{self._trim_text(str(prior.get('query', '')), 140)}' "
+                f"attempts={int(prior.get('attempts', 0))} "
+                f"decision={decision} explicit_recheck={explicit_recheck}"
+            )
+        else:
+            nearest_key, nearest_entry, score = self._nearest_prior_intent(intent_key)
+            if nearest_key and score >= collapse_threshold:
+                nearest_tokens = set(nearest_key.split())
+                new_tokens = sorted(current_tokens - nearest_tokens)
+                dropped_tokens = sorted(nearest_tokens - current_tokens)
+                diagnostics["classification"] = "near_duplicate_or_paraphrase"
+                diagnostics["prior_query"] = str(nearest_entry.get("query", ""))
+                diagnostics["similarity"] = float(score)
+                diagnostics["new_tokens"] = new_tokens[:10]
+                diagnostics["dropped_tokens"] = dropped_tokens[:10]
+                self._log(
+                    "Query intent: near-duplicate/paraphrase of prior intent. "
+                    f"query='{self._trim_text(query, 140)}' "
+                    f"prior_query='{self._trim_text(str(nearest_entry.get('query', '')), 140)}' "
+                    f"similarity={score:.2f} "
+                    f"new_tokens={new_tokens[:10]} dropped_tokens={dropped_tokens[:10]}"
+                )
+            elif nearest_key:
+                nearest_tokens = set(nearest_key.split())
+                new_tokens = sorted(current_tokens - nearest_tokens)
+                diagnostics["classification"] = "novel_vs_prior"
+                diagnostics["prior_query"] = str(nearest_entry.get("query", ""))
+                diagnostics["similarity"] = float(score)
+                diagnostics["new_tokens"] = new_tokens[:10]
+                self._log(
+                    "Query intent: novel relative to nearest prior intent. "
+                    f"query='{self._trim_text(query, 140)}' "
+                    f"nearest_prior='{self._trim_text(str(nearest_entry.get('query', '')), 140)}' "
+                    f"similarity={score:.2f} new_tokens={new_tokens[:10]}"
+                )
+            else:
+                self._log(
+                    "Query intent: first intent in this run. "
+                    f"query='{self._trim_text(query, 140)}'"
+                )
+
+        if effective_k > self.results_per_query:
+            self._log(
+                "Execution plan: broadened result set requested. "
+                f"base_k={self.results_per_query} effective_k={effective_k} decision={decision}"
+            )
+        else:
+            self._log(
+                "Execution plan: standard result set. "
+                f"k={effective_k} decision={decision}"
+            )
+        return diagnostics
+
+    def _is_time_sensitive(self, query: str) -> bool:
+        normalized = self._normalize_query_intent(query)
+        terms = self.search_policy.get("time_sensitive_terms", [])
+        if not normalized:
+            return False
+        padded = f" {normalized} "
+        for term in terms:
+            if not isinstance(term, str):
+                continue
+            term_norm = self._normalize_query_intent(term)
+            if not term_norm:
+                continue
+            if f" {term_norm} " in padded:
+                return True
+        return False
+
+    def _decide_query_execution(
+        self, intent_key: str, explicit_recheck: bool
+    ) -> tuple[bool, str]:
+        entry = self.query_memory.get(intent_key)
+        if not entry:
+            return True, "new_query"
+
+        max_no_gain = int(self.search_policy.get("max_no_gain_retries_per_intent", 2))
+        if int(entry.get("no_gain_streak", 0)) >= max_no_gain:
+            return False, "blocked_diminishing_returns"
+
+        if explicit_recheck:
+            return True, "explicit_recheck"
+
+        if self._is_time_sensitive(entry.get("query", intent_key)):
+            return True, "time_sensitive"
+
+        if bool(entry.get("search_error")) and bool(
+            self.search_policy.get("allow_rerun_on_search_error", True)
+        ):
+            return True, "previous_search_error"
+
+        ttl = int(self.search_policy.get("cache_ttl_seconds", 3600))
+        last_ts = float(entry.get("last_ts", 0.0))
+        if ttl > 0 and (time.time() - last_ts) > ttl:
+            return True, "cache_expired"
+
+        return False, "cache_hit"
+
+    def _effective_results_per_query(self, intent_key: str) -> tuple[int, int]:
+        entry = self.query_memory.get(intent_key, {})
+        attempts = int(entry.get("attempts", 0))
+        multipliers = self.search_policy.get("broaden_k_multipliers", [1, 2, 3])
+        if not isinstance(multipliers, list) or not multipliers:
+            multipliers = [1, 2, 3]
+        max_steps = int(self.search_policy.get("max_broaden_steps", 2))
+        step = min(attempts, max_steps, len(multipliers) - 1)
+        mult = max(1, int(multipliers[step]))
+        return self.results_per_query * mult, step
+
+    def _update_query_memory(
+        self,
+        intent_key: str,
+        query: str,
+        round_i: int,
+        effective_k: int,
+        selected_results: List[EvaluatedResult],
+        search_error: str,
+        rerun_reason: Optional[str],
+        new_fact_gain: int,
+    ) -> None:
+        entry = self.query_memory.get(intent_key, {})
+        attempts = int(entry.get("attempts", 0)) + 1
+        no_gain_streak = int(entry.get("no_gain_streak", 0))
+        min_gain = int(self.search_policy.get("min_new_fact_gain", 1))
+        if new_fact_gain < min_gain:
+            no_gain_streak += 1
+        else:
+            no_gain_streak = 0
+        self.query_memory[intent_key] = {
+            "query": query,
+            "last_round": round_i,
+            "last_ts": time.time(),
+            "attempts": attempts,
+            "effective_k": effective_k,
+            "selected_results_count": len(selected_results),
+            "primary_count": sum(
+                1 for r in selected_results if r.quality_tier == "primary_or_official"
+            ),
+            "search_error": search_error,
+            "rerun_reason": rerun_reason or "",
+            "new_fact_gain": new_fact_gain,
+            "no_gain_streak": no_gain_streak,
+        }
+
+    def _query_memory_summary(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for k, v in self.query_memory.items():
+            out[k] = {
+                "query": v.get("query", ""),
+                "attempts": int(v.get("attempts", 0)),
+                "last_round": int(v.get("last_round", 0)),
+                "last_ts": float(v.get("last_ts", 0.0)),
+                "effective_k": int(v.get("effective_k", self.results_per_query)),
+                "selected_results_count": int(v.get("selected_results_count", 0)),
+                "primary_count": int(v.get("primary_count", 0)),
+                "search_error": v.get("search_error", ""),
+                "rerun_reason": v.get("rerun_reason", ""),
+                "new_fact_gain": int(v.get("new_fact_gain", 0)),
+                "no_gain_streak": int(v.get("no_gain_streak", 0)),
+            }
+        return out
+
     def _normalize_llm_list(self, value: Any, field_name: str) -> List[str]:
         normalized = as_clean_str_list(value)
         if not isinstance(value, list):
@@ -1306,6 +2243,12 @@ Known success criteria:
         findings: Dict[str, SubQuestionFinding],
         extra_questions: List[str],
         extra_queries: List[str],
+        recheck_queries: List[str],
+        unresolved_questions: List[str],
+        question_depths: Dict[str, int],
+        question_parents: Dict[str, str],
+        decomposed_questions: set[str],
+        resolved_questions: set[str],
         final_suff: Dict[str, Any],
         total_search_calls: int,
         failed_search_calls: int,
@@ -1318,7 +2261,7 @@ Known success criteria:
     ) -> None:
         state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
-            "version": 1,
+            "version": 2,
             "status": status,
             "task": task,
             "model": self.llm.model,
@@ -1331,6 +2274,12 @@ Known success criteria:
             "findings": self._serialize_findings(findings),
             "extra_questions": extra_questions,
             "extra_queries": extra_queries,
+            "recheck_queries": recheck_queries,
+            "unresolved_questions": unresolved_questions,
+            "question_depths": question_depths,
+            "question_parents": question_parents,
+            "decomposed_questions": sorted(decomposed_questions),
+            "resolved_questions": sorted(resolved_questions),
             "final_sufficiency": final_suff,
             "search_stats": {
                 "total_calls": total_search_calls,
@@ -1340,6 +2289,7 @@ Known success criteria:
             },
             "query_history": query_history,
             "completed_query_steps": sorted(completed_query_steps),
+            "query_memory": self._query_memory_summary(),
             "token_usage": self.usage_tracker.to_dict(),
             "trace": trace,
             "error": error,
@@ -1397,6 +2347,26 @@ Known success criteria:
     def _log(self, message: str) -> None:
         if self.verbose:
             print(f"[progress] {message}")
+
+    def _abort_if_requested(self, context: str) -> None:
+        if self.should_abort and self.should_abort():
+            self._log(f"Abort requested ({context}).")
+            raise RuntimeError("Run aborted by user")
+
+    def _emit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        if not self.event_callback:
+            return
+        event = {
+            "run_id": self.run_id,
+            "timestamp": self._now_iso(),
+            "event_type": event_type,
+            "payload": payload,
+        }
+        try:
+            self.event_callback(event)
+        except Exception:
+            # Observability must not break core execution flow.
+            pass
 
     def _select_high_quality_results(
         self, results: List[SearchResult], max_results: int
@@ -1462,10 +2432,16 @@ def main() -> None:
         help="Final report model",
     )
     parser.add_argument(
-        "--max-rounds", type=int, default=4, help="Max iterative research rounds"
+        "--max-depth",
+        type=int,
+        default=4,
+        help="Max recursive decomposition depth per question node",
     )
     parser.add_argument(
-        "--results-per-query", type=int, default=5, help="Search results per query"
+        "--max-rounds", type=int, default=1, help="Max iterative research rounds"
+    )
+    parser.add_argument(
+        "--results-per-query", type=int, default=3, help="Baseline search results per query"
     )
     parser.add_argument(
         "--trace-file",
@@ -1523,6 +2499,7 @@ def main() -> None:
     agent = DeepResearchAgent(
         model=args.model,
         report_model=args.report_model,
+        max_depth=args.max_depth,
         max_rounds=args.max_rounds,
         results_per_query=args.results_per_query,
         trace_file=args.trace_file,

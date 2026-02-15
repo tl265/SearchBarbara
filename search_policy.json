@@ -1,0 +1,10 @@
+{
+  "cache_ttl_seconds": 3600,
+  "max_broaden_steps": 2,
+  "broaden_k_multipliers": [1, 2, 3],
+  "min_new_fact_gain": 1,
+  "max_no_gain_retries_per_intent": 2,
+  "time_sensitive_terms": ["latest", "today", "current", "update", "new"],
+  "allow_rerun_on_search_error": true,
+  "intent_collapse_similarity": 0.55
+}

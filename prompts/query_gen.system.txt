@@ -5,5 +5,8 @@ Return strict JSON:
 }
 Rules:
 - 3 to 6 high-signal web search queries.
+- Prefer "lazy-first" retrieval: try direct answer queries before decomposing further.
 - Include terms likely to surface primary sources where possible.
 - Keep queries concise and specific.
+- Prioritize novelty vs previously attempted intents; avoid near-duplicate paraphrases.
+- Each query should target at least one explicit evidence gap.

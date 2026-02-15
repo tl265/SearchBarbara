@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SearchBarbara</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <main class="layout">
+    <section class="panel">
+      <h1>SearchBarbara</h1>
+      <label for="task">Research task</label>
+      <textarea id="task" rows="4" placeholder="Enter your research task..."></textarea>
+      <details>
+        <summary>Advanced options</summary>
+        <div class="advanced">
+          <label>Max depth <input id="maxDepth" type="number" value="4" min="1" max="8"></label>
+          <label>Max passes <input id="maxRounds" type="number" value="1" min="1" max="10"></label>
+          <label>Results/query <input id="resultsPerQuery" type="number" value="3" min="1" max="30"></label>
+          <label>Model <input id="model" value="gpt-4.1"></label>
+          <label>Report model <input id="reportModel" value="gpt-5.2"></label>
+        </div>
+      </details>
+      <button id="startBtn">Start Research</button>
+      <button id="abortBtn" disabled>Abort Run (Debug)</button>
+      <div id="runMeta"></div>
+      <div id="statusPill" class="pill">idle</div>
+      <div id="errorBanner" class="error hidden"></div>
+    </section>
+
+    <section class="panel">
+      <h2>DFS Task Tree</h2>
+      <div id="tree"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Final Report</h2>
+      <button id="partialReportBtn" disabled>Generate Partial Report</button>
+      <button id="downloadBtn" disabled>Download Report</button>
+      <pre id="report"></pre>
+      <h3>Token Usage</h3>
+      <pre id="usage"></pre>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

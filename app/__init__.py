@@ -1,0 +1,2 @@
+"""SearchBarbara web app package."""
+

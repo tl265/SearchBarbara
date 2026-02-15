@@ -5,8 +5,11 @@ Return strict JSON:
   "reasoning": "short rationale",
   "gaps": ["..."],
   "follow_up_questions": ["..."],
-  "follow_up_queries": ["..."]
+  "follow_up_queries": ["..."],
+  "recheck_queries": ["..."]
 }
 Rules:
 - Be conservative: if key evidence is missing, set is_sufficient=false.
 - Prefer concrete follow-up queries that can close the gaps.
+- Use recheck_queries only when rerunning prior intent is justified (freshness, search errors, or changed conditions).
+- If evidence is weak, state that clearly in reasoning and gaps.
