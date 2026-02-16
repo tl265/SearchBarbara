@@ -10,7 +10,7 @@
     }
   },
   "default": {
-    "input_per_1m": 0.0,
-    "output_per_1m": 0.0
+    "input_per_1m": 2.0,
+    "output_per_1m": 8.0
   }
 }

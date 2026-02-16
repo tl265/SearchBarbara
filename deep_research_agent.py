@@ -1371,18 +1371,31 @@ Known success criteria:
                     [q for q in next_unresolved if q not in resolved_questions]
                 )
 
-                suff = self.llm.json(
-                    SYSTEM_SUFFICIENCY,
-                    self._format_sufficiency_prompt(
-                        task=task,
-                        success_criteria=success_criteria,
-                        findings=findings,
-                        round_i=round_i,
-                    ),
-                    stage="sufficiency",
-                    metadata={"round": round_i},
+                root_resolved = bool(
+                    sub_questions and sub_questions[0] in resolved_questions
                 )
-                self._abort_if_requested("after_sufficiency")
+                if not unresolved_questions or root_resolved:
+                    suff = {
+                        "is_sufficient": True,
+                        "reasoning": "All unresolved questions are closed or root question is resolved.",
+                        "gaps": [],
+                        "follow_up_questions": [],
+                        "follow_up_queries": [],
+                        "recheck_queries": [],
+                    }
+                else:
+                    suff = self.llm.json(
+                        SYSTEM_SUFFICIENCY,
+                        self._format_sufficiency_prompt(
+                            task=task,
+                            success_criteria=success_criteria,
+                            findings=findings,
+                            round_i=round_i,
+                        ),
+                        stage="sufficiency",
+                        metadata={"round": round_i},
+                    )
+                    self._abort_if_requested("after_sufficiency")
                 final_suff = suff
                 round_trace["sufficiency"] = suff
                 round_trace["round_new_fact_gain"] = round_new_fact_gain

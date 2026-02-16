@@ -113,4 +113,6 @@ def generate_partial_report(run_id: str) -> dict:
     result = run_manager.generate_partial_report(run_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        raise HTTPException(status_code=500, detail=str(result.get("error", "Unknown error")))
     return {"run_id": run_id, **result}

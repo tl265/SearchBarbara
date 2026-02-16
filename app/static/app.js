@@ -18,6 +18,7 @@ const usageEl = document.getElementById("usage");
 let currentRunId = null;
 let es = null;
 let currentSnapshot = null;
+let partialReportGenerating = false;
 
 function setStatus(status) {
   statusPill.textContent = status || "unknown";
@@ -147,8 +148,13 @@ function applySnapshot(snap) {
   downloadBtn.disabled = !snap.report_file_path;
   abortBtn.disabled = !(snap.status === "queued" || snap.status === "running");
   partialReportBtn.disabled = !(
-    currentRunId && (snap.status === "failed" || snap.status === "completed")
+    !partialReportGenerating &&
+    currentRunId &&
+    !snap.report_file_path
   );
+  partialReportBtn.textContent = partialReportGenerating
+    ? "Generating Partial Report..."
+    : "Generate Partial Report";
 }
 
 async function fetchSnapshot(runId) {
@@ -249,7 +255,11 @@ abortBtn.addEventListener("click", async () => {
 });
 
 partialReportBtn.addEventListener("click", async () => {
-  if (!currentRunId) return;
+  if (!currentRunId || partialReportGenerating) return;
+  partialReportGenerating = true;
+  partialReportBtn.disabled = true;
+  partialReportBtn.textContent = "Generating Partial Report...";
+  showError("");
   try {
     const rsp = await fetch(`/api/runs/${currentRunId}/report/partial`, {
       method: "POST",
@@ -260,6 +270,26 @@ partialReportBtn.addEventListener("click", async () => {
     await fetchSnapshot(currentRunId);
   } catch (err) {
     showError(err.message || String(err));
+  } finally {
+    partialReportGenerating = false;
+    if (!currentRunId) {
+      partialReportBtn.disabled = true;
+      partialReportBtn.textContent = "Generate Partial Report";
+      return;
+    }
+    try {
+      await fetchSnapshot(currentRunId);
+    } catch (err) {
+      // If snapshot refresh fails, still restore button from local state.
+      const snap = currentSnapshot;
+      const allow = !!(
+        snap &&
+        currentRunId &&
+        !snap.report_file_path
+      );
+      partialReportBtn.disabled = !allow;
+      partialReportBtn.textContent = "Generate Partial Report";
+    }
   }
 });
 

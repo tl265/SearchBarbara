@@ -7,7 +7,13 @@ from queue import Queue
 from typing import Any, Dict, List, Optional
 
 from app.models import RunState
-from deep_research_agent import DeepResearchAgent, SYSTEM_REPORT, slugify_for_filename
+from deep_research_agent import (
+    DeepResearchAgent,
+    SYSTEM_REPORT,
+    SubQuestionFinding,
+    UsageTracker,
+    slugify_for_filename,
+)
 
 
 def _now() -> datetime:
@@ -90,14 +96,14 @@ class RunManager:
         snapshot = self.get_snapshot(run_id)
         if not snapshot:
             return None
-        report_text = self._build_partial_report_with_agent(snapshot)
+        report_text, partial_usage = self._build_partial_report_with_agent(snapshot)
         if not report_text.strip():
-            report_text = self._build_partial_report(snapshot)
+            return {"error": "Partial report generation failed (report agent unavailable)."}
         reports_dir = Path("reports")
         reports_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         slug = slugify_for_filename(snapshot.task)
-        report_path = reports_dir / f"partial_report_{slug}_{ts}.md"
+        report_path = reports_dir / f"report_{slug}_{ts}.md"
         report_path.write_text(report_text, encoding="utf-8")
 
         with self._lock:
@@ -106,8 +112,12 @@ class RunManager:
                 return None
             state.report_text = report_text
             state.report_file_path = str(report_path)
+            if partial_usage:
+                state.token_usage = self._merge_usage_dicts(
+                    state.token_usage, partial_usage
+                )
             state.updated_at = _now()
-            state.tree["report_status"] = "partial_ready"
+            state.tree["report_status"] = "completed"
 
         self._publish_event(
             run_id,
@@ -115,7 +125,10 @@ class RunManager:
                 "run_id": run_id,
                 "timestamp": _now().isoformat(),
                 "event_type": "partial_report_generated",
-                "payload": {"report_file_path": str(report_path)},
+                "payload": {
+                    "report_file_path": str(report_path),
+                    "mode": "partial",
+                },
             },
         )
         return {"report_file_path": str(report_path)}
@@ -476,20 +489,9 @@ class RunManager:
                     },
                 )
 
-    def _build_partial_report_with_agent(self, snapshot: RunState) -> str:
-        state_file_path = snapshot.state_file_path or ""
-        if not state_file_path:
-            return ""
-        state_path = Path(state_file_path)
-        if not state_path.exists():
-            return ""
-        try:
-            raw = json.loads(state_path.read_text(encoding="utf-8"))
-        except Exception:
-            return ""
-        if not isinstance(raw, dict):
-            return ""
-
+    def _build_partial_report_with_agent(
+        self, snapshot: RunState
+    ) -> tuple[str, Optional[Dict[str, Any]]]:
         try:
             agent = DeepResearchAgent(
                 model=snapshot.model,
@@ -497,23 +499,49 @@ class RunManager:
                 max_depth=max(1, int(snapshot.max_depth)),
                 max_rounds=max(1, int(snapshot.max_rounds)),
                 results_per_query=max(1, int(snapshot.results_per_query)),
-                token_breakdown=False,
-                cost_estimate_enabled=False,
+                token_breakdown=True,
+                cost_estimate_enabled=True,
                 verbose=False,
             )
-            findings = agent._deserialize_findings(raw.get("findings", {}))
-            success_criteria = [
-                str(v).strip()
-                for v in raw.get("success_criteria", [])
-                if isinstance(v, str) and str(v).strip()
-            ]
-            stats = raw.get("search_stats", {})
-            if not isinstance(stats, dict):
-                stats = {}
-            total_search_calls = int(stats.get("total_calls", 0))
-            failed_search_calls = int(stats.get("failed_calls", 0))
-            queries_with_evidence = int(stats.get("queries_with_evidence", 0))
-            total_selected_results = int(stats.get("total_selected_results", 0))
+        except Exception:
+            return "", None
+
+        state_file_path = snapshot.state_file_path or ""
+        raw: Dict[str, Any] = {}
+        if state_file_path:
+            state_path = Path(state_file_path)
+            if state_path.exists():
+                try:
+                    parsed = json.loads(state_path.read_text(encoding="utf-8"))
+                    if isinstance(parsed, dict):
+                        raw = parsed
+                except Exception:
+                    raw = {}
+
+        try:
+            if raw:
+                findings = agent._deserialize_findings(raw.get("findings", {}))
+                success_criteria = [
+                    str(v).strip()
+                    for v in raw.get("success_criteria", [])
+                    if isinstance(v, str) and str(v).strip()
+                ]
+                stats = raw.get("search_stats", {})
+                if not isinstance(stats, dict):
+                    stats = {}
+                total_search_calls = int(stats.get("total_calls", 0))
+                failed_search_calls = int(stats.get("failed_calls", 0))
+                queries_with_evidence = int(stats.get("queries_with_evidence", 0))
+                total_selected_results = int(stats.get("total_selected_results", 0))
+            else:
+                findings, success_criteria, stats = self._derive_partial_context_from_tree(
+                    snapshot
+                )
+                total_search_calls = int(stats.get("total_calls", 0))
+                failed_search_calls = int(stats.get("failed_calls", 0))
+                queries_with_evidence = int(stats.get("queries_with_evidence", 0))
+                total_selected_results = int(stats.get("total_selected_results", 0))
+
             evidence_status, evidence_note = agent._assess_evidence_strength(
                 total_search_calls=total_search_calls,
                 failed_search_calls=failed_search_calls,
@@ -529,78 +557,111 @@ class RunManager:
                 findings=findings,
                 evidence_status=evidence_status,
                 evidence_note=evidence_note,
-                search_stats={
-                    "total_calls": total_search_calls,
-                    "failed_calls": failed_search_calls,
-                    "queries_with_evidence": queries_with_evidence,
-                    "total_selected_results": total_selected_results,
-                },
+                search_stats=stats,
             )
-            return agent.report_llm.text(
+            report_text = agent.report_llm.text(
                 SYSTEM_REPORT,
                 prompt,
                 stage="report_partial",
                 metadata={"task": snapshot.task[:120]},
             )
+            return report_text, agent.usage_tracker.to_dict()
         except Exception:
-            return ""
+            return "", None
 
-    def _build_partial_report(self, snapshot: RunState) -> str:
+    def _merge_usage_dicts(
+        self, base: Optional[Dict[str, Any]], delta: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        merged = dict(base) if isinstance(base, dict) else {}
+        base_events = (
+            merged.get("events", [])
+            if isinstance(merged.get("events", []), list)
+            else []
+        )
+        delta_events = (
+            delta.get("events", [])
+            if isinstance(delta.get("events", []), list)
+            else []
+        )
+        combined_events: List[Dict[str, Any]] = []
+        for e in base_events + delta_events:
+            if isinstance(e, dict):
+                combined_events.append(e)
+        enabled = bool(
+            (merged.get("enabled", False) if isinstance(merged, dict) else False)
+            or bool(delta.get("enabled", False))
+        )
+        cost_enabled = bool(
+            (merged.get("cost_enabled", False) if isinstance(merged, dict) else False)
+            or bool(delta.get("cost_enabled", False))
+        )
+        pricing_source = str(
+            delta.get("pricing_source")
+            or merged.get("pricing_source", "")
+            or "unknown"
+        )
+        tracker = UsageTracker(
+            enabled=enabled,
+            cost_enabled=cost_enabled,
+            pricing_source=pricing_source,
+            pricing_models={},
+            pricing_default={"input_per_1m": 0.0, "output_per_1m": 0.0},
+        )
+        tracker.load_from_dict({"events": combined_events})
+        out = tracker.to_dict()
+        out["pricing_source"] = pricing_source
+        return out
+
+    def _derive_partial_context_from_tree(
+        self, snapshot: RunState
+    ) -> tuple[Dict[str, SubQuestionFinding], List[str], Dict[str, int]]:
         tree = snapshot.tree if isinstance(snapshot.tree, dict) else {}
         rounds = tree.get("rounds", [])
-        lines: List[str] = []
-        lines.append(f"# Partial Research Report")
-        lines.append("")
-        lines.append(f"Task: {snapshot.task}")
-        lines.append(f"Run ID: {snapshot.run_id}")
-        lines.append(f"Status: {snapshot.status}")
-        lines.append(f"Generated at: {_now().isoformat()}")
-        lines.append("")
-        lines.append("## Evidence Collected So Far")
-        if not isinstance(rounds, list) or not rounds:
-            lines.append("- No research pass data is available yet.")
-        else:
+        findings: Dict[str, SubQuestionFinding] = {}
+        total_calls = 0
+        failed_calls = 0
+        queries_with_evidence = 0
+        total_selected_results = 0
+        if isinstance(rounds, list):
             for rnd in rounds:
-                pass_i = int(rnd.get("round", 0)) if isinstance(rnd, dict) else 0
-                lines.append(f"### Pass {pass_i}")
-                questions = rnd.get("questions", []) if isinstance(rnd, dict) else []
-                if not isinstance(questions, list) or not questions:
-                    lines.append("- No task steps recorded in this pass.")
+                if not isinstance(rnd, dict):
+                    continue
+                questions = rnd.get("questions", [])
+                if not isinstance(questions, list):
                     continue
                 for q in questions:
                     if not isinstance(q, dict):
                         continue
-                    sq = str(q.get("sub_question", ""))
-                    depth = int(q.get("depth", 1))
-                    status = str(q.get("status", "unknown"))
-                    lines.append(f"- Task: {sq} (depth={depth}, status={status})")
-                    steps = q.get("query_steps", [])
-                    if isinstance(steps, list):
-                        for st in steps:
-                            if not isinstance(st, dict):
-                                continue
-                            qtxt = str(st.get("query", ""))
-                            st_status = str(st.get("status", "queued"))
-                            selected = int(st.get("selected_results_count", 0))
-                            lines.append(
-                                f"  - Query [{st_status}]: {qtxt} (selected_results={selected})"
-                            )
-                            summary = str(st.get("synthesis_summary", "")).strip()
-                            if summary:
-                                lines.append(f"    - Synthesis: {summary}")
-                suff = rnd.get("sufficiency", {}) if isinstance(rnd, dict) else {}
-                if isinstance(suff, dict) and suff:
-                    lines.append(
-                        f"- Pass sufficiency: {'pass' if bool(suff.get('is_sufficient', False)) else 'fail'}"
+                    sq = str(q.get("sub_question", "")).strip()
+                    if not sq:
+                        continue
+                    finding = findings.setdefault(
+                        sq, SubQuestionFinding(sub_question=sq)
                     )
-                    reasoning = str(suff.get("reasoning", "")).strip()
-                    if reasoning:
-                        lines.append(f"  - Reasoning: {reasoning}")
-        lines.append("")
-        lines.append("## Limitations")
-        lines.append(
-            "- This is a partial report generated before normal completion; findings may be incomplete."
-        )
-        if snapshot.error:
-            lines.append(f"- Run error/abort context: {snapshot.error}")
-        return "\n".join(lines).strip() + "\n"
+                    if q.get("unresolved_reason"):
+                        finding.uncertainties.append(str(q.get("unresolved_reason", "")))
+                    steps = q.get("query_steps", [])
+                    if not isinstance(steps, list):
+                        continue
+                    for st in steps:
+                        if not isinstance(st, dict):
+                            continue
+                        status = str(st.get("status", ""))
+                        if status in {"success", "skipped", "cached", "running", "blocked"}:
+                            total_calls += 1
+                        if st.get("search_error"):
+                            failed_calls += 1
+                        selected = int(st.get("selected_results_count", 0))
+                        total_selected_results += selected
+                        if selected > 0:
+                            queries_with_evidence += 1
+                        summary = str(st.get("synthesis_summary", "")).strip()
+                        if summary:
+                            finding.summaries.append(summary)
+        stats = {
+            "total_calls": total_calls,
+            "failed_calls": failed_calls,
+            "queries_with_evidence": queries_with_evidence,
+            "total_selected_results": total_selected_results,
+        }
+        return findings, [], stats
