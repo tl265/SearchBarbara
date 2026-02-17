@@ -1,0 +1,16 @@
+{
+  "max_children_hard_cap": 7,
+  "prefer_min_children": true,
+  "default_child_range": [2, 5],
+  "depth_guidance": {
+    "shallow_max_depth": 2,
+    "deep_min_depth": 4
+  },
+  "mode_child_ranges": {
+    "broad_tilt": [3, 5],
+    "balanced_tilt": [2, 4],
+    "specific_tilt": [2, 3]
+  },
+  "overlap_threshold_for_mece_rewrite": 0.55,
+  "near_duplicate_threshold": 0.72
+}

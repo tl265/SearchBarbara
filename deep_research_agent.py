@@ -14,6 +14,7 @@ from openai import OpenAI, RateLimitError
 PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 SOURCE_POLICY_PATH = Path(__file__).resolve().parent / "source_policy.json"
 SEARCH_POLICY_PATH = Path(__file__).resolve().parent / "search_policy.json"
+DECOMPOSE_POLICY_PATH = Path(__file__).resolve().parent / "decompose_policy.json"
 
 DEFAULT_SEARCH_POLICY: Dict[str, Any] = {
     "cache_ttl_seconds": 3600,
@@ -24,6 +25,23 @@ DEFAULT_SEARCH_POLICY: Dict[str, Any] = {
     "time_sensitive_terms": ["latest", "today", "current", "update", "new"],
     "allow_rerun_on_search_error": True,
     "intent_collapse_similarity": 0.55,
+}
+
+DEFAULT_DECOMPOSE_POLICY: Dict[str, Any] = {
+    "max_children_hard_cap": 7,
+    "prefer_min_children": True,
+    "default_child_range": [2, 5],
+    "depth_guidance": {
+        "shallow_max_depth": 2,
+        "deep_min_depth": 4,
+    },
+    "mode_child_ranges": {
+        "broad_tilt": [3, 5],
+        "balanced_tilt": [2, 4],
+        "specific_tilt": [2, 3],
+    },
+    "overlap_threshold_for_mece_rewrite": 0.55,
+    "near_duplicate_threshold": 0.72,
 }
 
 
@@ -84,6 +102,69 @@ def load_search_policy() -> Dict[str, Any]:
         terms = [str(v).strip().lower() for v in raw["time_sensitive_terms"] if str(v).strip()]
         if terms:
             policy["time_sensitive_terms"] = terms
+    return policy
+
+
+def load_decompose_policy() -> Dict[str, Any]:
+    policy = json.loads(json.dumps(DEFAULT_DECOMPOSE_POLICY))
+    if not DECOMPOSE_POLICY_PATH.exists():
+        return policy
+    try:
+        raw = json.loads(DECOMPOSE_POLICY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return policy
+    if not isinstance(raw, dict):
+        return policy
+
+    if isinstance(raw.get("max_children_hard_cap"), int):
+        policy["max_children_hard_cap"] = min(
+            7, max(2, int(raw.get("max_children_hard_cap", 7)))
+        )
+    if isinstance(raw.get("prefer_min_children"), bool):
+        policy["prefer_min_children"] = raw["prefer_min_children"]
+
+    def _parse_pair(value: Any, fallback: List[int]) -> List[int]:
+        if (
+            isinstance(value, list)
+            and len(value) == 2
+            and isinstance(value[0], int)
+            and isinstance(value[1], int)
+        ):
+            lo = max(2, int(value[0]))
+            hi = min(7, int(value[1]))
+            if lo <= hi:
+                return [lo, hi]
+        return list(fallback)
+
+    policy["default_child_range"] = _parse_pair(
+        raw.get("default_child_range"), policy["default_child_range"]
+    )
+
+    if isinstance(raw.get("depth_guidance"), dict):
+        depth_guidance = raw["depth_guidance"]
+        if isinstance(depth_guidance.get("shallow_max_depth"), int):
+            policy["depth_guidance"]["shallow_max_depth"] = max(
+                1, int(depth_guidance["shallow_max_depth"])
+            )
+        if isinstance(depth_guidance.get("deep_min_depth"), int):
+            policy["depth_guidance"]["deep_min_depth"] = max(
+                policy["depth_guidance"]["shallow_max_depth"] + 1,
+                int(depth_guidance["deep_min_depth"]),
+            )
+
+    if isinstance(raw.get("mode_child_ranges"), dict):
+        ranges = raw["mode_child_ranges"]
+        for key in ("broad_tilt", "balanced_tilt", "specific_tilt"):
+            policy["mode_child_ranges"][key] = _parse_pair(
+                ranges.get(key), policy["mode_child_ranges"][key]
+            )
+
+    if isinstance(raw.get("overlap_threshold_for_mece_rewrite"), (int, float)):
+        v = float(raw["overlap_threshold_for_mece_rewrite"])
+        policy["overlap_threshold_for_mece_rewrite"] = min(0.95, max(0.3, v))
+    if isinstance(raw.get("near_duplicate_threshold"), (int, float)):
+        v = float(raw["near_duplicate_threshold"])
+        policy["near_duplicate_threshold"] = min(0.99, max(0.5, v))
     return policy
 
 
@@ -566,6 +647,7 @@ class DeepResearchAgent:
         self.should_abort = should_abort
         self.source_policy = load_source_policy()
         self.search_policy = load_search_policy()
+        self.decompose_policy = load_decompose_policy()
         self.query_memory: Dict[str, Dict[str, Any]] = {}
 
     def run(self, task: str) -> str:
@@ -712,6 +794,7 @@ class DeepResearchAgent:
                 "rounds": [],
                 "source_policy_file": str(SOURCE_POLICY_PATH),
                 "search_policy_file": str(SEARCH_POLICY_PATH),
+                "decompose_policy_file": str(DECOMPOSE_POLICY_PATH),
             }
             self._log("Initializing root task node (no upfront decomposition).")
             root_question = task.strip() or "Research task"
@@ -1372,6 +1455,10 @@ Known success criteria:
                                 sub_question=sq,
                                 success_criteria=success_criteria,
                                 node_gaps=node_gaps,
+                                node_reasoning=node_reasoning,
+                                depth=depth,
+                                max_depth=self.max_depth,
+                                finding=findings[sq],
                             )
                             children = self._dedupe_preserve_order(children)
                             if children:
@@ -1673,7 +1760,26 @@ Known success criteria:
         sub_question: str,
         success_criteria: List[str],
         node_gaps: List[str],
+        node_reasoning: str,
+        depth: int,
+        max_depth: int,
+        finding: SubQuestionFinding,
     ) -> List[str]:
+        mode = self._compute_decompose_mode_hint(
+            parent_question=sub_question,
+            node_gaps=node_gaps,
+            node_reasoning=node_reasoning,
+            depth=depth,
+            max_depth=max_depth,
+        )
+        compact = self._compact_findings(
+            findings={sub_question: finding},
+            summaries_limit=2,
+            facts_limit=8,
+            uncertainties_limit=4,
+            char_budget=7000,
+        )
+        hard_cap = int(self.decompose_policy.get("max_children_hard_cap", 7))
         prompt = textwrap.dedent(
             f"""
             Original task:
@@ -1682,13 +1788,30 @@ Known success criteria:
             Parent question to decompose:
             {sub_question}
 
+            Current depth:
+            {depth}
+
+            Max depth:
+            {max_depth}
+
+            Node sufficiency failure reasoning:
+            {node_reasoning}
+
             Known unresolved gaps:
             {json.dumps(node_gaps, ensure_ascii=False)}
 
             Success criteria:
             {json.dumps(success_criteria, ensure_ascii=False)}
 
-            Return only 2 to 4 child sub-questions focused on unresolved evidence gaps.
+            Current node evidence snapshot:
+            {json.dumps(compact, ensure_ascii=False)}
+
+            Decomposition style hint (guidance, not rigid):
+            {json.dumps(mode, ensure_ascii=False)}
+
+            Return child sub-questions focused on unresolved evidence gaps.
+            Use as few children as possible while keeping the set MECE and answerable.
+            Never return more than {hard_cap} children.
             """
         ).strip()
         try:
@@ -1705,11 +1828,16 @@ Known success criteria:
             plan.get("sub_questions"), "child_sub_questions"
         )
         filtered = [q for q in children if q.strip() and q.strip() != sub_question.strip()]
+        filtered = self._cap_children_by_distinctiveness(filtered, hard_cap)
         return self._enforce_mece_children(
             task=task,
             parent_question=sub_question,
             success_criteria=success_criteria,
             node_gaps=node_gaps,
+            node_reasoning=node_reasoning,
+            depth=depth,
+            max_depth=max_depth,
+            mode_hint=mode,
             candidates=filtered,
         )
 
@@ -1719,15 +1847,26 @@ Known success criteria:
         parent_question: str,
         success_criteria: List[str],
         node_gaps: List[str],
+        node_reasoning: str,
+        depth: int,
+        max_depth: int,
+        mode_hint: Dict[str, Any],
         candidates: List[str],
     ) -> List[str]:
+        hard_cap = int(self.decompose_policy.get("max_children_hard_cap", 7))
         cleaned = self._dedupe_preserve_order(
             [q.strip() for q in candidates if q.strip() and q.strip() != parent_question.strip()]
         )
+        cleaned = self._cap_children_by_distinctiveness(cleaned, hard_cap)
         if len(cleaned) <= 1:
             return cleaned
         # If overlap is high, ask once for a stricter MECE rewrite.
-        overlap_pairs = self._find_overlapping_question_pairs(cleaned, threshold=0.55)
+        overlap_pairs = self._find_overlapping_question_pairs(
+            cleaned,
+            threshold=float(
+                self.decompose_policy.get("overlap_threshold_for_mece_rewrite", 0.55)
+            ),
+        )
         if overlap_pairs:
             self._log(
                 "Child decomposition overlap detected; running MECE rewrite. "
@@ -1742,6 +1881,12 @@ Known success criteria:
                 Parent question:
                 {parent_question}
 
+                Current depth / max depth:
+                {depth} / {max_depth}
+
+                Node sufficiency failure reasoning:
+                {node_reasoning}
+
                 Unresolved gaps:
                 {json.dumps(node_gaps, ensure_ascii=False)}
 
@@ -1751,10 +1896,15 @@ Known success criteria:
                 Candidate child questions (overlapping):
                 {json.dumps(cleaned, ensure_ascii=False)}
 
-                Rewrite into 2 to 4 child questions that are MECE:
+                Decomposition style hint:
+                {json.dumps(mode_hint, ensure_ascii=False)}
+
+                Rewrite child questions that are MECE:
                 - Mutually Exclusive: no overlap/paraphrase.
                 - Collectively Exhaustive: covers unresolved scope.
                 - Specific and researchable.
+                - Use as few children as possible.
+                - Never exceed {hard_cap} children.
                 Return strict JSON only.
                 """
             ).strip()
@@ -1768,10 +1918,116 @@ Known success criteria:
                 cleaned = self._normalize_llm_list(
                     rewritten.get("sub_questions"), "child_sub_questions_mece_rewrite"
                 )
+                cleaned = self._cap_children_by_distinctiveness(cleaned, hard_cap)
             except Exception as exc:
                 self._log(f"MECE rewrite failed; keeping original children. error={exc}")
         # Final overlap cleanup to avoid near-duplicate siblings.
-        return self._drop_near_duplicate_questions(cleaned, threshold=0.72)
+        return self._drop_near_duplicate_questions(
+            cleaned,
+            threshold=float(self.decompose_policy.get("near_duplicate_threshold", 0.72)),
+        )
+
+    def _compute_decompose_mode_hint(
+        self,
+        parent_question: str,
+        node_gaps: List[str],
+        node_reasoning: str,
+        depth: int,
+        max_depth: int,
+    ) -> Dict[str, Any]:
+        depth_guidance = self.decompose_policy.get("depth_guidance", {})
+        shallow_max = int(depth_guidance.get("shallow_max_depth", 2))
+        deep_min = int(depth_guidance.get("deep_min_depth", 4))
+
+        if depth <= shallow_max:
+            mode = "broad_tilt"
+        elif depth >= deep_min:
+            mode = "specific_tilt"
+        else:
+            mode = "balanced_tilt"
+
+        text = " ".join(
+            [parent_question, node_reasoning] + [g for g in node_gaps if isinstance(g, str)]
+        ).lower()
+        broad_markers = (
+            "market",
+            "ecosystem",
+            "landscape",
+            "overall",
+            "framework",
+            "全局",
+            "整体",
+            "格局",
+            "体系",
+        )
+        specific_markers = (
+            "metric",
+            "kpi",
+            "implementation",
+            "api",
+            "latency",
+            "cost",
+            "adoption",
+            "份额",
+            "增速",
+            "渗透率",
+            "成本",
+            "延迟",
+        )
+        broad_score = sum(1 for tok in broad_markers if tok in text)
+        specific_score = sum(1 for tok in specific_markers if tok in text)
+        if specific_score >= broad_score + 2:
+            mode = "specific_tilt"
+        elif broad_score >= specific_score + 2 and depth <= max(shallow_max + 1, 3):
+            mode = "broad_tilt"
+
+        ranges = self.decompose_policy.get("mode_child_ranges", {})
+        suggested = ranges.get(mode) or self.decompose_policy.get("default_child_range", [2, 5])
+        if (
+            not isinstance(suggested, list)
+            or len(suggested) != 2
+            or not all(isinstance(v, int) for v in suggested)
+        ):
+            suggested = [2, 5]
+        suggested_min = max(2, int(suggested[0]))
+        suggested_max = min(
+            int(self.decompose_policy.get("max_children_hard_cap", 7)),
+            max(suggested_min, int(suggested[1])),
+        )
+        return {
+            "mode": mode,
+            "depth": depth,
+            "max_depth": max_depth,
+            "suggested_child_range": [suggested_min, suggested_max],
+            "instruction": "Depth is guidance, not rigid; prioritize minimum viable MECE decomposition.",
+        }
+
+    def _cap_children_by_distinctiveness(
+        self, questions: List[str], max_children: int
+    ) -> List[str]:
+        cleaned = self._dedupe_preserve_order(questions)
+        cap = max(2, min(7, int(max_children)))
+        if len(cleaned) <= cap:
+            return cleaned
+        kept: List[str] = [cleaned[0]]
+        for q in cleaned[1:]:
+            if len(kept) >= cap:
+                break
+            qn = self._normalize_query_intent(q)
+            if not qn:
+                continue
+            max_sim = 0.0
+            for k in kept:
+                kn = self._normalize_query_intent(k)
+                max_sim = max(max_sim, self._query_similarity(qn, kn))
+            if max_sim < 0.85:
+                kept.append(q)
+        for q in cleaned:
+            if len(kept) >= cap:
+                break
+            if q not in kept:
+                kept.append(q)
+        return kept[:cap]
 
     def _find_overlapping_question_pairs(
         self, questions: List[str], threshold: float
