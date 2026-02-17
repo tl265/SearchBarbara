@@ -58,7 +58,7 @@ Key web endpoints:
 
 Options:
 
-- `--max-depth` max recursive decomposition depth per question node (default `4`)
+- `--max-depth` max recursive decomposition depth per question node (default `3`)
 - `--max-rounds` max iterative research rounds (default `1`)
 - `--results-per-query` baseline results per web query before adaptive broadening (default `3`)
 - `--trace-file` optional custom path for execution trace JSON
@@ -70,8 +70,8 @@ Options:
 - `--no-token-breakdown` disable token tracking and usage summary
 - `--no-cost-estimate` disable cost estimation while keeping token tracking
 - `--quiet` disable progress logs
-- `--model` research model for planning/search/synthesis/sufficiency (defaults to `OPENAI_MODEL` or `gpt-4.1`)
-- `--report-model` final report model (defaults to `OPENAI_REPORT_MODEL` or `gpt-5.2`)
+- `--model` research model for query generation/search/synthesis/sufficiency (defaults to `OPENAI_MODEL` or `gpt-4.1`)
+- `--report-model` report/decomposition model for final report writing and question decomposition (defaults to `OPENAI_REPORT_MODEL` or `gpt-5.2`)
 
 ## Notes
 

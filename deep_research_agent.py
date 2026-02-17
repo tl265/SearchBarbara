@@ -2595,7 +2595,7 @@ def main() -> None:
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=4,
+        default=3,
         help="Max recursive decomposition depth per question node",
     )
     parser.add_argument(
