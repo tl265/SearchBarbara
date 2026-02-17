@@ -462,6 +462,7 @@ function eventNarration(ev) {
   if (et === "synthesis_completed") return "Synthesized evidence from selected sources.";
   if (et === "node_sufficiency_started") return "Running node sufficiency check, please wait a moment...";
   if (et === "node_sufficiency_completed") return `Node sufficiency: ${p.is_sufficient ? "pass" : "fail"}.`;
+  if (et === "node_decomposition_started") return "Node sufficiency failed, decomposing into child tasks...";
   if (et === "node_decomposed") return `Insufficient evidence, decomposed into ${Array.isArray(p.children) ? p.children.length : 0} child tasks.`;
   if (et === "node_completed") return "Task node resolved.";
   if (et === "sufficiency_started") return "Running pass sufficiency check, please wait a moment...";
@@ -473,6 +474,12 @@ function eventNarration(ev) {
   if (et === "report_generation_completed") return "Report generation completed.";
   if (et === "report_generation_failed") return "Report generation failed.";
   if (et === "partial_report_generated") return "Generated report from current findings.";
+  if (et === "run_heartbeat") {
+    const phase = p.phase || "processing";
+    if (p.query) return `Still working (${phase}): ${p.query}`;
+    if (p.sub_question) return `Still working (${phase}): ${p.sub_question}`;
+    return `Still working (${phase})...`;
+  }
   if (et === "run_completed") return "Run complete. Final report ready.";
   if (et === "run_failed") return `Run failed: ${p.error || "unknown error"}`;
   return "";
@@ -493,6 +500,7 @@ function mergeChildren(a, b) {
 function mergeNodeStatus(prevStatus, nextStatus) {
   const rank = {
     running: 6,
+    decomposing: 6,
     solved_via_children: 5,
     solved: 5,
     success: 5,
@@ -699,7 +707,7 @@ function buildNodeVisualStateMap(byDepth) {
       const status = String(q.status || "");
       const steps = Array.isArray(q.query_steps) ? q.query_steps : [];
       const hasRunningStep = steps.some((s) => String((s && s.status) || "") === "running");
-      if (status === "running" || hasRunningStep) {
+      if (status === "running" || status === "decomposing" || hasRunningStep) {
         runningKeys.add(key);
       }
     }
@@ -756,13 +764,6 @@ function renderCanvas(tree) {
       return `<div class="muted">No task nodes yet.</div>`;
     }
 
-    const hasRunning = depths.some((d) => {
-      for (const q of byDepth.get(d).values()) {
-        if (String(q.status || "") === "running") return true;
-      }
-      return false;
-    });
-
     let html = `<div class="depth-rows">`;
     for (const d of depths) {
       html += `<section class="depth-row"><p class="depth-title">Depth ${d}</p>`;
@@ -783,14 +784,26 @@ function renderCanvas(tree) {
         }
         const st = String(q.status || "queued");
         const cls = statusClass(st);
-        const dim = hasRunning && st !== "running" && visualCls !== "state-active" ? "dimmed" : "";
+        const solvedStatuses = new Set(["solved", "solved_via_children", "success", "completed"]);
+        const unresolvedStatuses = new Set(["unresolved", "failed", "dead_end", "stopped", "aborted"]);
+        const visitedOutcomeCls =
+          visualCls === "state-visited"
+            ? (solvedStatuses.has(st) ? "visited-solved" : (unresolvedStatuses.has(st) ? "visited-unresolved" : "visited-neutral"))
+            : "";
+        const dim = visualCls === "state-planned" ? "dimmed" : "";
         const parentCls = q.parent ? "has-parent" : "";
-        const activeCls = st === "running" ? "active-node" : "";
+        const stLower = st.toLowerCase();
+        const isRunning = ["running", "researching", "decomposing"].includes(stLower);
+        const isDecomposed = ["decomposed", "decomposed_child"].includes(stLower);
+        const activeStateCls = (visualCls === "state-active" && isRunning)
+          ? "active-running"
+          : ((visualCls === "state-active" && isDecomposed) ? "active-decomposed" : "");
+        const activeEmphasisCls = visualCls === "state-active" ? "active-emphasis" : "";
         const pathId = String(q.node_id || nodeIdMap.get(key) || "");
         const nodeId = (passNo !== null && passNo !== undefined && passNo !== "")
           ? (pathId ? `P${passNo}/${pathId}` : "")
           : pathId;
-        html += `<article class="node ${esc(cls)} ${esc(dim)} ${esc(parentCls)} ${esc(activeCls)} ${esc(visualCls)}">`;
+        html += `<article class="node ${esc(cls)} ${esc(dim)} ${esc(parentCls)} ${esc(activeStateCls)} ${esc(activeEmphasisCls)} ${esc(visualCls)} ${esc(visitedOutcomeCls)}" data-node-depth="${Number(d)}" data-node-status="${esc(stLower)}">`;
         html += `<div class="node-head"><span class="badge ${esc(cls)}">${esc(shortStatus(st))}</span>`;
         html += `<span class="badge">${esc(visualLabel)}</span>`;
         html += `<span class="badge">d${d}</span></div>`;
@@ -907,14 +920,37 @@ function renderCanvas(tree) {
   canvasEl.innerHTML = html;
   restoreAndTrackDetailState();
   refreshCanvasZoomForCurrentLayout();
-  const active = canvasEl.querySelector(".active-node");
+  const active = pickAutoFollowTargetNode();
   if (autoFollowActiveNode && active && typeof active.scrollIntoView === "function") {
     suppressUserScrollDetection = true;
-    active.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "center" });
+    active.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
     window.setTimeout(() => {
       suppressUserScrollDetection = false;
     }, 250);
   }
+}
+
+function pickAutoFollowTargetNode() {
+  const nodes = Array.from(canvasEl.querySelectorAll(".node.state-active"));
+  if (!nodes.length) return null;
+  let best = null;
+  let bestScore = -1;
+  for (let i = 0; i < nodes.length; i += 1) {
+    const node = nodes[i];
+    const status = String(node.getAttribute("data-node-status") || "").toLowerCase();
+    const depth = Number(node.getAttribute("data-node-depth") || 0);
+    const isRunning = node.classList.contains("running")
+      || node.classList.contains("active-running")
+      || status === "running"
+      || status === "decomposing"
+      || status === "researching";
+    const score = (isRunning ? 1_000_000 : 0) + (depth * 1_000) + i;
+    if (score > bestScore) {
+      bestScore = score;
+      best = node;
+    }
+  }
+  return best;
 }
 
 function applySnapshot(snap) {
@@ -985,10 +1021,10 @@ function connectEvents(runId) {
     "run_started", "plan_created", "round_started", "sub_question_started", "queries_generated",
     "query_started", "query_diagnostic", "query_skipped_cached", "query_rerun_allowed",
     "query_broadened", "query_blocked_diminishing_returns", "search_completed", "synthesis_completed",
-    "node_sufficiency_started", "node_sufficiency_completed", "node_decomposed", "node_completed", "node_unresolved",
+    "node_sufficiency_started", "node_sufficiency_completed", "node_decomposition_started", "node_decomposed", "node_completed", "node_unresolved",
     "sufficiency_started", "sufficiency_completed", "run_abort_requested", "abort_requested", "run_aborted",
     "report_generation_started", "report_generation_completed", "report_generation_failed",
-    "partial_report_generated", "run_completed", "run_failed"
+    "partial_report_generated", "run_heartbeat", "run_completed", "run_failed"
   ];
   for (const e of events) {
     es.addEventListener(e, async (evt) => {
@@ -1137,16 +1173,33 @@ async function bootstrapFromUrl() {
 
 bootstrapFromUrl();
 
-canvasEl.addEventListener("scroll", () => {
+function disableAutoFollowFromUserAction(evt) {
   if (suppressUserScrollDetection) return;
+  if (evt) {
+    if (evt.type === "keydown") {
+      // Ignore typing/navigation keys when user is editing inputs.
+      const ae = document.activeElement;
+      if (ae) {
+        const tag = String(ae.tagName || "").toLowerCase();
+        const editable = !!ae.isContentEditable;
+        if (editable || tag === "input" || tag === "textarea" || tag === "select") {
+          return;
+        }
+      }
+    }
+  }
   autoFollowActiveNode = false;
-});
+}
 
-window.addEventListener(
-  "scroll",
-  () => {
-    if (suppressUserScrollDetection) return;
-    autoFollowActiveNode = false;
-  },
-  { passive: true }
-);
+canvasEl.addEventListener("wheel", disableAutoFollowFromUserAction, { passive: true });
+canvasEl.addEventListener("touchstart", disableAutoFollowFromUserAction, { passive: true });
+
+window.addEventListener("wheel", disableAutoFollowFromUserAction, { passive: true });
+window.addEventListener("touchstart", disableAutoFollowFromUserAction, { passive: true });
+
+window.addEventListener("keydown", (evt) => {
+  const key = String(evt.key || "");
+  if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(key)) {
+    disableAutoFollowFromUserAction(evt);
+  }
+});

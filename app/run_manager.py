@@ -21,11 +21,14 @@ def _now() -> datetime:
 
 
 class RunManager:
-    def __init__(self) -> None:
+    _DEFAULT_HEARTBEAT_INTERVAL_SEC = 8.0
+
+    def __init__(self, heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC) -> None:
         self._runs: Dict[str, RunState] = {}
         self._subscribers: Dict[str, List[Queue]] = {}
         self._cancel_flags: Dict[str, bool] = {}
         self._lock = threading.Lock()
+        self._heartbeat_interval_sec = max(1.0, float(heartbeat_interval_sec))
 
     def create_run(
         self,
@@ -393,6 +396,13 @@ class RunManager:
             )
             qnode["status"] = "decomposed"
             return
+        if et == "node_decomposition_started":
+            round_i = int(payload.get("round", 0))
+            sq = str(payload.get("sub_question", ""))
+            rnd = self._ensure_round(tree, round_i)
+            qnode = self._ensure_question(rnd, sq)
+            qnode["status"] = "decomposing"
+            return
         if et == "node_sufficiency_completed":
             round_i = int(payload.get("round", 0))
             sq = str(payload.get("sub_question", ""))
@@ -512,7 +522,84 @@ class RunManager:
         slug = slugify_for_filename(task)
         report_path = reports_dir / f"report_{slug}_{ts}.md"
 
+        phase_lock = threading.Lock()
+        phase_info: Dict[str, Any] = {
+            "phase": "initializing",
+            "last_event_type": "run_started",
+            "sub_question": "",
+            "query": "",
+            "updated_at": _now().isoformat(),
+        }
+
+        def set_phase(event_type: str, payload: Dict[str, Any]) -> None:
+            payload = payload if isinstance(payload, dict) else {}
+            phase = "working"
+            if event_type == "run_started":
+                phase = "initializing"
+            elif event_type in {"sub_question_started", "queries_generated"}:
+                phase = "planning_node"
+            elif event_type in {
+                "query_started",
+                "query_diagnostic",
+                "query_rerun_allowed",
+                "query_broadened",
+            }:
+                phase = "searching"
+            elif event_type in {"query_skipped_cached", "query_blocked_diminishing_returns"}:
+                phase = "query_decision"
+            elif event_type in {"search_completed", "synthesis_completed"}:
+                phase = "synthesizing"
+            elif event_type in {"node_sufficiency_started", "node_sufficiency_completed"}:
+                phase = "node_sufficiency"
+            elif event_type in {"node_decomposition_started", "node_decomposed"}:
+                phase = "decomposing"
+            elif event_type in {"sufficiency_started", "sufficiency_completed"}:
+                phase = "run_sufficiency"
+            elif event_type in {"report_generation_started", "partial_report_generated"}:
+                phase = "writing_report"
+            elif event_type in {"run_completed", "run_failed", "run_aborted"}:
+                phase = "terminal"
+
+            with phase_lock:
+                phase_info["phase"] = phase
+                phase_info["last_event_type"] = event_type
+                phase_info["sub_question"] = str(payload.get("sub_question", "")).strip()
+                phase_info["query"] = str(payload.get("query", "")).strip()
+                phase_info["updated_at"] = _now().isoformat()
+
+        heartbeat_stop = threading.Event()
+
+        def heartbeat_worker() -> None:
+            while not heartbeat_stop.wait(self._heartbeat_interval_sec):
+                with self._lock:
+                    state = self._runs.get(run_id)
+                    if not state or state.status in {"completed", "failed"}:
+                        return
+                with phase_lock:
+                    payload = {
+                        "phase": str(phase_info.get("phase", "working")),
+                        "last_event_type": str(
+                            phase_info.get("last_event_type", "")
+                        ),
+                        "sub_question": str(phase_info.get("sub_question", "")),
+                        "query": str(phase_info.get("query", "")),
+                        "phase_updated_at": str(phase_info.get("updated_at", "")),
+                    }
+                self._publish_event(
+                    run_id,
+                    {
+                        "run_id": run_id,
+                        "timestamp": _now().isoformat(),
+                        "event_type": "run_heartbeat",
+                        "payload": payload,
+                    },
+                )
+
+        heartbeat_thread = threading.Thread(target=heartbeat_worker, daemon=True)
+        heartbeat_thread.start()
+
         def callback(event: Dict[str, Any]) -> None:
+            set_phase(str(event.get("event_type", "")), event.get("payload", {}))
             self._publish_event(run_id, event)
 
         def should_abort() -> bool:
@@ -578,6 +665,9 @@ class RunManager:
                         "payload": {"error": error_text},
                     },
                 )
+        finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
 
     def _best_effort_usage_snapshot(self, snapshot: RunState) -> Optional[Dict[str, Any]]:
         if isinstance(snapshot.token_usage, dict):

@@ -853,6 +853,7 @@ class DeepResearchAgent:
                     "frontier_questions": frontier_questions,
                     "questions": [],
                 }
+                trace["rounds"].append(round_trace)
                 round_new_fact_gain = 0
                 round_extra_queries_by_question = self._assign_follow_up_queries(
                     frontier_questions, self._dedupe_preserve_order(extra_queries)
@@ -928,8 +929,10 @@ class DeepResearchAgent:
                         "sub_question": sq,
                         "depth": depth,
                         "parent": parent,
+                        "status": "running",
                         "query_steps": [],
                     }
+                    round_trace["questions"].append(question_trace)
                     query_prompt = f"""Original task:
 {task}
 
@@ -1351,11 +1354,19 @@ Known success criteria:
                                 },
                             )
                             question_trace["status"] = "solved"
-                            round_trace["questions"].append(question_trace)
                             save_checkpoint(status="running", next_round=round_i)
                             return True
 
                         if depth < self.max_depth:
+                            self._emit(
+                                "node_decomposition_started",
+                                {
+                                    "round": round_i,
+                                    "sub_question": sq,
+                                    "depth": depth,
+                                },
+                            )
+                            question_trace["status"] = "decomposing"
                             children = self._decompose_sub_question(
                                 task=task,
                                 sub_question=sq,
@@ -1404,7 +1415,6 @@ Known success criteria:
                                     )
                                     resolved_questions.add(sq)
                                     question_trace["status"] = "solved_via_children"
-                                    round_trace["questions"].append(question_trace)
                                     save_checkpoint(status="running", next_round=round_i)
                                     return True
                                 self._emit(
@@ -1419,7 +1429,6 @@ Known success criteria:
                                 question_trace["status"] = "unresolved"
                                 question_trace["unresolved_reason"] = "children_insufficient"
                                 next_unresolved.append(sq)
-                                round_trace["questions"].append(question_trace)
                                 save_checkpoint(status="running", next_round=round_i)
                                 return False
 
@@ -1436,7 +1445,6 @@ Known success criteria:
                         question_trace["status"] = "unresolved"
                         question_trace["unresolved_reason"] = reason
                         next_unresolved.append(sq)
-                        round_trace["questions"].append(question_trace)
                         save_checkpoint(status="running", next_round=round_i)
                         return False
                     finally:
@@ -1489,7 +1497,6 @@ Known success criteria:
                 round_trace["sufficiency"] = suff
                 round_trace["round_new_fact_gain"] = round_new_fact_gain
                 round_trace["frontier_remaining"] = unresolved_questions
-                trace["rounds"].append(round_trace)
                 self._emit(
                     "sufficiency_completed",
                     {

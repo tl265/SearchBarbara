@@ -17,7 +17,6 @@ from app.sse import format_sse
 BASE_DIR = Path(__file__).resolve().parent
 WEB_CONFIG_PATH = BASE_DIR.parent / "web_config.json"
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
-run_manager = RunManager()
 
 app = FastAPI(title="SearchBarbara Web")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -30,6 +29,7 @@ def _load_web_config() -> Dict[str, Any]:
         "report_model": "gpt-5.2",
         "min_canvas_zoom": 0.45,
         "auto_fit_safety_px": 10,
+        "heartbeat_interval_sec": 8,
     }
     if not WEB_CONFIG_PATH.exists():
         return default
@@ -59,16 +59,26 @@ def _load_web_config() -> Dict[str, Any]:
         )
     except (TypeError, ValueError):
         auto_fit_safety_px = default["auto_fit_safety_px"]
+    try:
+        heartbeat_interval_sec = float(
+            raw.get("heartbeat_interval_sec", default["heartbeat_interval_sec"])
+        )
+    except (TypeError, ValueError):
+        heartbeat_interval_sec = default["heartbeat_interval_sec"]
     return {
         "max_rounds": max(1, max_rounds),
         "model": model,
         "report_model": report_model,
         "min_canvas_zoom": min(max(min_canvas_zoom, 0.1), 0.95),
         "auto_fit_safety_px": max(0, min(auto_fit_safety_px, 200)),
+        "heartbeat_interval_sec": min(max(heartbeat_interval_sec, 1.0), 120.0),
     }
 
 
 WEB_CONFIG = _load_web_config()
+run_manager = RunManager(
+    heartbeat_interval_sec=float(WEB_CONFIG.get("heartbeat_interval_sec", 8))
+)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -180,6 +190,8 @@ def _latest_thought(events: List[Dict[str, Any]]) -> str:
         )
     if et == "node_decomposed":
         return f"Decomposed into {len(payload.get('children', [])) if isinstance(payload.get('children', []), list) else 0} child tasks."
+    if et == "node_decomposition_started":
+        return "Node sufficiency failed; decomposing into child tasks."
     if et == "sufficiency_completed":
         return "Pass-level sufficiency check completed."
     if et == "run_completed":
@@ -190,6 +202,15 @@ def _latest_thought(events: List[Dict[str, Any]]) -> str:
         return f"Run failed: {payload.get('error', 'unknown error')}"
     if et == "partial_report_generated":
         return "Partial report generated from current findings."
+    if et == "run_heartbeat":
+        phase = str(payload.get("phase", "")).strip()
+        sq = str(payload.get("sub_question", "")).strip()
+        query = str(payload.get("query", "")).strip()
+        if query:
+            return f"Still working ({phase or 'processing'}): {query}"
+        if sq:
+            return f"Still working ({phase or 'processing'}): {sq}"
+        return f"Still working ({phase or 'processing'})."
     return et.replace("_", " ").strip().capitalize()
 
 
