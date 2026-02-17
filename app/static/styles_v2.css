@@ -21,6 +21,7 @@ body {
   font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
   color: var(--ink);
   background: radial-gradient(circle at top left, #e8f4ef 0%, var(--bg) 45%, #edf2f7 100%);
+  overflow-x: hidden;
 }
 
 .app-shell {
@@ -170,14 +171,14 @@ h3 { margin: 12px 0 6px; font-size: 0.95rem; }
   flex-direction: column;
   gap: 10px;
   min-height: 200px;
-  width: 100%;
-  min-width: 0;
+  width: max-content;
+  min-width: 100%;
 }
 .depth-row {
   border-left: 3px solid #dbe5ea;
   padding-left: 8px;
-  width: 100%;
-  min-width: 0;
+  width: max-content;
+  min-width: 100%;
 }
 .depth-row-nodes {
   display: flex;
@@ -185,19 +186,16 @@ h3 { margin: 12px 0 6px; font-size: 0.95rem; }
   flex-wrap: nowrap;
   align-items: stretch;
   justify-content: center;
-  overflow-x: auto;
-  overflow-y: hidden;
+  overflow-x: hidden;
+  overflow-y: visible;
   padding-bottom: 8px;
-  scroll-behavior: smooth;
-  scroll-snap-type: x proximity;
-  width: 100%;
-  min-width: 0;
+  width: max-content;
+  min-width: 100%;
 }
 .depth-row-nodes .node {
   width: var(--node-card-width, 340px);
   min-width: var(--node-card-width, 340px);
   flex: 0 0 var(--node-card-width, 340px);
-  scroll-snap-align: center;
 }
 .depth-title {
   font-size: 0.82rem;
@@ -269,16 +267,20 @@ h3 { margin: 12px 0 6px; font-size: 0.95rem; }
 
 .node-head {
   display: flex;
+  flex-wrap: wrap;
   gap: 6px;
   align-items: center;
   margin-bottom: 6px;
   font-size: 0.84em;
+  min-width: 0;
 }
 .badge {
   border-radius: 999px;
   border: 1px solid var(--line);
   padding: 1px 7px;
   background: #fff;
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 .badge.running { border-color: var(--running); color: #0369a1; }
 .badge.success { border-color: var(--success); color: #166534; }

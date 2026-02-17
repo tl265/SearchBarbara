@@ -37,7 +37,8 @@ let es = null;
 let reportGenerating = false;
 let abortRequested = false;
 let autoFollowActiveNode = true;
-let suppressUserScrollDetection = false;
+let lastAutoFollowNodeKey = "";
+let skipNextCanvasScrollDisable = false;
 const thoughts = [];
 const openDetailKeys = new Set();
 const forceClosedDetailKeys = new Set();
@@ -102,8 +103,9 @@ function setCanvasScaleVariables(scale) {
 
 function hasHorizontalOverflow() {
   const rowEls = Array.from(canvasEl.querySelectorAll(".depth-row-nodes"));
-  const viewportLeft = 0;
-  const viewportRight = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+  const canvasRect = canvasEl.getBoundingClientRect();
+  const viewportLeft = Math.floor(canvasRect.left);
+  const viewportRight = Math.ceil(canvasRect.right);
   return rowEls.some((row) => {
     const rect = row.getBoundingClientRect();
     const visibleWidth = Math.max(
@@ -131,8 +133,9 @@ function getFitDiagnostics() {
   let worstClientWidth = 0;
   let worstScrollWidth = 0;
   let worstVisibleWidth = 0;
-  const viewportLeft = 0;
-  const viewportRight = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
+  const canvasRect = canvasEl.getBoundingClientRect();
+  const viewportLeft = Math.floor(canvasRect.left);
+  const viewportRight = Math.ceil(canvasRect.right);
   for (let i = 0; i < rowEls.length; i += 1) {
     const row = rowEls[i];
     const cw = Math.floor(row.clientWidth);
@@ -803,7 +806,7 @@ function renderCanvas(tree) {
         const nodeId = (passNo !== null && passNo !== undefined && passNo !== "")
           ? (pathId ? `P${passNo}/${pathId}` : "")
           : pathId;
-        html += `<article class="node ${esc(cls)} ${esc(dim)} ${esc(parentCls)} ${esc(activeStateCls)} ${esc(activeEmphasisCls)} ${esc(visualCls)} ${esc(visitedOutcomeCls)}" data-node-depth="${Number(d)}" data-node-status="${esc(stLower)}">`;
+        html += `<article class="node ${esc(cls)} ${esc(dim)} ${esc(parentCls)} ${esc(activeStateCls)} ${esc(activeEmphasisCls)} ${esc(visualCls)} ${esc(visitedOutcomeCls)}" data-node-depth="${Number(d)}" data-node-status="${esc(stLower)}" data-node-id="${esc(nodeId || "")}" data-node-key="${esc(key)}">`;
         html += `<div class="node-head"><span class="badge ${esc(cls)}">${esc(shortStatus(st))}</span>`;
         html += `<span class="badge">${esc(visualLabel)}</span>`;
         html += `<span class="badge">d${d}</span></div>`;
@@ -922,12 +925,32 @@ function renderCanvas(tree) {
   refreshCanvasZoomForCurrentLayout();
   const active = pickAutoFollowTargetNode();
   if (autoFollowActiveNode && active && typeof active.scrollIntoView === "function") {
-    suppressUserScrollDetection = true;
-    active.scrollIntoView({ behavior: "smooth", block: "center", inline: "center" });
-    window.setTimeout(() => {
-      suppressUserScrollDetection = false;
-    }, 250);
+    const nodeKey = String(active.getAttribute("data-node-key") || "");
+    const nodeId = String(active.getAttribute("data-node-id") || "");
+    const followKey = nodeId || nodeKey;
+    const shouldRecenter = followKey !== lastAutoFollowNodeKey || !isNodeMostlyVisibleInCanvas(active);
+    if (shouldRecenter) {
+      skipNextCanvasScrollDisable = true;
+      active.scrollIntoView({ behavior: "auto", block: "nearest", inline: "center" });
+      lastAutoFollowNodeKey = followKey;
+    }
   }
+}
+
+function isNodeMostlyVisibleInCanvas(node) {
+  if (!node || !canvasEl) return false;
+  const nr = node.getBoundingClientRect();
+  const cr = canvasEl.getBoundingClientRect();
+  const interLeft = Math.max(nr.left, cr.left);
+  const interRight = Math.min(nr.right, cr.right);
+  const interTop = Math.max(nr.top, cr.top);
+  const interBottom = Math.min(nr.bottom, cr.bottom);
+  const interW = Math.max(0, interRight - interLeft);
+  const interH = Math.max(0, interBottom - interTop);
+  const nodeW = Math.max(1, nr.width);
+  const nodeH = Math.max(1, nr.height);
+  const visibleRatio = (interW * interH) / (nodeW * nodeH);
+  return visibleRatio >= 0.75;
 }
 
 function pickAutoFollowTargetNode() {
@@ -1054,6 +1077,7 @@ async function startRun() {
   showError("");
   abortRequested = false;
   autoFollowActiveNode = true;
+  lastAutoFollowNodeKey = "";
   thoughts.length = 0;
   thoughtStreamEl.innerHTML = "";
 
@@ -1174,7 +1198,6 @@ async function bootstrapFromUrl() {
 bootstrapFromUrl();
 
 function disableAutoFollowFromUserAction(evt) {
-  if (suppressUserScrollDetection) return;
   if (evt) {
     if (evt.type === "keydown") {
       // Ignore typing/navigation keys when user is editing inputs.
@@ -1193,6 +1216,17 @@ function disableAutoFollowFromUserAction(evt) {
 
 canvasEl.addEventListener("wheel", disableAutoFollowFromUserAction, { passive: true });
 canvasEl.addEventListener("touchstart", disableAutoFollowFromUserAction, { passive: true });
+canvasEl.addEventListener(
+  "scroll",
+  () => {
+    if (skipNextCanvasScrollDisable) {
+      skipNextCanvasScrollDisable = false;
+      return;
+    }
+    autoFollowActiveNode = false;
+  },
+  { passive: true, capture: true }
+);
 
 window.addEventListener("wheel", disableAutoFollowFromUserAction, { passive: true });
 window.addEventListener("touchstart", disableAutoFollowFromUserAction, { passive: true });
