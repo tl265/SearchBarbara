@@ -48,6 +48,9 @@ h1 { margin: 0; font-size: 1.4rem; }
   flex-wrap: wrap;
   font-size: 0.86rem;
 }
+.top-metrics {
+  display: none;
+}
 .top-metrics div {
   background: #fff;
   border: 1px solid var(--line);

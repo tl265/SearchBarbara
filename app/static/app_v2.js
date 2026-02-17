@@ -291,6 +291,30 @@ function renderTokenSummary(usage) {
   usageEl.textContent = JSON.stringify(total, null, 2);
 }
 
+function renderInlineMarkdown(text) {
+  const raw = String(text || "");
+  const linkRe = /\[([^\]\r\n]+)\]\(([^)\r\n]+)\)/g;
+  let html = "";
+  let lastIdx = 0;
+  let m = null;
+  while ((m = linkRe.exec(raw)) !== null) {
+    const full = String(m[0] || "");
+    const label = String(m[1] || "").trim();
+    const url = String(m[2] || "").trim();
+    html += esc(raw.slice(lastIdx, m.index));
+    const safeUrl = toSafeHttpUrl(url);
+    if (safeUrl) {
+      const safeLabel = esc(label || shortSourceLabel(safeUrl));
+      html += `<a href="${esc(safeUrl)}" target="_blank" rel="noopener noreferrer">${safeLabel}</a>`;
+    } else {
+      html += esc(label || full);
+    }
+    lastIdx = m.index + full.length;
+  }
+  html += esc(raw.slice(lastIdx));
+  return html;
+}
+
 function markdownToHtml(md) {
   const lines = String(md || "").split(/\r?\n/);
   const out = [];
@@ -301,7 +325,7 @@ function markdownToHtml(md) {
         out.push("<ul>");
         inList = true;
       }
-      const item = esc(line.replace(/^\s*[-*]\s+/, ""));
+      const item = renderInlineMarkdown(line.replace(/^\s*[-*]\s+/, ""));
       out.push(`<li>${item}</li>`);
       continue;
     }
@@ -310,15 +334,15 @@ function markdownToHtml(md) {
       inList = false;
     }
     if (/^###\s+/.test(line)) {
-      out.push(`<h3>${esc(line.replace(/^###\s+/, ""))}</h3>`);
+      out.push(`<h3>${renderInlineMarkdown(line.replace(/^###\s+/, ""))}</h3>`);
     } else if (/^##\s+/.test(line)) {
-      out.push(`<h2>${esc(line.replace(/^##\s+/, ""))}</h2>`);
+      out.push(`<h2>${renderInlineMarkdown(line.replace(/^##\s+/, ""))}</h2>`);
     } else if (/^#\s+/.test(line)) {
-      out.push(`<h1>${esc(line.replace(/^#\s+/, ""))}</h1>`);
+      out.push(`<h1>${renderInlineMarkdown(line.replace(/^#\s+/, ""))}</h1>`);
     } else if (!line.trim()) {
       out.push("<p></p>");
     } else {
-      out.push(`<p>${esc(line)}</p>`);
+      out.push(`<p>${renderInlineMarkdown(line)}</p>`);
     }
   }
   if (inList) {
@@ -1002,10 +1026,12 @@ function applySnapshot(snap) {
   toggleReportMode();
 
   const running = snap.status === "running" || snap.status === "queued";
+  const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
+  const reportBusy = reportGenerating || reportPhase === "running";
   const canStop = running && !abortRequested;
   runBtn.textContent = abortRequested ? "Stopping..." : (running ? "Stop Research" : "Start Research");
   runBtn.classList.toggle("primary", !running);
-  runBtn.disabled = abortRequested;
+  runBtn.disabled = abortRequested || reportBusy;
 
   const hasDownloadableReport = !!snap.report_file_path;
   downloadBtn.disabled = !hasDownloadableReport;
@@ -1114,6 +1140,9 @@ async function stopRun() {
 
 runBtn.addEventListener("click", async () => {
   try {
+    if (reportGenerating) {
+      return;
+    }
     const running = currentSnapshot && (currentSnapshot.status === "queued" || currentSnapshot.status === "running");
     if (running) {
       await stopRun();
@@ -1128,6 +1157,7 @@ runBtn.addEventListener("click", async () => {
 reportBtn.addEventListener("click", async () => {
   if (!currentRunId || reportGenerating) return;
   reportGenerating = true;
+  runBtn.disabled = true;
   reportBtn.disabled = true;
   reportBtn.textContent = "Generating Report...";
   showError("");

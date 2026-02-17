@@ -224,7 +224,8 @@ def as_clean_str_list(value: Any) -> List[str]:
 SYSTEM_DECOMPOSE = load_prompt("decompose.system.txt")
 SYSTEM_QUERY_GEN = load_prompt("query_gen.system.txt")
 SYSTEM_SYNTHESIZE = load_prompt("synthesize.system.txt")
-SYSTEM_SUFFICIENCY = load_prompt("sufficiency.system.txt")
+SYSTEM_SUFFICIENCY_NODE = load_prompt("sufficiency_node.system.txt")
+SYSTEM_SUFFICIENCY_PASS = load_prompt("sufficiency_pass.system.txt")
 SYSTEM_REPORT = load_prompt("report.system.txt")
 
 
@@ -1387,7 +1388,7 @@ Known success criteria:
                                 },
                             )
                             node_suff = self.llm.json(
-                                SYSTEM_SUFFICIENCY,
+                                SYSTEM_SUFFICIENCY_NODE,
                                 self._format_node_sufficiency_prompt(
                                     task=task,
                                     sub_question=sq,
@@ -1569,7 +1570,7 @@ Known success criteria:
                         },
                     )
                     suff = self.llm.json(
-                        SYSTEM_SUFFICIENCY,
+                        SYSTEM_SUFFICIENCY_PASS,
                         self._format_sufficiency_prompt(
                             task=task,
                             success_criteria=success_criteria,
