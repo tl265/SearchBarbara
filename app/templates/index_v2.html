@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SearchBarbara v02</title>
+  <link rel="stylesheet" href="/static/styles_v2.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <h1>SearchBarbara</h1>
+        <p class="subtitle">Thinking-partner mode</p>
+      </div>
+      <div class="top-metrics">
+        <div><span class="k">Run</span><span id="runStatus">idle</span></div>
+        <div><span class="k">Research</span><span id="researchStatus">idle</span></div>
+        <div><span class="k">Report</span><span id="reportStatus">pending</span></div>
+        <div><span class="k">Tokens</span><span id="tokenSummary">-</span></div>
+      </div>
+    </header>
+
+    <section class="prompt-dock card">
+      <label for="task" class="dock-label">Research Task</label>
+      <textarea id="task" rows="3" placeholder="Ask a deep research question..."></textarea>
+      <div class="dock-controls">
+        <button id="runBtn" class="primary">Start Research</button>
+        <button id="reportBtn" disabled>Generate Report From Current Findings</button>
+        <button id="downloadBtn" disabled>Download Report</button>
+      </div>
+      <details>
+        <summary>Advanced controls</summary>
+        <div class="advanced-grid">
+          <label>Max depth <input id="maxDepth" type="number" value="3" min="1" max="8"></label>
+          <label>Results/query <input id="resultsPerQuery" type="number" value="3" min="1" max="30"></label>
+        </div>
+      </details>
+      <div id="runMeta" class="muted"></div>
+      <div id="stopReason" class="stop-reason"></div>
+      <div id="errorBanner" class="error hidden" aria-live="polite"></div>
+    </section>
+
+    <main class="content-grid">
+      <section class="canvas card">
+        <div class="section-head">
+          <h2>Research Canvas</h2>
+          <div class="canvas-toolbar">
+            <span id="canvasHint" class="muted">Auto-fit</span>
+            <button id="zoomOutBtn" type="button">-</button>
+            <span id="zoomPct" class="zoom-pct">100%</span>
+            <button id="zoomInBtn" type="button">+</button>
+            <button id="zoomFitBtn" type="button">Fit</button>
+            <span id="fitDebug" class="zoom-debug muted"></span>
+          </div>
+        </div>
+        <div id="canvas" class="canvas-board"></div>
+      </section>
+
+      <section class="thoughts card" aria-live="polite">
+        <div class="section-head">
+          <h2>Thought Stream</h2>
+          <span id="latestThought" class="muted"></span>
+        </div>
+        <div id="thoughtStream" class="thought-list"></div>
+      </section>
+
+      <section class="report card">
+        <div class="section-head">
+          <h2>Report</h2>
+          <label class="raw-toggle"><input id="rawToggle" type="checkbox" /> Raw</label>
+        </div>
+        <div id="coverageNote" class="muted"></div>
+        <pre id="reportRaw" class="report-body hidden"></pre>
+        <div id="reportRendered" class="report-body rendered"></div>
+        <h3>Token Usage</h3>
+        <pre id="usage" class="usage"></pre>
+      </section>
+    </main>
+  </div>
+  <script>
+    window.APP_CONFIG = {
+      min_canvas_zoom: {{ min_canvas_zoom|tojson }},
+      auto_fit_safety_px: {{ auto_fit_safety_px|tojson }},
+    };
+  </script>
+  <script src="/static/app_v2.js"></script>
+</body>
+</html>

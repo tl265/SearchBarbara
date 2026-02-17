@@ -73,6 +73,7 @@ class RunManager:
         return run_id
 
     def abort_run(self, run_id: str) -> Optional[str]:
+        should_emit = False
         with self._lock:
             state = self._runs.get(run_id)
             if not state:
@@ -81,23 +82,53 @@ class RunManager:
                 return state.status
             self._cancel_flags[run_id] = True
             state.updated_at = _now()
-            for q in self._subscribers.get(run_id, []):
-                q.put(
-                    {
-                        "run_id": run_id,
-                        "timestamp": _now().isoformat(),
-                        "event_type": "run_abort_requested",
-                        "payload": {},
-                    }
-                )
-            return "aborting"
+            should_emit = True
+        if should_emit:
+            self._publish_event(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "timestamp": _now().isoformat(),
+                    "event_type": "run_abort_requested",
+                    "payload": {},
+                },
+            )
+            self._publish_event(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "timestamp": _now().isoformat(),
+                    "event_type": "abort_requested",
+                    "payload": {},
+                },
+            )
+        return "aborting"
 
     def generate_partial_report(self, run_id: str) -> Optional[Dict[str, str]]:
         snapshot = self.get_snapshot(run_id)
         if not snapshot:
             return None
+        base_usage = self._best_effort_usage_snapshot(snapshot)
+        self._publish_event(
+            run_id,
+            {
+                "run_id": run_id,
+                "timestamp": _now().isoformat(),
+                "event_type": "report_generation_started",
+                "payload": {"mode": "partial"},
+            },
+        )
         report_text, partial_usage = self._build_partial_report_with_agent(snapshot)
         if not report_text.strip():
+            self._publish_event(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "timestamp": _now().isoformat(),
+                    "event_type": "report_generation_failed",
+                    "payload": {"mode": "partial"},
+                },
+            )
             return {"error": "Partial report generation failed (report agent unavailable)."}
         reports_dir = Path("reports")
         reports_dir.mkdir(parents=True, exist_ok=True)
@@ -112,10 +143,14 @@ class RunManager:
                 return None
             state.report_text = report_text
             state.report_file_path = str(report_path)
+            live_usage = state.token_usage if isinstance(state.token_usage, dict) else None
+            usage_base = live_usage or base_usage
             if partial_usage:
                 state.token_usage = self._merge_usage_dicts(
-                    state.token_usage, partial_usage
+                    usage_base, partial_usage
                 )
+            elif usage_base:
+                state.token_usage = usage_base
             state.updated_at = _now()
             state.tree["report_status"] = "completed"
 
@@ -125,6 +160,18 @@ class RunManager:
                 "run_id": run_id,
                 "timestamp": _now().isoformat(),
                 "event_type": "partial_report_generated",
+                "payload": {
+                    "report_file_path": str(report_path),
+                    "mode": "partial",
+                },
+            },
+        )
+        self._publish_event(
+            run_id,
+            {
+                "run_id": run_id,
+                "timestamp": _now().isoformat(),
+                "event_type": "report_generation_completed",
                 "payload": {
                     "report_file_path": str(report_path),
                     "mode": "partial",
@@ -159,6 +206,12 @@ class RunManager:
             state = self._runs.get(run_id)
             if not state:
                 return
+            event_type = str(event.get("event_type", ""))
+            if event_type in ("run_abort_requested", "abort_requested") and state.status in (
+                "completed",
+                "failed",
+            ):
+                return
             state.events.append(event)
             state.updated_at = _now()
             self._project_event(state, event)
@@ -189,10 +242,14 @@ class RunManager:
             sq = str(payload.get("sub_question", ""))
             depth = int(payload.get("depth", 1))
             parent = str(payload.get("parent", ""))
+            node_id = str(payload.get("node_id", ""))
             rnd = self._ensure_round(tree, round_i)
             qnode = self._ensure_question(rnd, sq)
             qnode["depth"] = depth
             qnode["parent"] = parent
+            qnode["status"] = "running"
+            if node_id:
+                qnode["node_id"] = node_id
             return
         if et == "queries_generated":
             round_i = int(payload.get("round", 0))
@@ -291,6 +348,20 @@ class RunManager:
             step["search_error"] = payload.get("search_error")
             step["selected_results_count"] = int(payload.get("selected_results_count", 0))
             step["primary_count"] = int(payload.get("primary_count", 0))
+            selected_sources = payload.get("selected_sources", [])
+            if isinstance(selected_sources, list):
+                cleaned_sources = []
+                for item in selected_sources:
+                    if not isinstance(item, dict):
+                        continue
+                    url = str(item.get("url", "")).strip()
+                    title = str(item.get("title", "")).strip()
+                    if not url:
+                        continue
+                    cleaned_sources.append({"title": title, "url": url})
+                step["selected_sources"] = cleaned_sources
+            else:
+                step["selected_sources"] = []
             if step["selected_results_count"] == 0:
                 step["status"] = "skipped"
             return
@@ -316,6 +387,10 @@ class RunManager:
             rnd = self._ensure_round(tree, round_i)
             qnode = self._ensure_question(rnd, sq)
             qnode["children"] = payload.get("children", [])
+            child_node_ids = payload.get("child_node_ids", [])
+            qnode["child_node_ids"] = (
+                child_node_ids if isinstance(child_node_ids, list) else []
+            )
             qnode["status"] = "decomposed"
             return
         if et == "node_sufficiency_completed":
@@ -361,8 +436,21 @@ class RunManager:
             state.error = str(payload.get("error", "Run aborted by user"))
             tree["report_status"] = "failed"
             return
+        if et == "abort_requested":
+            return
+        if et == "abort_acknowledged":
+            return
         if et == "partial_report_generated":
             tree["report_status"] = "partial_ready"
+            return
+        if et == "report_generation_started":
+            tree["report_status"] = "running"
+            return
+        if et == "report_generation_completed":
+            tree["report_status"] = "completed"
+            return
+        if et == "report_generation_failed":
+            tree["report_status"] = "failed"
             return
 
     def _ensure_round(self, tree: Dict[str, Any], round_i: int) -> Dict[str, Any]:
@@ -381,6 +469,7 @@ class RunManager:
                 return q
         q = {
             "sub_question": sub_question,
+            "node_id": "",
             "depth": 1,
             "parent": "",
             "status": "pending",
@@ -468,6 +557,7 @@ class RunManager:
                     return
                 state.status = "failed"
                 state.error = error_text
+                state.token_usage = agent.usage_tracker.to_dict()
                 state.updated_at = _now()
                 state.tree["report_status"] = "failed"
                 last_event_type = (
@@ -488,6 +578,24 @@ class RunManager:
                         "payload": {"error": error_text},
                     },
                 )
+
+    def _best_effort_usage_snapshot(self, snapshot: RunState) -> Optional[Dict[str, Any]]:
+        if isinstance(snapshot.token_usage, dict):
+            return snapshot.token_usage
+        state_file_path = snapshot.state_file_path or ""
+        if not state_file_path:
+            return None
+        state_path = Path(state_file_path)
+        if not state_path.exists():
+            return None
+        try:
+            parsed = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        token_usage = parsed.get("token_usage", {})
+        return token_usage if isinstance(token_usage, dict) else None
 
     def _build_partial_report_with_agent(
         self, snapshot: RunState

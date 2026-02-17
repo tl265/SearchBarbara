@@ -546,6 +546,7 @@ class DeepResearchAgent:
             pricing_default=pricing_default,
         )
         self.llm = LLM(model=model, usage_tracker=self.usage_tracker)
+        self.decompose_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
         self.report_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
         self.search = WebSearch(model=model, usage_tracker=self.usage_tracker)
         self.max_depth = max(1, int(max_depth))
@@ -591,6 +592,7 @@ class DeepResearchAgent:
         unresolved_questions: List[str] = []
         question_depths: Dict[str, int] = {}
         question_parents: Dict[str, str] = {}
+        question_node_ids: Dict[str, str] = {}
         decomposed_questions: set[str] = set()
         resolved_questions: set[str] = set()
         final_suff: Dict[str, Any] = {}
@@ -651,6 +653,11 @@ class DeepResearchAgent:
                 for q, parent in raw_parents.items():
                     if isinstance(q, str) and isinstance(parent, str):
                         question_parents[q] = parent
+            raw_node_ids = resume_state.get("question_node_ids", {})
+            if isinstance(raw_node_ids, dict):
+                for q, nid in raw_node_ids.items():
+                    if isinstance(q, str) and isinstance(nid, str):
+                        question_node_ids[q] = nid
             decomposed_questions = set(
                 self._normalize_llm_list(
                     resume_state.get("decomposed_questions", []),
@@ -692,6 +699,7 @@ class DeepResearchAgent:
             trace = {
                 "task": task,
                 "model": self.llm.model,
+                "decompose_model": self.decompose_llm.model,
                 "report_model": self.report_llm.model,
                 "token_breakdown_enabled": self.token_breakdown,
                 "cost_estimate_enabled": self.cost_estimate_enabled,
@@ -729,9 +737,57 @@ class DeepResearchAgent:
             start_round = 1
             self.query_memory = {}
 
+        parent_child_order: Dict[str, Dict[str, int]] = {}
+        root_order: Dict[str, int] = {}
+
+        for q, nid in list(question_node_ids.items()):
+            if not isinstance(nid, str):
+                continue
+            parts = nid.split(".")
+            if not parts or not all(p.isdigit() for p in parts):
+                continue
+            parent = question_parents.get(q, "")
+            if parent:
+                parent_child_order.setdefault(parent, {})[q] = int(parts[-1])
+            else:
+                root_order[q] = int(parts[0])
+
+        def get_or_assign_node_id(question: str, parent: str) -> str:
+            q = question.strip()
+            p = parent.strip()
+            if not q:
+                return ""
+            existing = question_node_ids.get(q, "")
+            if isinstance(existing, str) and existing.strip():
+                return existing
+
+            if p:
+                parent_id = question_node_ids.get(p, "")
+                if not parent_id:
+                    parent_id = get_or_assign_node_id(p, question_parents.get(p, ""))
+                order_map = parent_child_order.setdefault(p, {})
+                child_idx = order_map.get(q)
+                if child_idx is None:
+                    child_idx = len(order_map) + 1
+                    order_map[q] = child_idx
+                node_id = f"{parent_id}.{child_idx}" if parent_id else str(child_idx)
+            else:
+                root_idx = root_order.get(q)
+                if root_idx is None:
+                    root_idx = len(root_order) + 1
+                    root_order[q] = root_idx
+                node_id = str(root_idx)
+
+            question_node_ids[q] = node_id
+            return node_id
+
         unresolved_questions = self._dedupe_preserve_order(
             [q for q in unresolved_questions if q not in resolved_questions]
         )
+        for q in self._dedupe_preserve_order(
+            sub_questions + extra_questions + unresolved_questions
+        ):
+            get_or_assign_node_id(q, question_parents.get(q, ""))
 
         def save_checkpoint(
             status: str,
@@ -753,6 +809,7 @@ class DeepResearchAgent:
                 unresolved_questions=unresolved_questions,
                 question_depths=question_depths,
                 question_parents=question_parents,
+                question_node_ids=question_node_ids,
                 decomposed_questions=decomposed_questions,
                 resolved_questions=resolved_questions,
                 final_suff=final_suff,
@@ -852,8 +909,9 @@ class DeepResearchAgent:
                     question_depths[sq] = max(1, depth)
                     if sq not in question_parents or not question_parents.get(sq, ""):
                         question_parents[sq] = parent
+                    node_id = get_or_assign_node_id(sq, question_parents.get(sq, ""))
                     findings.setdefault(sq, SubQuestionFinding(sub_question=sq))
-                    self._log(f"Question (depth {depth}): {sq}")
+                    self._log(f"Question [{node_id}] (depth {depth}): {sq}")
                     self._emit(
                         "sub_question_started",
                         {
@@ -861,10 +919,12 @@ class DeepResearchAgent:
                             "sub_question": sq,
                             "depth": depth,
                             "parent": parent,
+                            "node_id": node_id,
                         },
                     )
 
                     question_trace: Dict[str, Any] = {
+                        "node_id": node_id,
                         "sub_question": sq,
                         "depth": depth,
                         "parent": parent,
@@ -880,7 +940,7 @@ Question depth:
 {depth}
 
 Known success criteria:
-{json.dumps(success_criteria, ensure_ascii=True)}
+{json.dumps(success_criteria, ensure_ascii=False)}
 """
                     qobj = self.llm.json(
                         SYSTEM_QUERY_GEN,
@@ -969,6 +1029,7 @@ Known success criteria:
                         if not should_run:
                             cache_entry = self.query_memory.get(intent_key, {})
                             step_data = {
+                                "node_id": node_id,
                                 "round": round_i,
                                 "sub_question": sq,
                                 "depth": depth,
@@ -1091,6 +1152,13 @@ Known success criteria:
                                 "raw_results_count": len(raw_results),
                                 "selected_results_count": len(selected_results),
                                 "primary_count": primary_count,
+                                "selected_sources": [
+                                    {
+                                        "title": r.title,
+                                        "url": r.url,
+                                    }
+                                    for r in selected_results
+                                ],
                                 "effective_results_per_query": effective_k,
                                 "broadening_step": broaden_step,
                             },
@@ -1108,6 +1176,7 @@ Known success criteria:
                             self._log(limitation)
                             findings[sq].uncertainties.append(limitation)
                             step_data = {
+                                "node_id": node_id,
                                 "round": round_i,
                                 "sub_question": sq,
                                 "depth": depth,
@@ -1175,6 +1244,7 @@ Known success criteria:
                         new_fact_gain = max(0, len(findings[sq].facts) - facts_before)
                         round_new_fact_gain += new_fact_gain
                         step_data = {
+                            "node_id": node_id,
                             "round": round_i,
                             "sub_question": sq,
                             "depth": depth,
@@ -1222,6 +1292,14 @@ Known success criteria:
                             "gaps": [],
                         }
                         if question_has_evidence:
+                            self._emit(
+                                "node_sufficiency_started",
+                                {
+                                    "round": round_i,
+                                    "sub_question": sq,
+                                    "depth": depth,
+                                },
+                            )
                             node_suff = self.llm.json(
                                 SYSTEM_SUFFICIENCY,
                                 self._format_node_sufficiency_prompt(
@@ -1286,6 +1364,12 @@ Known success criteria:
                             )
                             children = self._dedupe_preserve_order(children)
                             if children:
+                                child_node_ids: List[str] = []
+                                for child in children:
+                                    question_depths[child] = min(self.max_depth, depth + 1)
+                                    if child not in question_parents or not question_parents.get(child, ""):
+                                        question_parents[child] = sq
+                                    child_node_ids.append(get_or_assign_node_id(child, sq))
                                 decomposed_questions.add(sq)
                                 self._emit(
                                     "node_decomposed",
@@ -1294,14 +1378,13 @@ Known success criteria:
                                         "sub_question": sq,
                                         "depth": depth,
                                         "children": children,
+                                        "child_node_ids": child_node_ids,
                                     },
                                 )
                                 question_trace["children"] = children
+                                question_trace["child_node_ids"] = child_node_ids
                                 child_all_solved = True
                                 for child in children:
-                                    question_depths[child] = min(self.max_depth, depth + 1)
-                                    if child not in question_parents or not question_parents.get(child, ""):
-                                        question_parents[child] = sq
                                     findings.setdefault(
                                         child, SubQuestionFinding(sub_question=child)
                                     )
@@ -1384,6 +1467,12 @@ Known success criteria:
                         "recheck_queries": [],
                     }
                 else:
+                    self._emit(
+                        "sufficiency_started",
+                        {
+                            "round": round_i,
+                        },
+                    )
                     suff = self.llm.json(
                         SYSTEM_SUFFICIENCY,
                         self._format_sufficiency_prompt(
@@ -1458,6 +1547,7 @@ Known success criteria:
             trace["question_tree"] = {
                 "depths": question_depths,
                 "parents": question_parents,
+                "node_ids": question_node_ids,
                 "resolved_questions": sorted(resolved_questions),
                 "decomposed_questions": sorted(decomposed_questions),
                 "unresolved_questions": unresolved_questions,
@@ -1476,6 +1566,12 @@ Known success criteria:
                 self._log(f"Evidence limitation: {evidence_note}")
 
             self._log("Generating final Pyramid Principle report.")
+            self._emit(
+                "report_generation_started",
+                {
+                    "mode": "final",
+                },
+            )
             report_prompt = self._format_report_prompt(
                 task=task,
                 success_criteria=success_criteria,
@@ -1555,10 +1651,10 @@ Known success criteria:
             {depth}
 
             Success criteria:
-            {json.dumps(success_criteria, ensure_ascii=True)}
+            {json.dumps(success_criteria, ensure_ascii=False)}
 
             Evidence for this sub-question:
-            {json.dumps(compact, ensure_ascii=True)}
+            {json.dumps(compact, ensure_ascii=False)}
 
             Evaluate only whether this specific sub-question is sufficiently answered.
             """
@@ -1580,16 +1676,16 @@ Known success criteria:
             {sub_question}
 
             Known unresolved gaps:
-            {json.dumps(node_gaps, ensure_ascii=True)}
+            {json.dumps(node_gaps, ensure_ascii=False)}
 
             Success criteria:
-            {json.dumps(success_criteria, ensure_ascii=True)}
+            {json.dumps(success_criteria, ensure_ascii=False)}
 
             Return only 2 to 4 child sub-questions focused on unresolved evidence gaps.
             """
         ).strip()
         try:
-            plan = self.llm.json(
+            plan = self.decompose_llm.json(
                 SYSTEM_DECOMPOSE,
                 prompt,
                 stage="decompose_child",
@@ -1640,13 +1736,13 @@ Known success criteria:
                 {parent_question}
 
                 Unresolved gaps:
-                {json.dumps(node_gaps, ensure_ascii=True)}
+                {json.dumps(node_gaps, ensure_ascii=False)}
 
                 Success criteria:
-                {json.dumps(success_criteria, ensure_ascii=True)}
+                {json.dumps(success_criteria, ensure_ascii=False)}
 
                 Candidate child questions (overlapping):
-                {json.dumps(cleaned, ensure_ascii=True)}
+                {json.dumps(cleaned, ensure_ascii=False)}
 
                 Rewrite into 2 to 4 child questions that are MECE:
                 - Mutually Exclusive: no overlap/paraphrase.
@@ -1656,7 +1752,7 @@ Known success criteria:
                 """
             ).strip()
             try:
-                rewritten = self.llm.json(
+                rewritten = self.decompose_llm.json(
                     SYSTEM_DECOMPOSE,
                     rewrite_prompt,
                     stage="decompose_child_mece_rewrite",
@@ -1738,10 +1834,10 @@ Known success criteria:
             {round_i}
 
             Success criteria:
-            {json.dumps(success_criteria, ensure_ascii=True)}
+            {json.dumps(success_criteria, ensure_ascii=False)}
 
             Current findings:
-            {json.dumps(compact, ensure_ascii=True)}
+            {json.dumps(compact, ensure_ascii=False)}
             """
         ).strip()
 
@@ -1769,19 +1865,19 @@ Known success criteria:
             {task}
 
             Success criteria:
-            {json.dumps(success_criteria, ensure_ascii=True)}
+            {json.dumps(success_criteria, ensure_ascii=False)}
 
             Evidence quality:
             status={evidence_status}
             note={evidence_note}
-            stats={json.dumps(search_stats, ensure_ascii=True)}
+            stats={json.dumps(search_stats, ensure_ascii=False)}
 
             Reporting rule:
             If evidence status is not "adequate", explicitly state this limitation in the
             Governing Thought and Risks/Unknowns sections, and avoid definitive claims.
 
             Evidence base:
-            {json.dumps(compact, ensure_ascii=True)}
+            {json.dumps(compact, ensure_ascii=False)}
             """
         ).strip()
 
@@ -1803,7 +1899,7 @@ Known success criteria:
                 ],
             }
 
-        payload = json.dumps(compact, ensure_ascii=True)
+        payload = json.dumps(compact, ensure_ascii=False)
         while len(payload) > char_budget and compact:
             changed = False
             for key in list(compact.keys()):
@@ -1823,10 +1919,10 @@ Known success criteria:
             if not changed:
                 largest_key = max(
                     compact.keys(),
-                    key=lambda kk: len(json.dumps(compact[kk], ensure_ascii=True)),
+                    key=lambda kk: len(json.dumps(compact[kk], ensure_ascii=False)),
                 )
                 compact.pop(largest_key, None)
-            payload = json.dumps(compact, ensure_ascii=True)
+            payload = json.dumps(compact, ensure_ascii=False)
         return compact
 
     def _compact_facts(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1917,9 +2013,50 @@ Known success criteria:
             out.append(key)
         return out
 
+    def _is_cjk_char(self, ch: str) -> bool:
+        if not isinstance(ch, str) or len(ch) != 1:
+            return False
+        code = ord(ch)
+        return (
+            0x4E00 <= code <= 0x9FFF  # CJK Unified Ideographs
+            or 0x3400 <= code <= 0x4DBF  # CJK Extension A
+            or 0x3040 <= code <= 0x309F  # Hiragana
+            or 0x30A0 <= code <= 0x30FF  # Katakana
+            or 0xAC00 <= code <= 0xD7AF  # Hangul
+        )
+
+    def _contains_cjk(self, text: str) -> bool:
+        return any(self._is_cjk_char(ch) for ch in str(text or ""))
+
     def _normalize_query_intent(self, query: str) -> str:
-        cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in query)
-        tokens = [t for t in cleaned.split() if t]
+        tokens: List[str] = []
+        buf: List[str] = []
+        mode = ""  # "latin", "cjk", ""
+
+        def flush() -> None:
+            nonlocal buf, mode
+            if buf:
+                tok = "".join(buf).strip()
+                if tok:
+                    tokens.append(tok)
+            buf = []
+            mode = ""
+
+        for ch in str(query or ""):
+            if self._is_cjk_char(ch):
+                if mode != "cjk":
+                    flush()
+                    mode = "cjk"
+                buf.append(ch)
+            elif ch.isalnum():
+                lower = ch.lower()
+                if mode != "latin":
+                    flush()
+                    mode = "latin"
+                buf.append(lower)
+            else:
+                flush()
+        flush()
         return " ".join(tokens)
 
     def _query_similarity(self, intent_a: str, intent_b: str) -> float:
@@ -1980,6 +2117,7 @@ Known success criteria:
             prior = self.query_memory.get(intent_key, {})
             diagnostics["classification"] = "exact_redundant"
             diagnostics["prior_query"] = str(prior.get("query", ""))
+            diagnostics["similarity"] = 1.0
             self._log(
                 "Query intent: redundant exact-match to prior intent. "
                 f"query='{self._trim_text(query, 140)}' "
@@ -2181,11 +2319,18 @@ Known success criteria:
         return best_question
 
     def _tokenize(self, text: str) -> set[str]:
-        return {
-            t
-            for t in "".join(ch.lower() if ch.isalnum() else " " for ch in text).split()
-            if len(t) > 2
-        }
+        out: set[str] = set()
+        for tok in self._normalize_query_intent(text).split():
+            if self._contains_cjk(tok):
+                out.add(tok)
+                cjk_chars = [ch for ch in tok if self._is_cjk_char(ch)]
+                if len(cjk_chars) >= 2:
+                    for i in range(len(cjk_chars) - 1):
+                        out.add("".join(cjk_chars[i : i + 2]))
+                continue
+            if len(tok) > 2:
+                out.add(tok)
+        return out
 
     def _query_step_key(self, round_i: int, sub_question: str, query: str) -> str:
         return f"{round_i}|{sub_question.strip()}|{query.strip().lower()}"
@@ -2260,6 +2405,7 @@ Known success criteria:
         unresolved_questions: List[str],
         question_depths: Dict[str, int],
         question_parents: Dict[str, str],
+        question_node_ids: Dict[str, str],
         decomposed_questions: set[str],
         resolved_questions: set[str],
         final_suff: Dict[str, Any],
@@ -2278,6 +2424,7 @@ Known success criteria:
             "status": status,
             "task": task,
             "model": self.llm.model,
+            "decompose_model": self.decompose_llm.model,
             "report_model": self.report_llm.model,
             "started_at": started_at,
             "updated_at": self._now_iso(),
@@ -2291,6 +2438,7 @@ Known success criteria:
             "unresolved_questions": unresolved_questions,
             "question_depths": question_depths,
             "question_parents": question_parents,
+            "question_node_ids": question_node_ids,
             "decomposed_questions": sorted(decomposed_questions),
             "resolved_questions": sorted(resolved_questions),
             "final_sufficiency": final_suff,
@@ -2308,7 +2456,7 @@ Known success criteria:
             "error": error,
         }
         tmp = state_path.with_suffix(state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(state_path)
 
     def _write_trace(self, trace: Dict[str, Any]) -> str:
@@ -2320,13 +2468,13 @@ Known success criteria:
             runs_dir.mkdir(parents=True, exist_ok=True)
             ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             path = runs_dir / f"research_trace_{ts}.json"
-        path.write_text(json.dumps(trace, ensure_ascii=True, indent=2))
+        path.write_text(json.dumps(trace, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
 
     def _write_usage_report(self, usage: Dict[str, Any]) -> str:
         path = Path(self.usage_file)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(usage, ensure_ascii=True, indent=2), encoding="utf-8")
+        path.write_text(json.dumps(usage, ensure_ascii=False, indent=2), encoding="utf-8")
         return str(path)
 
     def _print_token_summary(self, usage: Dict[str, Any]) -> None:
@@ -2442,7 +2590,7 @@ def main() -> None:
     parser.add_argument(
         "--report-model",
         default=os.getenv("OPENAI_REPORT_MODEL", "gpt-5.2"),
-        help="Final report model",
+        help="Final report model (also used for decomposition)",
     )
     parser.add_argument(
         "--max-depth",

@@ -1,9 +1,6 @@
 const taskEl = document.getElementById("task");
 const maxDepthEl = document.getElementById("maxDepth");
-const maxRoundsEl = document.getElementById("maxRounds");
 const resultsPerQueryEl = document.getElementById("resultsPerQuery");
-const modelEl = document.getElementById("model");
-const reportModelEl = document.getElementById("reportModel");
 const startBtn = document.getElementById("startBtn");
 const abortBtn = document.getElementById("abortBtn");
 const statusPill = document.getElementById("statusPill");
@@ -221,11 +218,8 @@ startBtn.addEventListener("click", async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         task,
-        max_depth: Number(maxDepthEl.value || 4),
-        max_rounds: Number(maxRoundsEl.value || 1),
+        max_depth: Number(maxDepthEl.value || 3),
         results_per_query: Number(resultsPerQueryEl.value || 3),
-        model: modelEl.value || "gpt-4.1",
-        report_model: reportModelEl.value || "gpt-5.2",
       }),
     });
     if (!rsp.ok) {

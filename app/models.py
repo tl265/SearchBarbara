@@ -9,7 +9,7 @@ RunStatus = Literal["queued", "running", "completed", "failed"]
 
 class CreateRunRequest(BaseModel):
     task: str
-    max_depth: int = Field(default=4, ge=1)
+    max_depth: int = Field(default=3, ge=1)
     max_rounds: int = Field(default=1, ge=1)
     results_per_query: int = Field(default=3, ge=1)
     model: str = "gpt-4.1"
@@ -24,10 +24,18 @@ class CreateRunResponse(BaseModel):
 class RunSnapshotResponse(BaseModel):
     run_id: str
     status: RunStatus
+    research_status: Optional[str] = None
+    report_status: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     task: str
     tree: Dict[str, Any] = Field(default_factory=dict)
+    facts: List[Dict[str, Any]] = Field(default_factory=list)
+    insights: List[str] = Field(default_factory=list)
+    syntheses: List[str] = Field(default_factory=list)
+    stop_reason: Optional[str] = None
+    coverage_note: Optional[str] = None
+    latest_thought: Optional[str] = None
     report_text: Optional[str] = None
     report_file_path: Optional[str] = None
     error: Optional[str] = None
