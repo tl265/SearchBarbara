@@ -25,6 +25,8 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 def _load_web_config() -> Dict[str, Any]:
     default = {
         "max_rounds": 1,
+        "default_max_depth": 3,
+        "default_results_per_query": 3,
         "model": "gpt-4.1",
         "report_model": "gpt-5.2",
         "min_canvas_zoom": 0.45,
@@ -43,6 +45,20 @@ def _load_web_config() -> Dict[str, Any]:
         max_rounds = int(raw.get("max_rounds", default["max_rounds"]))
     except (TypeError, ValueError):
         max_rounds = default["max_rounds"]
+    try:
+        default_max_depth = int(
+            raw.get("default_max_depth", default["default_max_depth"])
+        )
+    except (TypeError, ValueError):
+        default_max_depth = default["default_max_depth"]
+    try:
+        default_results_per_query = int(
+            raw.get(
+                "default_results_per_query", default["default_results_per_query"]
+            )
+        )
+    except (TypeError, ValueError):
+        default_results_per_query = default["default_results_per_query"]
     model = str(raw.get("model", default["model"]) or default["model"])
     report_model = str(
         raw.get("report_model", default["report_model"]) or default["report_model"]
@@ -67,6 +83,8 @@ def _load_web_config() -> Dict[str, Any]:
         heartbeat_interval_sec = default["heartbeat_interval_sec"]
     return {
         "max_rounds": max(1, max_rounds),
+        "default_max_depth": max(1, min(default_max_depth, 8)),
+        "default_results_per_query": max(1, min(default_results_per_query, 30)),
         "model": model,
         "report_model": report_model,
         "min_canvas_zoom": min(max(min_canvas_zoom, 0.1), 0.95),
@@ -89,6 +107,10 @@ def index(request: Request) -> HTMLResponse:
         {
             "min_canvas_zoom": float(WEB_CONFIG.get("min_canvas_zoom", 0.45)),
             "auto_fit_safety_px": int(WEB_CONFIG.get("auto_fit_safety_px", 10)),
+            "default_max_depth": int(WEB_CONFIG.get("default_max_depth", 3)),
+            "default_results_per_query": int(
+                WEB_CONFIG.get("default_results_per_query", 3)
+            ),
         },
     )
 

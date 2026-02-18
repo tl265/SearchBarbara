@@ -46,6 +46,11 @@ let canvasZoom = 1;
 let autoFitCanvas = true;
 const MIN_CANVAS_ZOOM = clamp(Number(APP_CONFIG.min_canvas_zoom ?? 0.45), 0.1, 0.95);
 const MAX_CANVAS_ZOOM = 1.6;
+const DEFAULT_MAX_DEPTH = Math.max(1, Math.floor(Number(APP_CONFIG.default_max_depth ?? 3)));
+const DEFAULT_RESULTS_PER_QUERY = Math.max(
+  1,
+  Math.floor(Number(APP_CONFIG.default_results_per_query ?? 3))
+);
 const BASE_NODE_CARD_WIDTH = 340;
 const MIN_NODE_FONT_SCALE = 0.72;
 const MAX_NODE_FONT_SCALE = 1.25;
@@ -1112,8 +1117,8 @@ async function startRun() {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       task,
-      max_depth: Number(maxDepthEl.value || 3),
-      results_per_query: Number(resultsPerQueryEl.value || 3),
+      max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
+      results_per_query: Number(resultsPerQueryEl.value || DEFAULT_RESULTS_PER_QUERY),
     }),
   });
   if (!rsp.ok) {

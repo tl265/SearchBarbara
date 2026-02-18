@@ -15,3 +15,11 @@ Rules:
 - Prefer concrete follow-up queries that can close the gaps.
 - Use recheck_queries only when rerunning prior intent is justified (freshness, search errors, or changed conditions).
 - If evidence is weak, state that clearly in reasoning and gaps.
+
+Usage notes (execution semantics reminder):
+- Frontier questions = the question set the agent will process in the next pass. In current pipeline, this frontier is formed from unresolved questions carried over from the prior pass (plus any pipeline-added extras, if configured).
+- follow_up_queries are executed in later passes by mapping each query to one frontier question (best semantic/token overlap).
+- follow_up_queries are not standalone/global queries; they are attached to specific frontier questions and run under that node context.
+- follow_up_questions are suggestion-level next-step questions (outside the current task scope), intended as future exploration ideas rather than required completion criteria for the current task.
+- gaps should focus on what is still missing to complete the ORIGINAL TASK; keep this distinct from out-of-scope next-step suggestions.
+- recheck_queries should only be used when rerunning prior intents is justified (freshness, previous search errors, or changed conditions).

@@ -32,8 +32,8 @@
       <details>
         <summary>Advanced controls</summary>
         <div class="advanced-grid">
-          <label>Max depth <input id="maxDepth" type="number" value="3" min="1" max="8"></label>
-          <label>Results/query <input id="resultsPerQuery" type="number" value="3" min="1" max="30"></label>
+          <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="1" max="8"></label>
+          <label>Results/query <input id="resultsPerQuery" type="number" value="{{ default_results_per_query }}" min="1" max="30"></label>
         </div>
       </details>
       <div id="runMeta" class="muted"></div>
@@ -82,6 +82,8 @@
     window.APP_CONFIG = {
       min_canvas_zoom: {{ min_canvas_zoom|tojson }},
       auto_fit_safety_px: {{ auto_fit_safety_px|tojson }},
+      default_max_depth: {{ default_max_depth|tojson }},
+      default_results_per_query: {{ default_results_per_query|tojson }},
     };
   </script>
   <script src="/static/app_v2.js"></script>
