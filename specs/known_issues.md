@@ -35,3 +35,32 @@ This file tracks active product/engineering issues that are accepted for now but
 ### Planned Fix Direction
 - Prefer in-memory consistency for `GET /api/sessions/{session_id}` (fresh-first snapshot path).
 - Keep anti-hang fallback behavior for list endpoints with explicit staleness signaling.
+
+## ISSUE-0002
+- Title: Opening an old session can feel unresponsive and may require repeated clicks
+- Severity: P2
+- Status: open
+- Owner: unassigned
+- Created: 2026-02-18
+- Updated: 2026-02-18
+
+### Symptoms
+- Clicking `Open` in the session list sometimes appears to do nothing for a while.
+- Users may click `Open` repeatedly before seeing the session content load.
+
+### Repro Steps
+1. Keep active research/report activity in one window.
+2. In another window, try opening older sessions from the session list.
+3. Observe delayed UI response and occasional repeated-click behavior.
+
+### Likely Causes
+- No explicit per-row/loading state for `Open` action in UI.
+- Multiple rapid clicks can supersede prior open requests in frontend switch-token logic.
+- Snapshot retrieval may fall back to disk parsing under lock contention, increasing latency.
+
+### Workaround
+- Click `Open` once and wait a few seconds before retrying.
+- If state appears stale, refresh session list and reopen.
+
+### Scope
+- Web UI session switching, especially with multi-window concurrent usage.

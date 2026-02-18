@@ -3,7 +3,7 @@ from queue import Empty, Queue
 from typing import Any, Dict, Iterator, List
 import json
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -130,7 +130,12 @@ def index_legacy(request: Request) -> HTMLResponse:
     )
 
 
-def _compute_research_status(status: str, error: str | None) -> str:
+def _compute_research_status(
+    status: str, execution_state: str | None, error: str | None
+) -> str:
+    es = str(execution_state or "").strip().lower()
+    if es == "paused":
+        return "paused"
     if status == "queued":
         return "idle"
     if status == "running":
@@ -230,6 +235,8 @@ def _latest_thought(events: List[Dict[str, Any]]) -> str:
         return f"Run failed: {payload.get('error', 'unknown error')}"
     if et == "partial_report_generated":
         return "Partial report generated from current findings."
+    if et == "report_heartbeat":
+        return "Still writing report..."
     if et == "run_heartbeat":
         phase = str(payload.get("phase", "")).strip()
         sq = str(payload.get("sub_question", "")).strip()
@@ -281,7 +288,9 @@ def get_run(run_id: str) -> RunSnapshotResponse:
         title=state.title or state.task,
         status=state.status,
         execution_state=state.execution_state,
-        research_status=_compute_research_status(state.status, state.error),
+        research_status=_compute_research_status(
+            state.status, state.execution_state, state.error
+        ),
         report_status=report_status,
         created_at=state.created_at,
         updated_at=state.updated_at,
@@ -298,6 +307,8 @@ def get_run(run_id: str) -> RunSnapshotResponse:
         latest_thought=_latest_thought(state.events),
         report_text=state.report_text,
         report_file_path=state.report_file_path,
+        report_versions=state.report_versions,
+        current_report_version_index=state.current_report_version_index,
         error=state.error,
         token_usage=state.token_usage,
     )
@@ -322,7 +333,9 @@ def get_session(session_id: str) -> RunSnapshotResponse:
         title=state.title or state.task,
         status=state.status,
         execution_state=state.execution_state,
-        research_status=_compute_research_status(state.status, state.error),
+        research_status=_compute_research_status(
+            state.status, state.execution_state, state.error
+        ),
         report_status=report_status,
         created_at=state.created_at,
         updated_at=state.updated_at,
@@ -339,6 +352,8 @@ def get_session(session_id: str) -> RunSnapshotResponse:
         latest_thought=_latest_thought(state.events),
         report_text=state.report_text,
         report_file_path=state.report_file_path,
+        report_versions=state.report_versions,
+        current_report_version_index=state.current_report_version_index,
         error=state.error,
         token_usage=state.token_usage,
     )
@@ -390,13 +405,21 @@ def stream_events(run_id: str) -> StreamingResponse:
 
 
 @app.get("/api/runs/{run_id}/report/download")
-def download_report(run_id: str) -> FileResponse:
+def download_report(
+    run_id: str, version_index: int | None = Query(default=None, ge=1)
+) -> FileResponse:
     state = run_manager.get_snapshot(run_id)
     if not state:
         raise HTTPException(status_code=404, detail="Run not found")
-    if not state.report_file_path:
+    report_file_path = state.report_file_path
+    if version_index is not None and isinstance(state.report_versions, list):
+        if version_index > len(state.report_versions):
+            raise HTTPException(status_code=404, detail="Report version not available")
+        selected = state.report_versions[version_index - 1]
+        report_file_path = str(selected.get("report_file_path", "") or "")
+    if not report_file_path:
         raise HTTPException(status_code=404, detail="Report not available")
-    path = Path(state.report_file_path)
+    path = Path(report_file_path)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Report file missing")
     return FileResponse(
@@ -409,6 +432,22 @@ def download_report(run_id: str) -> FileResponse:
 @app.post("/api/runs/{run_id}/abort")
 def abort_run(run_id: str) -> dict:
     status = run_manager.abort_run(run_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"run_id": run_id, "status": status}
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_run(run_id: str) -> dict:
+    status = run_manager.pause_run(run_id)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return {"run_id": run_id, "status": status}
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(run_id: str) -> dict:
+    status = run_manager.resume_run(run_id)
     if status is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return {"run_id": run_id, "status": status}
@@ -431,4 +470,14 @@ def generate_report_now(run_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Run not found")
     if "error" in result:
         raise HTTPException(status_code=500, detail=str(result.get("error", "Unknown error")))
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/report/select")
+def select_report_version(run_id: str, version_index: int = Query(..., ge=1)) -> dict:
+    result = run_manager.select_report_version(run_id, version_index)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if not result:
+        raise HTTPException(status_code=404, detail="No report versions available")
     return {"run_id": run_id, **result}

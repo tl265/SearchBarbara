@@ -34,6 +34,7 @@ class RunManager:
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self._subscribers: Dict[str, List[Queue]] = {}
         self._cancel_flags: Dict[str, bool] = {}
+        self._pause_flags: Dict[str, bool] = {}
         self._lock = threading.Lock()
         self._index_write_lock = threading.Lock()
         self._index_flush_event = threading.Event()
@@ -100,6 +101,7 @@ class RunManager:
             self._runs[run_id] = state
             self._subscribers[run_id] = []
             self._cancel_flags[run_id] = False
+            self._pause_flags[run_id] = False
             self._sync_session_from_state_locked(state)
             self._save_sessions_index_locked(force=True)
 
@@ -186,6 +188,7 @@ class RunManager:
             self._runs.pop(session_id, None)
             self._subscribers.pop(session_id, None)
             self._cancel_flags.pop(session_id, None)
+            self._pause_flags.pop(session_id, None)
             self._save_sessions_index_locked(force=True)
         if state_file_path:
             try:
@@ -202,9 +205,16 @@ class RunManager:
             state = self._runs.get(run_id)
             if not state:
                 return None
-            if state.status in ("completed", "failed"):
+            # Allow cancellation during startup race: queued + idle still has a live worker
+            # that has not emitted run_started yet.
+            can_abort = (
+                state.status in ("queued", "running")
+                or state.execution_state in ("running", "paused")
+            )
+            if not can_abort:
                 return state.status
             self._cancel_flags[run_id] = True
+            self._pause_flags[run_id] = False
             state.updated_at = _now()
             should_emit = True
         if should_emit:
@@ -228,7 +238,35 @@ class RunManager:
             )
         return "aborting"
 
-    def generate_partial_report(self, run_id: str) -> Optional[Dict[str, str]]:
+    def pause_run(self, run_id: str) -> Optional[str]:
+        with self._lock:
+            state = self._runs.get(run_id)
+            if not state:
+                return None
+            if state.execution_state != "running":
+                return state.execution_state
+            self._pause_flags[run_id] = True
+            state.execution_state = "paused"
+            state.updated_at = _now()
+            self._sync_session_from_state_locked(state)
+            self._save_sessions_index_locked(force=True)
+        return "paused"
+
+    def resume_run(self, run_id: str) -> Optional[str]:
+        with self._lock:
+            state = self._runs.get(run_id)
+            if not state:
+                return None
+            if state.execution_state != "paused":
+                return state.execution_state
+            self._pause_flags[run_id] = False
+            state.execution_state = "running"
+            state.updated_at = _now()
+            self._sync_session_from_state_locked(state)
+            self._save_sessions_index_locked(force=True)
+        return "running"
+
+    def generate_partial_report(self, run_id: str) -> Optional[Dict[str, Any]]:
         snapshot = self.get_snapshot(run_id)
         if not snapshot:
             return None
@@ -242,7 +280,33 @@ class RunManager:
                 "payload": {"mode": "partial"},
             },
         )
-        report_text, partial_usage = self._build_partial_report_with_agent(snapshot)
+        report_heartbeat_stop = threading.Event()
+
+        def report_heartbeat_worker() -> None:
+            while not report_heartbeat_stop.wait(self._heartbeat_interval_sec):
+                self._publish_event(
+                    run_id,
+                    {
+                        "run_id": run_id,
+                        "timestamp": _now().isoformat(),
+                        "event_type": "report_heartbeat",
+                        "payload": {
+                            "phase": "writing_report",
+                            "last_event_type": "report_generation_started",
+                            "phase_updated_at": _now().isoformat(),
+                        },
+                    },
+                )
+
+        report_heartbeat_thread = threading.Thread(
+            target=report_heartbeat_worker, daemon=True
+        )
+        report_heartbeat_thread.start()
+        try:
+            report_text, partial_usage = self._build_partial_report_with_agent(snapshot)
+        finally:
+            report_heartbeat_stop.set()
+            report_heartbeat_thread.join(timeout=1.0)
         if not report_text.strip():
             self._publish_event(
                 run_id,
@@ -265,8 +329,6 @@ class RunManager:
             state = self._runs.get(run_id)
             if not state:
                 return None
-            state.report_text = report_text
-            state.report_file_path = str(report_path)
             live_usage = state.token_usage if isinstance(state.token_usage, dict) else None
             usage_base = live_usage or base_usage
             if partial_usage:
@@ -275,6 +337,13 @@ class RunManager:
                 )
             elif usage_base:
                 state.token_usage = usage_base
+            created = self._append_report_version_locked(
+                state=state,
+                report_text=report_text,
+                report_file_path=str(report_path),
+                trigger_type="manual",
+                usage_snapshot=partial_usage,
+            )
             state.updated_at = _now()
             state.tree["report_status"] = "completed"
 
@@ -286,6 +355,7 @@ class RunManager:
                 "event_type": "partial_report_generated",
                 "payload": {
                     "report_file_path": str(report_path),
+                    "version_index": int(created.get("version_index", 1)),
                     "mode": "partial",
                 },
             },
@@ -298,11 +368,71 @@ class RunManager:
                 "event_type": "report_generation_completed",
                 "payload": {
                     "report_file_path": str(report_path),
+                    "version_index": int(created.get("version_index", 1)),
                     "mode": "partial",
                 },
             },
         )
-        return {"report_file_path": str(report_path)}
+        return {
+            "report_file_path": str(report_path),
+            "version_index": int(created.get("version_index", 1)),
+        }
+
+    def select_report_version(
+        self, run_id: str, version_index: int
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            state = self._runs.get(run_id)
+            if not state:
+                return None
+            versions = state.report_versions if isinstance(state.report_versions, list) else []
+            if not versions:
+                return {}
+            idx = max(1, int(version_index))
+            if idx > len(versions):
+                idx = len(versions)
+            selected = versions[idx - 1]
+            state.current_report_version_index = idx
+            state.report_text = str(selected.get("report_text", ""))
+            state.report_file_path = str(selected.get("report_file_path", "") or "") or None
+            state.updated_at = _now()
+            self._sync_session_from_state_locked(state)
+            self._save_sessions_index_locked(force=True)
+        self._publish_event(
+            run_id,
+            {
+                "run_id": run_id,
+                "timestamp": _now().isoformat(),
+                "event_type": "report_version_selected",
+                "payload": {"version_index": idx},
+            },
+        )
+        return {"version_index": idx}
+
+    def _append_report_version_locked(
+        self,
+        state: RunState,
+        report_text: str,
+        report_file_path: str,
+        trigger_type: str,
+        usage_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        versions = state.report_versions if isinstance(state.report_versions, list) else []
+        next_idx = len(versions) + 1
+        version = {
+            "version_index": next_idx,
+            "created_at": _now().isoformat(),
+            "trigger_type": trigger_type,
+            "report_text": report_text,
+            "report_file_path": report_file_path,
+            "token_usage": usage_snapshot if isinstance(usage_snapshot, dict) else None,
+        }
+        versions.append(version)
+        state.report_versions = versions
+        state.current_report_version_index = next_idx
+        state.report_text = report_text
+        state.report_file_path = report_file_path
+        return version
 
     def get_snapshot(self, run_id: str) -> Optional[RunState]:
         acquired, acquired_at = self._lock_acquire("get_snapshot", timeout=0.5)
@@ -420,6 +550,8 @@ class RunManager:
             "events": copy.deepcopy(events_tail),
             "report_text": state.report_text,
             "report_file_path": state.report_file_path,
+            "report_versions": copy.deepcopy(state.report_versions),
+            "current_report_version_index": state.current_report_version_index,
             "state_file_path": state.state_file_path,
             "error": state.error,
             "token_usage": copy.deepcopy(state.token_usage),
@@ -436,6 +568,14 @@ class RunManager:
             state.status = "running"
             state.execution_state = "running"
             tree["report_status"] = "pending"
+            return
+        if et == "run_paused":
+            if state.status == "running":
+                state.execution_state = "paused"
+            return
+        if et == "run_resumed":
+            if state.status == "running":
+                state.execution_state = "running"
             return
         if et == "plan_created":
             tree["plan"] = {
@@ -663,6 +803,8 @@ class RunManager:
         if et == "partial_report_generated":
             tree["report_status"] = "partial_ready"
             return
+        if et == "report_version_selected":
+            return
         if et == "report_generation_started":
             tree["report_status"] = "running"
             return
@@ -671,6 +813,9 @@ class RunManager:
             return
         if et == "report_generation_failed":
             tree["report_status"] = "failed"
+            return
+        if et == "report_version_created":
+            tree["report_status"] = "completed"
             return
 
     def _ensure_round(self, tree: Dict[str, Any], round_i: int) -> Dict[str, Any]:
@@ -770,6 +915,10 @@ class RunManager:
                 phase = "run_sufficiency"
             elif event_type in {"report_generation_started", "partial_report_generated"}:
                 phase = "writing_report"
+            elif event_type == "run_paused":
+                phase = "paused"
+            elif event_type == "run_resumed":
+                phase = "working"
             elif event_type in {"run_completed", "run_failed", "run_aborted"}:
                 phase = "terminal"
 
@@ -815,9 +964,45 @@ class RunManager:
             set_phase(str(event.get("event_type", "")), event.get("payload", {}))
             self._publish_event(run_id, event)
 
+        paused_announced = False
+
         def should_abort() -> bool:
-            with self._lock:
-                return bool(self._cancel_flags.get(run_id, False))
+            nonlocal paused_announced
+            while True:
+                with self._lock:
+                    cancelled = bool(self._cancel_flags.get(run_id, False))
+                    paused = bool(self._pause_flags.get(run_id, False))
+                    state = self._runs.get(run_id)
+                if cancelled:
+                    return True
+                if paused and state and state.status == "running":
+                    if not paused_announced:
+                        set_phase("run_paused", {})
+                        self._publish_event(
+                            run_id,
+                            {
+                                "run_id": run_id,
+                                "timestamp": _now().isoformat(),
+                                "event_type": "run_paused",
+                                "payload": {},
+                            },
+                        )
+                        paused_announced = True
+                    time.sleep(0.2)
+                    continue
+                if paused_announced:
+                    set_phase("run_resumed", {})
+                    self._publish_event(
+                        run_id,
+                        {
+                            "run_id": run_id,
+                            "timestamp": _now().isoformat(),
+                            "event_type": "run_resumed",
+                            "payload": {},
+                        },
+                    )
+                    paused_announced = False
+                return False
 
         agent = DeepResearchAgent(
             model=snapshot.model,
@@ -838,16 +1023,35 @@ class RunManager:
                 state = self._runs.get(run_id)
                 if not state:
                     return
-                state.report_text = report
-                state.report_file_path = str(report_path)
                 state.token_usage = agent.usage_tracker.to_dict()
+                created = self._append_report_version_locked(
+                    state=state,
+                    report_text=report,
+                    report_file_path=str(report_path),
+                    trigger_type="auto_natural_stop",
+                    usage_snapshot=state.token_usage,
+                )
                 state.updated_at = _now()
                 if state.status != "failed":
                     state.status = "completed"
                     state.execution_state = "completed"
+                    self._pause_flags[run_id] = False
                     state.tree["report_status"] = "completed"
                 self._sync_session_from_state_locked(state)
                 self._save_sessions_index_locked()
+            self._publish_event(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "timestamp": _now().isoformat(),
+                    "event_type": "report_version_created",
+                    "payload": {
+                        "version_index": int(created.get("version_index", 1)),
+                        "trigger_type": "auto_natural_stop",
+                        "report_file_path": str(report_path),
+                    },
+                },
+            )
         except Exception as exc:
             error_text = str(exc)
             terminal_event_type = (
@@ -862,6 +1066,7 @@ class RunManager:
                 state.execution_state = (
                     "aborted" if error_text == "Run aborted by user" else "failed"
                 )
+                self._pause_flags[run_id] = False
                 state.error = error_text
                 state.token_usage = agent.usage_tracker.to_dict()
                 state.updated_at = _now()
@@ -1112,6 +1317,8 @@ class RunManager:
             "updated_at": state.updated_at.isoformat(),
             "state_file_path": state.state_file_path or "",
             "report_file_path": report_file_path or None,
+            "report_versions": state.report_versions if isinstance(state.report_versions, list) else [],
+            "current_report_version_index": state.current_report_version_index,
             "has_manual_edits": bool(state.has_manual_edits),
         }
 
@@ -1165,6 +1372,8 @@ class RunManager:
     def _should_flush_sessions_index(self, event_type: str) -> bool:
         if event_type in {
             "run_started",
+            "run_paused",
+            "run_resumed",
             "run_completed",
             "run_failed",
             "run_aborted",
@@ -1172,6 +1381,8 @@ class RunManager:
             "report_generation_completed",
             "report_generation_failed",
             "partial_report_generated",
+            "report_version_created",
+            "report_version_selected",
             "abort_requested",
             "run_abort_requested",
         }:
@@ -1228,6 +1439,7 @@ class RunManager:
                 self._sessions[sid] = item
                 self._subscribers.setdefault(sid, [])
                 self._cancel_flags.setdefault(sid, False)
+                self._pause_flags.setdefault(sid, False)
 
             known_state_paths = {
                 str(v.get("state_file_path", "")).strip()
@@ -1267,6 +1479,7 @@ class RunManager:
                     self._runs[sid] = state
                     self._subscribers.setdefault(sid, [])
                     self._cancel_flags.setdefault(sid, False)
+                    self._pause_flags.setdefault(sid, False)
                     self._sync_session_from_state_locked(state)
                     new_title = str(self._sessions.get(sid, {}).get("title", "")).strip()
                     if (
@@ -1319,6 +1532,14 @@ class RunManager:
         }
         report_text = None
         report_path = str(session_item.get("report_file_path", "") or "")
+        report_versions: List[Dict[str, Any]] = []
+        raw_session_versions = session_item.get("report_versions", [])
+        if isinstance(raw_session_versions, list):
+            report_versions = [v for v in raw_session_versions if isinstance(v, dict)]
+        current_report_version_index: Optional[int] = None
+        raw_session_idx = session_item.get("current_report_version_index")
+        if isinstance(raw_session_idx, int):
+            current_report_version_index = raw_session_idx
         created_at = _now()
         updated_at = _now()
         model = "gpt-4.1"
@@ -1370,6 +1591,12 @@ class RunManager:
                         report = trace.get("report", "")
                         if isinstance(report, str) and report.strip():
                             report_text = report
+                        trace_versions = trace.get("report_versions", [])
+                        if isinstance(trace_versions, list):
+                            report_versions = [v for v in trace_versions if isinstance(v, dict)]
+                        trace_current_idx = trace.get("current_report_version_index")
+                        if isinstance(trace_current_idx, int):
+                            current_report_version_index = trace_current_idx
                         tu = trace.get("token_usage", {})
                         if isinstance(tu, dict):
                             token_usage = tu
@@ -1404,6 +1631,36 @@ class RunManager:
                 report_text = Path(report_path).read_text(encoding="utf-8")
             except Exception:
                 report_text = None
+
+        if not report_versions and report_text:
+            report_versions = [
+                {
+                    "version_index": 1,
+                    "created_at": updated_at.isoformat(),
+                    "trigger_type": "manual_legacy",
+                    "report_text": report_text,
+                    "report_file_path": report_path or "",
+                    "token_usage": token_usage if isinstance(token_usage, dict) else None,
+                }
+            ]
+            current_report_version_index = 1
+        elif report_versions and (
+            current_report_version_index is None
+            or current_report_version_index < 1
+            or current_report_version_index > len(report_versions)
+        ):
+            current_report_version_index = len(report_versions)
+        if report_versions and current_report_version_index:
+            selected = report_versions[current_report_version_index - 1]
+            report_text = str(selected.get("report_text", "") or "")
+            rp = str(selected.get("report_file_path", "") or "")
+            if rp:
+                report_path = rp
+            if (not report_text) and report_path and Path(report_path).exists():
+                try:
+                    report_text = Path(report_path).read_text(encoding="utf-8")
+                except Exception:
+                    report_text = None
 
         if status not in {"queued", "running", "completed", "failed"}:
             status = "failed"
@@ -1444,6 +1701,8 @@ class RunManager:
             tree=tree,
             report_text=report_text,
             report_file_path=report_path or None,
+            report_versions=report_versions,
+            current_report_version_index=current_report_version_index,
             state_file_path=state_file_path or None,
             error=error,
             token_usage=token_usage,

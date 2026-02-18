@@ -41,6 +41,14 @@
         <button id="downloadBtn" disabled>Download Report</button>
       </div>
       <details>
+        <summary>Session power controls</summary>
+        <div class="dock-controls">
+          <button id="pauseBtn" type="button" disabled>Pause Research</button>
+          <button id="resumeBtn" type="button" disabled>Resume Research</button>
+          <button id="abortBtn" type="button" disabled>Abort Research</button>
+        </div>
+      </details>
+      <details>
         <summary>Advanced controls</summary>
         <div class="advanced-grid">
           <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="1" max="8"></label>
@@ -79,7 +87,12 @@
       <section class="report card">
         <div class="section-head">
           <h2>Report</h2>
-          <label class="raw-toggle"><input id="rawToggle" type="checkbox" /> Raw</label>
+          <div class="report-head-tools">
+            <button id="reportPrevBtn" type="button" disabled>&lt;</button>
+            <span id="reportVersionLabel" class="muted">-/-</span>
+            <button id="reportNextBtn" type="button" disabled>&gt;</button>
+            <label class="raw-toggle"><input id="rawToggle" type="checkbox" /> Raw</label>
+          </div>
         </div>
         <div id="coverageNote" class="muted"></div>
         <pre id="reportRaw" class="report-body hidden"></pre>

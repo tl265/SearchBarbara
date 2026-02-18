@@ -4,6 +4,9 @@ const resultsPerQueryEl = document.getElementById("resultsPerQuery");
 const runBtn = document.getElementById("runBtn");
 const reportBtn = document.getElementById("reportBtn");
 const downloadBtn = document.getElementById("downloadBtn");
+const pauseBtn = document.getElementById("pauseBtn");
+const resumeBtn = document.getElementById("resumeBtn");
+const abortBtn = document.getElementById("abortBtn");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
@@ -30,6 +33,9 @@ const reportRawEl = document.getElementById("reportRaw");
 const reportRenderedEl = document.getElementById("reportRendered");
 const usageEl = document.getElementById("usage");
 const rawToggleEl = document.getElementById("rawToggle");
+const reportPrevBtn = document.getElementById("reportPrevBtn");
+const reportNextBtn = document.getElementById("reportNextBtn");
+const reportVersionLabel = document.getElementById("reportVersionLabel");
 const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
   ? window.APP_CONFIG
   : {};
@@ -40,8 +46,9 @@ let es = null;
 let activeSessionSwitchToken = 0;
 let snapshotFetchInFlight = false;
 let snapshotFetchQueued = false;
-let reportGenerating = false;
+const reportGeneratingRunIds = new Set();
 let abortRequested = false;
+let selectedReportVersionIndex = null;
 let autoFollowActiveNode = true;
 let lastAutoFollowNodeKey = "";
 let skipNextCanvasScrollDisable = false;
@@ -95,7 +102,7 @@ function resetWorkspaceForNewSession() {
   currentRunId = null;
   currentSnapshot = null;
   abortRequested = false;
-  reportGenerating = false;
+  reportGeneratingRunIds.clear();
   activeSessionSwitchToken += 1;
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
@@ -126,7 +133,19 @@ function resetWorkspaceForNewSession() {
   reportBtn.disabled = true;
   reportBtn.textContent = "Generate Report From Current Findings";
   downloadBtn.disabled = true;
+  pauseBtn.disabled = true;
+  resumeBtn.disabled = true;
+  abortBtn.disabled = true;
+  reportPrevBtn.disabled = true;
+  reportNextBtn.disabled = true;
+  reportVersionLabel.textContent = "-/-";
+  selectedReportVersionIndex = null;
   currentSnapshot = null;
+}
+
+function isReportGeneratingForRun(runId) {
+  const rid = String(runId || "").trim();
+  return !!rid && reportGeneratingRunIds.has(rid);
 }
 
 function readRunIdFromUrl() {
@@ -389,6 +408,21 @@ function queryStepStatusLabel(v) {
   return shortStatus(v);
 }
 
+function normalizeReportVersions(snap) {
+  const versions = Array.isArray(snap && snap.report_versions) ? snap.report_versions : [];
+  return versions.filter((v) => v && typeof v === "object");
+}
+
+function activeReportVersionIndex(snap) {
+  const versions = normalizeReportVersions(snap);
+  if (!versions.length) return null;
+  const idx = Number(snap && snap.current_report_version_index);
+  if (Number.isFinite(idx) && idx >= 1 && idx <= versions.length) {
+    return Math.floor(idx);
+  }
+  return versions.length;
+}
+
 function statusClass(v) {
   const s = String(v || "").toLowerCase();
   if (["running", "researching"].includes(s)) return "running";
@@ -620,10 +654,15 @@ function eventNarration(ev) {
   if (et === "run_abort_requested") return "Stop requested. Finishing current atomic step.";
   if (et === "abort_requested") return "Abort requested.";
   if (et === "run_aborted") return "Run stopped by user request.";
+  if (et === "run_paused") return "Research paused.";
+  if (et === "run_resumed") return "Research resumed.";
   if (et === "report_generation_started") return "Agent is writing the report, please wait a few moments...";
+  if (et === "report_heartbeat") return "Still writing report...";
   if (et === "report_generation_completed") return "Report generation completed.";
   if (et === "report_generation_failed") return "Report generation failed.";
   if (et === "partial_report_generated") return "Generated report from current findings.";
+  if (et === "report_version_created") return `Saved report version #${Number(p.version_index || 0)}.`;
+  if (et === "report_version_selected") return `Switched to report version #${Number(p.version_index || 0)}.`;
   if (et === "run_heartbeat") {
     const phase = p.phase || "processing";
     if (p.query) return `Still working (${phase}): ${p.query}`;
@@ -1157,7 +1196,21 @@ function applySnapshot(snap) {
 
   showError(snap.error || "");
   renderCanvas(snap.tree || {});
-  const hasReport = !!snap.report_file_path || !!(snap.report_text || "").trim();
+  const versions = normalizeReportVersions(snap);
+  const activeIdx = activeReportVersionIndex(snap);
+  selectedReportVersionIndex = activeIdx;
+  let reportText = "";
+  let reportFilePath = "";
+  if (versions.length && activeIdx) {
+    const selected = versions[activeIdx - 1] || {};
+    reportText = String(selected.report_text || "");
+    reportFilePath = String(selected.report_file_path || "");
+  } else {
+    reportText = String(snap.report_text || "");
+    reportFilePath = String(snap.report_file_path || "");
+  }
+
+  const hasReport = !!reportFilePath || !!reportText.trim();
   if (hasReport) {
     renderTokenSummary(snap.token_usage);
   } else {
@@ -1165,24 +1218,36 @@ function applySnapshot(snap) {
     usageEl.textContent = "";
   }
 
-  const reportText = snap.report_text || "";
   reportRawEl.textContent = reportText;
   reportRenderedEl.innerHTML = markdownToHtml(reportText);
   toggleReportMode();
 
-  const running = !!currentRunId && (snap.status === "running" || snap.status === "queued");
+  const es = String(snap.execution_state || "").toLowerCase();
+  const running = es === "running";
+  const paused = es === "paused";
+  const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
-  const reportBusy = reportGenerating || reportPhase === "running";
-  const canStop = running && !abortRequested;
-  runBtn.textContent = abortRequested ? "Stopping..." : (running ? "Stop Research" : "Start Research");
-  runBtn.classList.toggle("primary", !running);
-  runBtn.disabled = abortRequested || reportBusy;
+  const reportBusy = reportGeneratingForThisRun || reportPhase === "running";
+  const isNewSessionWorkspace = !currentRunId;
+  runBtn.textContent = "Start Research";
+  runBtn.classList.add("primary");
+  runBtn.disabled = !isNewSessionWorkspace || reportBusy;
+  pauseBtn.disabled = !(running && !reportBusy);
+  resumeBtn.disabled = !(paused && !reportBusy);
+  abortBtn.disabled = !((running || paused) && !reportBusy && !abortRequested);
 
-  const hasDownloadableReport = !!snap.report_file_path;
+  const hasDownloadableReport = !!reportFilePath;
   downloadBtn.disabled = !hasDownloadableReport;
-  const allowManualReport = !!currentRunId && !reportGenerating && !running && !hasDownloadableReport;
+  const allowManualReport = !!sid && !reportGeneratingForThisRun && (paused || ["completed", "aborted", "failed"].includes(es));
   reportBtn.disabled = !allowManualReport;
-  reportBtn.textContent = reportGenerating ? "Generating Report..." : "Generate Report From Current Findings";
+  reportBtn.textContent = reportGeneratingForThisRun ? "Generating Report..." : "Generate Report From Current Findings";
+  if (versions.length && activeIdx) {
+    reportVersionLabel.textContent = `${activeIdx}/${versions.length}`;
+  } else {
+    reportVersionLabel.textContent = "-/-";
+  }
+  reportPrevBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx > 1);
+  reportNextBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx < versions.length);
   renderSessions();
 }
 
@@ -1233,13 +1298,9 @@ async function openSession(runId, opts = {}) {
   if (updateUrl) {
     setRunIdInUrl(sid);
   }
-  const running = !!currentSnapshot && ["running", "queued"].includes(String(currentSnapshot.status || ""));
-  if (running) {
-    connectEvents(sid);
-  } else if (es) {
-    es.close();
-    es = null;
-  }
+  // Keep SSE attached for any opened session so manual report generation
+  // and version-selection events are visible even when research is not running.
+  connectEvents(sid);
 }
 
 function connectEvents(runId) {
@@ -1267,9 +1328,9 @@ function connectEvents(runId) {
     "query_started", "query_diagnostic", "query_skipped_cached", "query_rerun_allowed",
     "query_broadened", "query_blocked_diminishing_returns", "search_completed", "synthesis_completed",
     "node_sufficiency_started", "node_sufficiency_completed", "node_decomposition_started", "node_decomposed", "node_completed", "node_unresolved",
-    "sufficiency_started", "sufficiency_completed", "run_abort_requested", "abort_requested", "run_aborted",
-    "report_generation_started", "report_generation_completed", "report_generation_failed",
-    "partial_report_generated", "run_heartbeat", "run_completed", "run_failed"
+    "sufficiency_started", "sufficiency_completed", "run_paused", "run_resumed", "run_abort_requested", "abort_requested", "run_aborted",
+    "report_generation_started", "report_heartbeat", "report_generation_completed", "report_generation_failed",
+    "partial_report_generated", "report_version_created", "report_version_selected", "run_heartbeat", "run_completed", "run_failed"
   ];
   for (const e of events) {
     es.addEventListener(e, async (evt) => {
@@ -1279,6 +1340,9 @@ function connectEvents(runId) {
         const narration = eventNarration(parsed);
         if (narration) {
           upsertThought(narration, parsed.event_type || e);
+        }
+        if (parsed.event_type === "report_generation_completed" || parsed.event_type === "report_generation_failed") {
+          reportGeneratingRunIds.delete(String(runId));
         }
         if (parsed.event_type === "run_aborted" || parsed.event_type === "run_completed" || parsed.event_type === "run_failed") {
           abortRequested = false;
@@ -1324,11 +1388,11 @@ async function startRun() {
   await fetchSessions();
 }
 
-async function stopRun() {
+async function abortRun() {
   if (!currentRunId) return;
+  const ok = window.confirm("Abort this research session? This cannot be resumed.");
+  if (!ok) return;
   abortRequested = true;
-  runBtn.textContent = "Stopping...";
-  runBtn.disabled = true;
   const rsp = await fetch(`/api/runs/${currentRunId}/abort`, { method: "POST" });
   if (!rsp.ok) {
     abortRequested = false;
@@ -1336,25 +1400,50 @@ async function stopRun() {
   }
 }
 
+async function pauseRun() {
+  if (!currentRunId) return;
+  const rsp = await fetch(`/api/runs/${currentRunId}/pause`, { method: "POST" });
+  if (!rsp.ok) {
+    throw new Error(`Pause failed: ${rsp.status}`);
+  }
+}
+
+async function resumeRun() {
+  if (!currentRunId) return;
+  const rsp = await fetch(`/api/runs/${currentRunId}/resume`, { method: "POST" });
+  if (!rsp.ok) {
+    throw new Error(`Resume failed: ${rsp.status}`);
+  }
+}
+
+async function selectReportVersion(versionIndex) {
+  if (!currentRunId) return;
+  const vi = Number(versionIndex);
+  if (!Number.isFinite(vi) || vi < 1) return;
+  const rsp = await fetch(`/api/runs/${currentRunId}/report/select?version_index=${Math.floor(vi)}`, {
+    method: "POST",
+  });
+  if (!rsp.ok) {
+    throw new Error(`Select report version failed: ${rsp.status}`);
+  }
+  await fetchSnapshot(currentRunId);
+}
+
 runBtn.addEventListener("click", async () => {
   try {
-    if (reportGenerating) {
+    if (currentRunId) {
       return;
     }
-    const running = currentSnapshot && (currentSnapshot.status === "queued" || currentSnapshot.status === "running");
-    if (running) {
-      await stopRun();
-    } else {
-      await startRun();
-    }
+    await startRun();
   } catch (err) {
     showError(err.message || String(err));
   }
 });
 
 reportBtn.addEventListener("click", async () => {
-  if (!currentRunId || reportGenerating) return;
-  reportGenerating = true;
+  const reportRunId = String(currentRunId || "").trim();
+  if (!reportRunId || isReportGeneratingForRun(reportRunId)) return;
+  reportGeneratingRunIds.add(reportRunId);
   runBtn.disabled = true;
   reportBtn.disabled = true;
   reportBtn.textContent = "Generating Report...";
@@ -1362,24 +1451,78 @@ reportBtn.addEventListener("click", async () => {
   upsertThought("Generating report from accumulated findings.", "report");
 
   try {
-    const rsp = await fetch(`/api/runs/${currentRunId}/report`, { method: "POST" });
+    const rsp = await fetch(`/api/runs/${reportRunId}/report`, { method: "POST" });
     if (!rsp.ok) {
       throw new Error(`Report generation failed: ${rsp.status}`);
     }
-    await fetchSnapshot(currentRunId);
+    if (currentRunId === reportRunId) {
+      await fetchSnapshot(reportRunId);
+    }
   } catch (err) {
     showError(err.message || String(err));
   } finally {
-    reportGenerating = false;
-    if (currentRunId) {
-      await fetchSnapshot(currentRunId);
+    reportGeneratingRunIds.delete(reportRunId);
+    if (currentRunId === reportRunId) {
+      await fetchSnapshot(reportRunId);
     }
   }
 });
 
 downloadBtn.addEventListener("click", () => {
   if (!currentRunId) return;
+  const idx = Number(selectedReportVersionIndex || 0);
+  if (Number.isFinite(idx) && idx > 0) {
+    window.location.href = `/api/runs/${currentRunId}/report/download?version_index=${Math.floor(idx)}`;
+    return;
+  }
   window.location.href = `/api/runs/${currentRunId}/report/download`;
+});
+
+pauseBtn.addEventListener("click", async () => {
+  try {
+    await pauseRun();
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+});
+
+resumeBtn.addEventListener("click", async () => {
+  try {
+    await resumeRun();
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+});
+
+abortBtn.addEventListener("click", async () => {
+  try {
+    await abortRun();
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+});
+
+reportPrevBtn.addEventListener("click", async () => {
+  try {
+    const idx = Number(selectedReportVersionIndex || 0);
+    if (idx > 1) {
+      await selectReportVersion(idx - 1);
+    }
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+});
+
+reportNextBtn.addEventListener("click", async () => {
+  try {
+    const idx = Number(selectedReportVersionIndex || 0);
+    const versions = normalizeReportVersions(currentSnapshot || {});
+    if (idx >= 1 && idx < versions.length) {
+      await selectReportVersion(idx + 1);
+    }
+  } catch (err) {
+    showError(err.message || String(err));
+  }
 });
 
 rawToggleEl.addEventListener("change", toggleReportMode);

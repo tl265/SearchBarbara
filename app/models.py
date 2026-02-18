@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 RunStatus = Literal["queued", "running", "completed", "failed"]
 ExecutionState = Literal["idle", "running", "paused", "completed", "failed", "aborted"]
+ReportTriggerType = Literal["auto_natural_stop", "manual", "manual_legacy"]
 
 
 class CreateRunRequest(BaseModel):
@@ -45,6 +46,8 @@ class RunSnapshotResponse(BaseModel):
     latest_thought: Optional[str] = None
     report_text: Optional[str] = None
     report_file_path: Optional[str] = None
+    report_versions: List[Dict[str, Any]] = Field(default_factory=list)
+    current_report_version_index: Optional[int] = None
     error: Optional[str] = None
     token_usage: Optional[Dict[str, Any]] = None
 
@@ -77,6 +80,8 @@ class RunState(BaseModel):
     events: List[Dict[str, Any]] = Field(default_factory=list)
     report_text: Optional[str] = None
     report_file_path: Optional[str] = None
+    report_versions: List[Dict[str, Any]] = Field(default_factory=list)
+    current_report_version_index: Optional[int] = None
     state_file_path: Optional[str] = None
     error: Optional[str] = None
     token_usage: Optional[Dict[str, Any]] = None
