@@ -9,7 +9,13 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
-from app.models import CreateRunRequest, CreateRunResponse, RunSnapshotResponse
+from app.models import (
+    CreateRunRequest,
+    CreateRunResponse,
+    PatchSessionRequest,
+    RunSnapshotResponse,
+    SessionListResponse,
+)
 from app.run_manager import RunManager
 from app.sse import format_sse
 
@@ -271,12 +277,18 @@ def get_run(run_id: str) -> RunSnapshotResponse:
     report_status = str(state.tree.get("report_status", "pending")) if isinstance(state.tree, dict) else "pending"
     return RunSnapshotResponse(
         run_id=state.run_id,
+        session_id=state.session_id or state.run_id,
+        title=state.title or state.task,
         status=state.status,
+        execution_state=state.execution_state,
         research_status=_compute_research_status(state.status, state.error),
         report_status=report_status,
         created_at=state.created_at,
         updated_at=state.updated_at,
         task=state.task,
+        max_depth=state.max_depth,
+        max_rounds=state.max_rounds,
+        results_per_query=state.results_per_query,
         tree=state.tree,
         facts=[],
         insights=insights,
@@ -289,6 +301,68 @@ def get_run(run_id: str) -> RunSnapshotResponse:
         error=state.error,
         token_usage=state.token_usage,
     )
+
+
+@app.get("/api/sessions", response_model=SessionListResponse)
+def list_sessions() -> SessionListResponse:
+    sessions = run_manager.list_sessions()
+    return SessionListResponse(sessions=sessions)
+
+
+@app.get("/api/sessions/{session_id}", response_model=RunSnapshotResponse)
+def get_session(session_id: str) -> RunSnapshotResponse:
+    state = run_manager.get_snapshot(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+    insights, syntheses = _collect_tree_summaries(state.tree)
+    report_status = str(state.tree.get("report_status", "pending")) if isinstance(state.tree, dict) else "pending"
+    return RunSnapshotResponse(
+        run_id=state.run_id,
+        session_id=state.session_id or state.run_id,
+        title=state.title or state.task,
+        status=state.status,
+        execution_state=state.execution_state,
+        research_status=_compute_research_status(state.status, state.error),
+        report_status=report_status,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        task=state.task,
+        max_depth=state.max_depth,
+        max_rounds=state.max_rounds,
+        results_per_query=state.results_per_query,
+        tree=state.tree,
+        facts=[],
+        insights=insights,
+        syntheses=syntheses,
+        stop_reason=_stop_reason(state),
+        coverage_note=_coverage_note(state.tree if isinstance(state.tree, dict) else {}),
+        latest_thought=_latest_thought(state.events),
+        report_text=state.report_text,
+        report_file_path=state.report_file_path,
+        error=state.error,
+        token_usage=state.token_usage,
+    )
+
+
+@app.patch("/api/sessions/{session_id}")
+def rename_session(session_id: str, req: PatchSessionRequest) -> dict:
+    clean = " ".join(str(req.title or "").split()).strip()
+    if not clean:
+        raise HTTPException(status_code=422, detail="Title must contain non-whitespace characters.")
+    renamed = run_manager.rename_session(session_id, clean)
+    if renamed is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session": renamed.model_dump()}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str) -> dict:
+    result = run_manager.delete_session(session_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if result == "conflict_running":
+        raise HTTPException(status_code=409, detail="Cannot delete a running session. Abort first.")
+    return {"session_id": session_id, "status": "deleted"}
 
 
 def _event_stream(run_id: str, q: Queue) -> Iterator[str]:

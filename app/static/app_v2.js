@@ -7,6 +7,9 @@ const downloadBtn = document.getElementById("downloadBtn");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
+const sessionListEl = document.getElementById("sessionList");
+const newSessionBtn = document.getElementById("newSessionBtn");
+const refreshSessionsBtn = document.getElementById("refreshSessionsBtn");
 
 const runStatusEl = document.getElementById("runStatus");
 const researchStatusEl = document.getElementById("researchStatus");
@@ -34,6 +37,9 @@ const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
 let currentRunId = null;
 let currentSnapshot = null;
 let es = null;
+let activeSessionSwitchToken = 0;
+let snapshotFetchInFlight = false;
+let snapshotFetchQueued = false;
 let reportGenerating = false;
 let abortRequested = false;
 let autoFollowActiveNode = true;
@@ -44,6 +50,10 @@ const openDetailKeys = new Set();
 const forceClosedDetailKeys = new Set();
 let canvasZoom = 1;
 let autoFitCanvas = true;
+let sessions = [];
+// DEBUG ONLY: surface session-list load failures prominently while session
+// management is being stabilized.
+let debugSessionLoadError = "";
 const MIN_CANVAS_ZOOM = clamp(Number(APP_CONFIG.min_canvas_zoom ?? 0.45), 0.1, 0.95);
 const MAX_CANVAS_ZOOM = 1.6;
 const DEFAULT_MAX_DEPTH = Math.max(1, Math.floor(Number(APP_CONFIG.default_max_depth ?? 3)));
@@ -68,16 +78,73 @@ function esc(s) {
 function setRunIdInUrl(runId) {
   const url = new URL(window.location.href);
   if (runId) {
+    url.searchParams.set("session_id", runId);
     url.searchParams.set("run_id", runId);
   } else {
+    url.searchParams.delete("session_id");
     url.searchParams.delete("run_id");
   }
   history.replaceState({}, "", url);
 }
 
+function resetWorkspaceForNewSession() {
+  if (es) {
+    es.close();
+    es = null;
+  }
+  currentRunId = null;
+  currentSnapshot = null;
+  abortRequested = false;
+  reportGenerating = false;
+  activeSessionSwitchToken += 1;
+  autoFollowActiveNode = true;
+  lastAutoFollowNodeKey = "";
+  thoughts.length = 0;
+  openDetailKeys.clear();
+  forceClosedDetailKeys.clear();
+  thoughtStreamEl.innerHTML = "";
+
+  runMeta.textContent = "";
+  stopReasonEl.textContent = "";
+  latestThoughtEl.textContent = "";
+  coverageNoteEl.textContent = "";
+  reportRawEl.textContent = "";
+  reportRenderedEl.innerHTML = "";
+  tokenSummaryEl.textContent = "-";
+  usageEl.textContent = "";
+  taskEl.value = "";
+  setTaskBoxLocked(false);
+  setRunIdInUrl("");
+  renderCanvas(null);
+  showError("");
+  runStatusEl.textContent = "idle";
+  researchStatusEl.textContent = "idle";
+  reportStatusEl.textContent = "pending";
+  runBtn.textContent = "Start Research";
+  runBtn.classList.add("primary");
+  runBtn.disabled = false;
+  reportBtn.disabled = true;
+  reportBtn.textContent = "Generate Report From Current Findings";
+  downloadBtn.disabled = true;
+  currentSnapshot = null;
+}
+
 function readRunIdFromUrl() {
   const url = new URL(window.location.href);
-  return (url.searchParams.get("run_id") || "").trim();
+  return (url.searchParams.get("session_id") || url.searchParams.get("run_id") || "").trim();
+}
+
+function setTaskBoxLocked(locked) {
+  taskEl.disabled = !!locked;
+  taskEl.classList.toggle("locked", !!locked);
+}
+
+function fmtTime(iso) {
+  const s = String(iso || "").trim();
+  if (!s) return "-";
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) return s;
+  return d.toLocaleString();
 }
 
 function showError(msg) {
@@ -88,6 +155,57 @@ function showError(msg) {
   }
   errorBanner.textContent = msg;
   errorBanner.classList.remove("hidden");
+}
+
+function renderSessions() {
+  if (!sessionListEl) return;
+  if (debugSessionLoadError) {
+    sessionListEl.innerHTML = `<div class="error">DEBUG: ${esc(debugSessionLoadError)}</div>`;
+    return;
+  }
+  if (!Array.isArray(sessions) || sessions.length === 0) {
+    sessionListEl.innerHTML = "<div class=\"muted\">No sessions yet.</div>";
+    return;
+  }
+  sessionListEl.innerHTML = sessions
+    .map((s) => {
+      const sid = String(s.session_id || "");
+      const active = sid && sid === currentRunId ? " active" : "";
+      const title = String(s.title || sid || "Untitled");
+      const status = shortStatus(s.execution_state || s.status || "");
+      const updated = fmtTime(s.updated_at);
+      return `<div class="session-row${active}" data-session-id="${esc(sid)}">
+        <div>
+          <div class="session-title">${esc(title)}</div>
+          <div class="session-meta">${esc(status)} · ${esc(updated)}</div>
+        </div>
+        <div class="session-actions">
+          <button type="button" data-action="open" data-session-id="${esc(sid)}">Open</button>
+          <button type="button" data-action="rename" data-session-id="${esc(sid)}">Rename</button>
+          <button type="button" data-action="delete" data-session-id="${esc(sid)}">Delete</button>
+        </div>
+      </div>`;
+    })
+    .join("");
+}
+
+async function fetchSessions() {
+  try {
+    const rsp = await fetch("/api/sessions");
+    if (!rsp.ok) throw new Error(`Failed to list sessions: ${rsp.status}`);
+    const data = await rsp.json();
+    sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    debugSessionLoadError = "";
+    renderSessions();
+  } catch (err) {
+    const detail = err && err.message ? err.message : String(err);
+    debugSessionLoadError = `Session list load failed. ${detail}`;
+    // DEBUG ONLY: explicit banner to distinguish backend/API load issues from
+    // empty data situations.
+    showError(`DEBUG: ${debugSessionLoadError}`);
+    renderSessions();
+    throw err;
+  }
 }
 
 function clamp(n, lo, hi) {
@@ -1007,10 +1125,32 @@ function pickAutoFollowTargetNode() {
 
 function applySnapshot(snap) {
   currentSnapshot = snap;
+  const sid = String(snap.session_id || snap.run_id || "").trim();
+  if (sid && Array.isArray(sessions)) {
+    const idx = sessions.findIndex((s) => String((s && s.session_id) || "") === sid);
+    if (idx >= 0) {
+      sessions[idx] = {
+        ...sessions[idx],
+        title: snap.title || snap.task || sessions[idx].title,
+        status: snap.status,
+        execution_state: snap.execution_state || sessions[idx].execution_state,
+        updated_at: snap.updated_at || sessions[idx].updated_at,
+      };
+    }
+  }
   runStatusEl.textContent = shortStatus(snap.status);
   researchStatusEl.textContent = shortStatus(snap.research_status);
   reportStatusEl.textContent = shortStatus(snap.report_status || (snap.tree && snap.tree.report_status) || "pending");
-  runMeta.textContent = `Run ID: ${snap.run_id}`;
+  const title = String(snap.title || snap.task || "").trim();
+  runMeta.textContent = `${title ? `${title} · ` : ""}Run ID: ${snap.run_id}`;
+  taskEl.value = String(snap.task || "");
+  setTaskBoxLocked(!!sid);
+  if (Number.isFinite(Number(snap.max_depth)) && Number(snap.max_depth) >= 1) {
+    maxDepthEl.value = String(Math.floor(Number(snap.max_depth)));
+  }
+  if (Number.isFinite(Number(snap.results_per_query)) && Number(snap.results_per_query) >= 1) {
+    resultsPerQueryEl.value = String(Math.floor(Number(snap.results_per_query)));
+  }
   stopReasonEl.textContent = snap.stop_reason ? `Stop rationale: ${snap.stop_reason}` : "";
   latestThoughtEl.textContent = snap.latest_thought || "";
   coverageNoteEl.textContent = snap.coverage_note || "";
@@ -1030,7 +1170,7 @@ function applySnapshot(snap) {
   reportRenderedEl.innerHTML = markdownToHtml(reportText);
   toggleReportMode();
 
-  const running = snap.status === "running" || snap.status === "queued";
+  const running = !!currentRunId && (snap.status === "running" || snap.status === "queued");
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
   const reportBusy = reportGenerating || reportPhase === "running";
   const canStop = running && !abortRequested;
@@ -1043,13 +1183,63 @@ function applySnapshot(snap) {
   const allowManualReport = !!currentRunId && !reportGenerating && !running && !hasDownloadableReport;
   reportBtn.disabled = !allowManualReport;
   reportBtn.textContent = reportGenerating ? "Generating Report..." : "Generate Report From Current Findings";
+  renderSessions();
 }
 
 async function fetchSnapshot(runId) {
-  const rsp = await fetch(`/api/runs/${runId}`);
+  const rsp = await fetch(`/api/sessions/${runId}`);
   if (!rsp.ok) throw new Error(`Failed to fetch snapshot: ${rsp.status}`);
   const data = await rsp.json();
   applySnapshot(data);
+  renderSessions();
+}
+
+async function scheduleSnapshotRefresh(runId) {
+  const rid = String(runId || "").trim();
+  if (!rid) return;
+  if (snapshotFetchInFlight) {
+    snapshotFetchQueued = true;
+    return;
+  }
+  snapshotFetchInFlight = true;
+  try {
+    do {
+      snapshotFetchQueued = false;
+      if (String(currentRunId || "") !== rid) {
+        break;
+      }
+      await fetchSnapshot(rid);
+    } while (snapshotFetchQueued);
+  } finally {
+    snapshotFetchInFlight = false;
+  }
+}
+
+async function openSession(runId, opts = {}) {
+  const sid = String(runId || "").trim();
+  if (!sid) return;
+  const updateUrl = opts.updateUrl !== false;
+  const switchToken = ++activeSessionSwitchToken;
+  if (es) {
+    es.close();
+    es = null;
+  }
+  currentRunId = sid;
+  abortRequested = false;
+  await fetchSnapshot(sid);
+  if (switchToken !== activeSessionSwitchToken || currentRunId !== sid) {
+    return;
+  }
+  if (updateUrl) {
+    setRunIdInUrl(sid);
+  }
+  const running = !!currentSnapshot && ["running", "queued"].includes(String(currentSnapshot.status || ""));
+  if (running) {
+    connectEvents(sid);
+  } else if (es) {
+    es.close();
+    es = null;
+  }
 }
 
 function connectEvents(runId) {
@@ -1057,6 +1247,7 @@ function connectEvents(runId) {
   es = new EventSource(`/api/runs/${runId}/events`);
 
   es.onmessage = async (evt) => {
+    if (String(runId) !== String(currentRunId || "")) return;
     try {
       if (evt.data) {
         const parsed = JSON.parse(evt.data);
@@ -1068,7 +1259,7 @@ function connectEvents(runId) {
     } catch (_err) {
       // no-op
     }
-    await fetchSnapshot(runId);
+    await scheduleSnapshotRefresh(runId);
   };
 
   const events = [
@@ -1082,6 +1273,7 @@ function connectEvents(runId) {
   ];
   for (const e of events) {
     es.addEventListener(e, async (evt) => {
+      if (String(runId) !== String(currentRunId || "")) return;
       try {
         const parsed = JSON.parse(evt.data || "{}");
         const narration = eventNarration(parsed);
@@ -1094,7 +1286,7 @@ function connectEvents(runId) {
       } catch (_err) {
         // no-op
       }
-      await fetchSnapshot(runId);
+      await scheduleSnapshotRefresh(runId);
     });
   }
 }
@@ -1129,6 +1321,7 @@ async function startRun() {
   setRunIdInUrl(currentRunId);
   await fetchSnapshot(currentRunId);
   connectEvents(currentRunId);
+  await fetchSessions();
 }
 
 async function stopRun() {
@@ -1216,15 +1409,15 @@ window.addEventListener("resize", () => {
 
 async function bootstrapFromUrl() {
   const runId = readRunIdFromUrl();
-  if (!runId) {
-    renderCanvas(null);
-    return;
-  }
-  currentRunId = runId;
   try {
-    await fetchSnapshot(runId);
-    connectEvents(runId);
-    upsertThought("Restored run state from URL.", "bootstrap");
+    await fetchSessions();
+    const selected = runId ? String(runId) : "";
+    if (!selected) {
+      resetWorkspaceForNewSession();
+      return;
+    }
+    await openSession(selected, { updateUrl: true });
+    upsertThought("Restored session state.", "bootstrap");
   } catch (err) {
     showError(err.message || String(err));
   }
@@ -1272,3 +1465,74 @@ window.addEventListener("keydown", (evt) => {
     disableAutoFollowFromUserAction(evt);
   }
 });
+
+if (sessionListEl) {
+  sessionListEl.addEventListener("click", async (evt) => {
+    const target = evt.target;
+    if (!(target instanceof HTMLElement)) return;
+    const action = String(target.getAttribute("data-action") || "");
+    const sid = String(target.getAttribute("data-session-id") || "");
+    if (!action || !sid) return;
+    try {
+      if (action === "open") {
+        await openSession(sid, { updateUrl: true });
+        return;
+      }
+      if (action === "rename") {
+        const current = sessions.find((s) => String(s.session_id || "") === sid);
+        const next = window.prompt("Rename session:", String((current && current.title) || sid));
+        if (!next || !next.trim()) return;
+        const rsp = await fetch(`/api/sessions/${sid}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: next.trim() }),
+        });
+        if (!rsp.ok) throw new Error(`Rename failed: ${rsp.status}`);
+        await fetchSessions();
+        return;
+      }
+      if (action === "delete") {
+        const ok = window.confirm("Delete this session? This removes its saved state.");
+        if (!ok) return;
+        const rsp = await fetch(`/api/sessions/${sid}`, { method: "DELETE" });
+        if (rsp.status === 409) {
+          const body = await rsp.json().catch(() => ({}));
+          throw new Error(String(body.detail || "Cannot delete running session."));
+        }
+        if (!rsp.ok) throw new Error(`Delete failed: ${rsp.status}`);
+        if (currentRunId === sid) {
+          currentRunId = null;
+          currentSnapshot = null;
+          if (es) {
+            es.close();
+            es = null;
+          }
+          setRunIdInUrl("");
+          renderCanvas(null);
+          runMeta.textContent = "";
+        }
+        await fetchSessions();
+      }
+    } catch (err) {
+      const detail = err && err.message ? err.message : String(err);
+      showError(`Session ${action} failed: ${detail}`);
+    }
+  });
+}
+
+if (refreshSessionsBtn) {
+  refreshSessionsBtn.addEventListener("click", async () => {
+    try {
+      await fetchSessions();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+  });
+}
+
+if (newSessionBtn) {
+  newSessionBtn.addEventListener("click", () => {
+    resetWorkspaceForNewSession();
+    renderSessions();
+  });
+}

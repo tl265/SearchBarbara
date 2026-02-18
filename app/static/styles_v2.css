@@ -69,6 +69,7 @@ h1 { margin: 0; font-size: 1.4rem; }
 }
 
 .prompt-dock { margin-bottom: 10px; }
+.session-dock { margin-bottom: 10px; }
 .dock-label { display: block; font-weight: 600; margin-bottom: 6px; }
 textarea, input {
   width: 100%;
@@ -78,6 +79,11 @@ textarea, input {
   font: inherit;
 }
 textarea { resize: vertical; }
+textarea.locked {
+  background: #edf2f7;
+  color: #4b5563;
+  cursor: not-allowed;
+}
 
 .dock-controls {
   display: flex;
@@ -110,6 +116,46 @@ button:disabled {
   gap: 8px;
 }
 .advanced-grid label { font-size: 0.9rem; }
+
+.session-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 220px;
+  overflow: auto;
+}
+.session-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px;
+  background: #fcfeff;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.session-row.active {
+  border-color: #2563eb;
+  box-shadow: 0 0 0 1px #bfdbfe;
+}
+.session-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.session-meta {
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+.session-actions {
+  display: inline-flex;
+  gap: 6px;
+}
+.session-actions button {
+  padding: 4px 8px;
+  font-size: 0.82rem;
+}
 
 .content-grid {
   display: grid;

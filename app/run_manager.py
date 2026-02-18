@@ -1,12 +1,16 @@
 import json
+import copy
+import os
 import threading
 import uuid
 from datetime import datetime, timezone
+from glob import glob
 from pathlib import Path
 from queue import Queue
+import time
 from typing import Any, Dict, List, Optional
 
-from app.models import RunState
+from app.models import RunState, SessionSummary
 from deep_research_agent import (
     DeepResearchAgent,
     SYSTEM_REPORT,
@@ -22,13 +26,39 @@ def _now() -> datetime:
 
 class RunManager:
     _DEFAULT_HEARTBEAT_INTERVAL_SEC = 8.0
+    _SESSIONS_INDEX_SCHEMA_VERSION = 1
+    _MAX_EVENTS_PER_RUN = 2000
 
     def __init__(self, heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC) -> None:
         self._runs: Dict[str, RunState] = {}
+        self._sessions: Dict[str, Dict[str, Any]] = {}
         self._subscribers: Dict[str, List[Queue]] = {}
         self._cancel_flags: Dict[str, bool] = {}
         self._lock = threading.Lock()
+        self._index_write_lock = threading.Lock()
+        self._index_flush_event = threading.Event()
+        self._index_flush_seq = 0
+        self._index_flush_pending: Optional[tuple[int, Dict[str, Any]]] = None
+        self._index_writer_thread = threading.Thread(
+            target=self._sessions_index_writer_loop,
+            daemon=True,
+        )
+        self._index_writer_thread.start()
+        self._lock_debug = str(os.getenv("RUN_MANAGER_LOCK_DEBUG", "0")).strip() in {"1", "true", "yes"}
+        self._lock_wait_warn_ms = float(os.getenv("RUN_MANAGER_LOCK_WAIT_WARN_MS", "120"))
+        self._lock_hold_warn_ms = float(os.getenv("RUN_MANAGER_LOCK_HOLD_WARN_MS", "150"))
         self._heartbeat_interval_sec = max(1.0, float(heartbeat_interval_sec))
+        self._index_flush_min_interval_sec = 2.0
+        self._last_index_flush_ts = 0.0
+        self._runs_dir = Path("runs")
+        self._runs_dir.mkdir(parents=True, exist_ok=True)
+        self._sessions_index_path = self._runs_dir / "sessions_index.json"
+        self._sessions_index_meta: Dict[str, Any] = {
+            "schema_version": self._SESSIONS_INDEX_SCHEMA_VERSION,
+            "title_migration_v1_done": False,
+            "execution_state_migration_v1_done": False,
+        }
+        self._bootstrap_sessions_from_disk()
 
     def create_run(
         self,
@@ -43,7 +73,11 @@ class RunManager:
         now = _now()
         state = RunState(
             run_id=run_id,
+            session_id=run_id,
+            owner_id=None,
+            title=self._default_title_from_task(task),
             status="queued",
+            execution_state="idle",
             created_at=now,
             updated_at=now,
             task=task,
@@ -66,6 +100,8 @@ class RunManager:
             self._runs[run_id] = state
             self._subscribers[run_id] = []
             self._cancel_flags[run_id] = False
+            self._sync_session_from_state_locked(state)
+            self._save_sessions_index_locked(force=True)
 
         t = threading.Thread(
             target=self._execute_run,
@@ -74,6 +110,91 @@ class RunManager:
         )
         t.start()
         return run_id
+
+    def list_sessions(self) -> List[SessionSummary]:
+        items: List[Dict[str, Any]]
+        from_disk_fallback = False
+        acquired, acquired_at = self._lock_acquire("list_sessions", timeout=0.5)
+        if acquired:
+            try:
+                items = list(self._sessions.values())
+            finally:
+                self._lock_release("list_sessions", acquired_at)
+        else:
+            # Fallback path: avoid hanging API calls when lock is contended.
+            loaded = self._load_sessions_index()
+            raw_items = loaded.get("sessions", [])
+            items = [it for it in raw_items if isinstance(it, dict)]
+            from_disk_fallback = True
+
+        # Disk fallback may contain stale non-terminal statuses from interrupted runs.
+        # Normalize for listing so UI does not show "running" without a live worker.
+        if from_disk_fallback:
+            normalized: List[Dict[str, Any]] = []
+            for it in items:
+                fixed = dict(it)
+                st = str(fixed.get("status", "")).strip().lower()
+                if st in {"queued", "running"}:
+                    fixed["status"] = "failed"
+                    fixed["execution_state"] = "failed"
+                normalized.append(fixed)
+            items = normalized
+        items.sort(
+            key=lambda it: str(it.get("updated_at", "")),
+            reverse=True,
+        )
+        out: List[SessionSummary] = []
+        for it in items:
+            try:
+                out.append(SessionSummary.model_validate(it))
+            except Exception:
+                continue
+        return out
+
+    def rename_session(self, session_id: str, title: str) -> Optional[SessionSummary]:
+        clean = " ".join(str(title or "").split()).strip()
+        if not clean:
+            return None
+        if len(clean) > 200:
+            clean = clean[:200]
+        with self._lock:
+            item = self._sessions.get(session_id)
+            if not item:
+                return None
+            item["title"] = clean
+            item["updated_at"] = _now().isoformat()
+            state = self._runs.get(session_id)
+            if state:
+                state.title = clean
+                state.updated_at = _now()
+            self._save_sessions_index_locked(force=True)
+            try:
+                return SessionSummary.model_validate(item)
+            except Exception:
+                return None
+
+    def delete_session(self, session_id: str) -> Optional[str]:
+        with self._lock:
+            state = self._runs.get(session_id)
+            if state and state.status in {"queued", "running"}:
+                return "conflict_running"
+            sess = self._sessions.get(session_id)
+            if not sess:
+                return None
+            state_file_path = str(sess.get("state_file_path", "")).strip()
+            self._sessions.pop(session_id, None)
+            self._runs.pop(session_id, None)
+            self._subscribers.pop(session_id, None)
+            self._cancel_flags.pop(session_id, None)
+            self._save_sessions_index_locked(force=True)
+        if state_file_path:
+            try:
+                path = Path(state_file_path)
+                if path.exists():
+                    path.unlink()
+            except Exception:
+                pass
+        return "deleted"
 
     def abort_run(self, run_id: str) -> Optional[str]:
         should_emit = False
@@ -184,11 +305,28 @@ class RunManager:
         return {"report_file_path": str(report_path)}
 
     def get_snapshot(self, run_id: str) -> Optional[RunState]:
-        with self._lock:
-            state = self._runs.get(run_id)
-            if not state:
-                return None
-            return RunState.model_validate(state.model_dump())
+        acquired, acquired_at = self._lock_acquire("get_snapshot", timeout=0.5)
+        if acquired:
+            try:
+                state = self._runs.get(run_id)
+                if state:
+                    payload = self._snapshot_payload_locked(state)
+                    return RunState.model_validate(payload)
+                session_item = self._sessions.get(run_id)
+            finally:
+                self._lock_release("get_snapshot", acquired_at)
+        else:
+            loaded = self._load_sessions_index()
+            session_item = None
+            for item in loaded.get("sessions", []):
+                if isinstance(item, dict) and str(item.get("session_id", "")).strip() == run_id:
+                    session_item = item
+                    break
+
+        if not session_item:
+            return None
+        state_path = str(session_item.get("state_file_path", "")).strip()
+        return self._load_run_state_from_files(run_id, state_path, session_item)
 
     def subscribe(self, run_id: str) -> Optional[Queue]:
         with self._lock:
@@ -205,7 +343,11 @@ class RunManager:
                 subs.remove(queue)
 
     def _publish_event(self, run_id: str, event: Dict[str, Any]) -> None:
-        with self._lock:
+        subscribers: List[Queue] = []
+        acquired, _ = self._lock_acquire("_publish_event")
+        if not acquired:
+            return
+        try:
             state = self._runs.get(run_id)
             if not state:
                 return
@@ -216,10 +358,74 @@ class RunManager:
             ):
                 return
             state.events.append(event)
+            if len(state.events) > self._MAX_EVENTS_PER_RUN:
+                del state.events[:-self._MAX_EVENTS_PER_RUN]
             state.updated_at = _now()
             self._project_event(state, event)
-            for q in self._subscribers.get(run_id, []):
+            self._sync_session_from_state_locked(state)
+            event_type = str(event.get("event_type", ""))
+            if self._should_flush_sessions_index(event_type):
+                self._save_sessions_index_locked(force=True)
+            subscribers = list(self._subscribers.get(run_id, []))
+        finally:
+            self._lock_release("_publish_event")
+        for q in subscribers:
+            try:
                 q.put(event)
+            except Exception:
+                # Best-effort fan-out: don't block run progress on subscriber failures.
+                pass
+
+    def _lock_acquire(self, section: str, timeout: Optional[float] = None) -> tuple[bool, float]:
+        t0 = time.perf_counter()
+        if timeout is None:
+            acquired = self._lock.acquire()
+        else:
+            acquired = self._lock.acquire(timeout=timeout)
+        wait_ms = (time.perf_counter() - t0) * 1000.0
+        if self._lock_debug and wait_ms >= self._lock_wait_warn_ms:
+            print(f"[lock] wait {wait_ms:.1f}ms section={section}")
+        return acquired, time.perf_counter()
+
+    def _lock_release(self, section: str, acquired_at: Optional[float] = None) -> None:
+        hold_ms = 0.0
+        if acquired_at is not None:
+            hold_ms = (time.perf_counter() - acquired_at) * 1000.0
+        if self._lock_debug and acquired_at is not None and hold_ms >= self._lock_hold_warn_ms:
+            print(f"[lock] hold {hold_ms:.1f}ms section={section}")
+        self._lock.release()
+
+    def _snapshot_payload_locked(self, state: RunState) -> Dict[str, Any]:
+        # Build a copy outside pydantic model_dump path to keep lock hold predictable.
+        # `events` are trimmed to tail because UI only uses latest thought.
+        events_tail = [state.events[-1]] if state.events else []
+        return {
+            "run_id": state.run_id,
+            "session_id": state.session_id,
+            "owner_id": state.owner_id,
+            "title": state.title,
+            "status": state.status,
+            "execution_state": state.execution_state,
+            "created_at": state.created_at,
+            "updated_at": state.updated_at,
+            "last_checkpoint_at": state.last_checkpoint_at,
+            "has_manual_edits": state.has_manual_edits,
+            "task": state.task,
+            "max_depth": state.max_depth,
+            "max_rounds": state.max_rounds,
+            "results_per_query": state.results_per_query,
+            "model": state.model,
+            "report_model": state.report_model,
+            "tree": copy.deepcopy(state.tree),
+            "events": copy.deepcopy(events_tail),
+            "report_text": state.report_text,
+            "report_file_path": state.report_file_path,
+            "state_file_path": state.state_file_path,
+            "error": state.error,
+            "token_usage": copy.deepcopy(state.token_usage),
+            "manual_edit_log": copy.deepcopy(state.manual_edit_log),
+            "manual_assertions": copy.deepcopy(state.manual_assertions),
+        }
 
     def _project_event(self, state: RunState, event: Dict[str, Any]) -> None:
         et = event.get("event_type", "")
@@ -228,7 +434,8 @@ class RunManager:
 
         if et == "run_started":
             state.status = "running"
-            tree["report_status"] = "running"
+            state.execution_state = "running"
+            tree["report_status"] = "pending"
             return
         if et == "plan_created":
             tree["plan"] = {
@@ -434,15 +641,18 @@ class RunManager:
             return
         if et == "run_completed":
             state.status = "completed"
+            state.execution_state = "completed"
             tree["report_status"] = "completed"
             return
         if et == "run_failed":
             state.status = "failed"
+            state.execution_state = "failed"
             state.error = str(payload.get("error", "unknown error"))
             tree["report_status"] = "failed"
             return
         if et == "run_aborted":
             state.status = "failed"
+            state.execution_state = "aborted"
             state.error = str(payload.get("error", "Run aborted by user"))
             tree["report_status"] = "failed"
             return
@@ -516,6 +726,9 @@ class RunManager:
             if state_for_path:
                 state_for_path.state_file_path = str(state_path)
                 state_for_path.updated_at = _now()
+                state_for_path.last_checkpoint_at = _now()
+                self._sync_session_from_state_locked(state_for_path)
+                self._save_sessions_index_locked()
         reports_dir = Path("reports")
         reports_dir.mkdir(parents=True, exist_ok=True)
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -631,7 +844,10 @@ class RunManager:
                 state.updated_at = _now()
                 if state.status != "failed":
                     state.status = "completed"
+                    state.execution_state = "completed"
                     state.tree["report_status"] = "completed"
+                self._sync_session_from_state_locked(state)
+                self._save_sessions_index_locked()
         except Exception as exc:
             error_text = str(exc)
             terminal_event_type = (
@@ -643,10 +859,15 @@ class RunManager:
                 if not state:
                     return
                 state.status = "failed"
+                state.execution_state = (
+                    "aborted" if error_text == "Run aborted by user" else "failed"
+                )
                 state.error = error_text
                 state.token_usage = agent.usage_tracker.to_dict()
                 state.updated_at = _now()
                 state.tree["report_status"] = "failed"
+                self._sync_session_from_state_locked(state)
+                self._save_sessions_index_locked()
                 last_event_type = (
                     state.events[-1].get("event_type", "") if state.events else ""
                 )
@@ -863,3 +1084,379 @@ class RunManager:
             "total_selected_results": total_selected_results,
         }
         return findings, [], stats
+
+    def _default_title_from_task(self, task: str) -> str:
+        clean = " ".join(str(task or "").split()).strip()
+        if not clean:
+            return "Untitled session"
+        if len(clean) > 80:
+            return clean[:77] + "..."
+        return clean
+
+    def _sync_session_from_state_locked(self, state: RunState) -> None:
+        sid = state.session_id or state.run_id
+        state.session_id = sid
+        if not state.title:
+            state.title = self._default_title_from_task(state.task)
+        state.last_checkpoint_at = state.last_checkpoint_at or _now()
+        report_file_path = state.report_file_path or ""
+        if not report_file_path and isinstance(state.tree, dict):
+            report_file_path = str(state.tree.get("report_file_path", "") or "")
+        self._sessions[sid] = {
+            "session_id": sid,
+            "owner_id": state.owner_id,
+            "title": state.title,
+            "status": state.status,
+            "execution_state": state.execution_state,
+            "created_at": state.created_at.isoformat(),
+            "updated_at": state.updated_at.isoformat(),
+            "state_file_path": state.state_file_path or "",
+            "report_file_path": report_file_path or None,
+            "has_manual_edits": bool(state.has_manual_edits),
+        }
+
+    def _save_sessions_index_locked(self, force: bool = False) -> None:
+        now_ts = time.time()
+        if not force and (now_ts - self._last_index_flush_ts) < self._index_flush_min_interval_sec:
+            return
+        self._sessions_index_meta["schema_version"] = self._SESSIONS_INDEX_SCHEMA_VERSION
+        payload = {
+            "schema_version": int(self._sessions_index_meta.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)),
+            "title_migration_v1_done": bool(self._sessions_index_meta.get("title_migration_v1_done", False)),
+            "execution_state_migration_v1_done": bool(
+                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
+            ),
+            "updated_at": _now().isoformat(),
+            "sessions": list(self._sessions.values()),
+        }
+        self._last_index_flush_ts = now_ts
+
+        # Queue latest payload for the single writer thread; this preserves write ordering
+        # while keeping filesystem I/O out of hot lock paths.
+        self._index_flush_seq += 1
+        self._index_flush_pending = (self._index_flush_seq, payload)
+        self._index_flush_event.set()
+
+    def _sessions_index_writer_loop(self) -> None:
+        while True:
+            self._index_flush_event.wait()
+            pending = self._index_flush_pending
+            if not pending:
+                self._index_flush_event.clear()
+                continue
+            seq, payload = pending
+            with self._index_write_lock:
+                try:
+                    tmp_path = self._sessions_index_path.with_suffix(".json.tmp")
+                    tmp_path.write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    tmp_path.replace(self._sessions_index_path)
+                except Exception as exc:
+                    # Keep session/runs in memory even if persistence is temporarily unavailable.
+                    print(f"[sessions] index flush failed: {exc}")
+            # If no newer payload arrived while writing, clear pending + sleep gate.
+            latest = self._index_flush_pending
+            if latest and latest[0] == seq:
+                self._index_flush_pending = None
+                self._index_flush_event.clear()
+
+    def _should_flush_sessions_index(self, event_type: str) -> bool:
+        if event_type in {
+            "run_started",
+            "run_completed",
+            "run_failed",
+            "run_aborted",
+            "report_generation_started",
+            "report_generation_completed",
+            "report_generation_failed",
+            "partial_report_generated",
+            "abort_requested",
+            "run_abort_requested",
+        }:
+            return True
+        return False
+
+    def _load_sessions_index(self) -> Dict[str, Any]:
+        if not self._sessions_index_path.exists():
+            return {"sessions": []}
+        try:
+            parsed = json.loads(self._sessions_index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {"sessions": []}
+        if not isinstance(parsed, dict):
+            return {"sessions": []}
+        try:
+            schema_version = int(
+                parsed.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+            )
+        except (TypeError, ValueError):
+            schema_version = self._SESSIONS_INDEX_SCHEMA_VERSION
+        self._sessions_index_meta["schema_version"] = schema_version
+        self._sessions_index_meta["title_migration_v1_done"] = bool(
+            parsed.get("title_migration_v1_done", False)
+        )
+        self._sessions_index_meta["execution_state_migration_v1_done"] = bool(
+            parsed.get("execution_state_migration_v1_done", False)
+        )
+        raw_sessions = parsed.get("sessions", [])
+        if not isinstance(raw_sessions, list):
+            return {"sessions": []}
+        out: List[Dict[str, Any]] = []
+        for item in raw_sessions:
+            if isinstance(item, dict):
+                out.append(item)
+        return {"sessions": out}
+
+    def _bootstrap_sessions_from_disk(self) -> None:
+        loaded = self._load_sessions_index()
+        loaded_sessions = loaded.get("sessions", [])
+        title_migration_needed = not bool(
+            self._sessions_index_meta.get("title_migration_v1_done", False)
+        )
+        execution_state_migration_needed = not bool(
+            self._sessions_index_meta.get("execution_state_migration_v1_done", False)
+        )
+        migrated_titles = 0
+        migrated_execution_states = 0
+        with self._lock:
+            for item in loaded_sessions:
+                sid = str(item.get("session_id", "")).strip()
+                if not sid:
+                    continue
+                self._sessions[sid] = item
+                self._subscribers.setdefault(sid, [])
+                self._cancel_flags.setdefault(sid, False)
+
+            known_state_paths = {
+                str(v.get("state_file_path", "")).strip()
+                for v in self._sessions.values()
+                if isinstance(v, dict)
+            }
+            for sp in glob(str(self._runs_dir / "state_web_*.json")):
+                if sp not in known_state_paths:
+                    run_id = Path(sp).stem.replace("state_web_", "")
+                    self._sessions.setdefault(
+                        run_id,
+                        {
+                            "session_id": run_id,
+                            "owner_id": None,
+                            "title": "Recovered session",
+                            "status": "failed",
+                            "execution_state": "failed",
+                            "created_at": _now().isoformat(),
+                            "updated_at": _now().isoformat(),
+                            "state_file_path": sp,
+                            "report_file_path": None,
+                            "has_manual_edits": False,
+                        },
+                    )
+
+            for sid, item in list(self._sessions.items()):
+                state_path = str(item.get("state_file_path", "")).strip()
+                state = self._load_run_state_from_files(
+                    sid,
+                    state_path,
+                    item,
+                    force_execution_state_recompute=execution_state_migration_needed,
+                )
+                if state:
+                    prior_title = str(item.get("title", "")).strip()
+                    prior_exec = str(item.get("execution_state", "")).strip().lower()
+                    self._runs[sid] = state
+                    self._subscribers.setdefault(sid, [])
+                    self._cancel_flags.setdefault(sid, False)
+                    self._sync_session_from_state_locked(state)
+                    new_title = str(self._sessions.get(sid, {}).get("title", "")).strip()
+                    if (
+                        title_migration_needed
+                        and prior_title.lower() == "recovered session"
+                        and new_title
+                        and new_title.lower() != "recovered session"
+                    ):
+                        migrated_titles += 1
+                    new_exec = str(
+                        self._sessions.get(sid, {}).get("execution_state", "")
+                    ).strip().lower()
+                    if execution_state_migration_needed and prior_exec and prior_exec != new_exec:
+                        migrated_execution_states += 1
+
+            if title_migration_needed:
+                self._sessions_index_meta["title_migration_v1_done"] = True
+            if execution_state_migration_needed:
+                self._sessions_index_meta["execution_state_migration_v1_done"] = True
+            self._save_sessions_index_locked()
+        if title_migration_needed:
+            print(f"[sessions] title migration v1 applied; updated {migrated_titles} session titles.")
+        if execution_state_migration_needed:
+            print(
+                "[sessions] execution-state migration v1 applied; "
+                f"updated {migrated_execution_states} sessions."
+            )
+
+    def _load_run_state_from_files(
+        self,
+        session_id: str,
+        state_file_path: str,
+        session_item: Dict[str, Any],
+        force_execution_state_recompute: bool = False,
+    ) -> Optional[RunState]:
+        status = str(session_item.get("status", "failed"))
+        execution_state = str(session_item.get("execution_state", status))
+        raw_title = str(session_item.get("title", "") or "").strip()
+        if raw_title and raw_title.lower() != "recovered session":
+            task = raw_title
+        else:
+            task = "Recovered session"
+        tree: Dict[str, Any] = {
+            "task": task,
+            "plan": {"sub_questions": [], "success_criteria": []},
+            "max_depth": 3,
+            "rounds": [],
+            "final_sufficiency": None,
+            "report_status": "pending",
+        }
+        report_text = None
+        report_path = str(session_item.get("report_file_path", "") or "")
+        created_at = _now()
+        updated_at = _now()
+        model = "gpt-4.1"
+        report_model = "gpt-5.2"
+        max_depth = 3
+        max_rounds = 1
+        results_per_query = 3
+        token_usage: Optional[Dict[str, Any]] = None
+        error = None
+
+        try:
+            ci = str(session_item.get("created_at", "") or "")
+            if ci:
+                created_at = datetime.fromisoformat(ci)
+        except Exception:
+            pass
+        try:
+            ui = str(session_item.get("updated_at", "") or "")
+            if ui:
+                updated_at = datetime.fromisoformat(ui)
+        except Exception:
+            pass
+
+        if state_file_path and Path(state_file_path).exists():
+            try:
+                raw = json.loads(Path(state_file_path).read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    raw_task = str(raw.get("task", "") or "").strip()
+                    if raw_task:
+                        task = raw_task
+                    status = str(raw.get("status", status) or status)
+                    trace = raw.get("trace", {})
+                    if isinstance(trace, dict):
+                        trace_task = str(trace.get("task", "") or "").strip()
+                        if trace_task:
+                            task = trace_task
+                        model = str(trace.get("model", model) or model)
+                        report_model = str(trace.get("report_model", report_model) or report_model)
+                        max_depth = int(trace.get("max_depth", max_depth))
+                        max_rounds = int(trace.get("max_rounds", max_rounds))
+                        results_per_query = int(
+                            trace.get("results_per_query", results_per_query)
+                        )
+                        rounds = trace.get("rounds", [])
+                        if isinstance(rounds, list):
+                            tree["rounds"] = rounds
+                        fs = trace.get("final_sufficiency", None)
+                        tree["final_sufficiency"] = fs
+                        report = trace.get("report", "")
+                        if isinstance(report, str) and report.strip():
+                            report_text = report
+                        tu = trace.get("token_usage", {})
+                        if isinstance(tu, dict):
+                            token_usage = tu
+                        error = str(raw.get("error", "") or "")
+                        tree["report_status"] = (
+                            "completed"
+                            if status == "completed"
+                            else ("failed" if status == "failed" else "pending")
+                        )
+                    st = str(raw.get("started_at", "") or "")
+                    if st:
+                        try:
+                            created_at = datetime.fromisoformat(st)
+                        except Exception:
+                            pass
+                    ut = str(raw.get("updated_at", "") or "")
+                    if ut:
+                        try:
+                            updated_at = datetime.fromisoformat(ut)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        if (not task or task.lower() == "recovered session") and raw_title:
+            task = raw_title
+        if not task:
+            task = "Recovered session"
+
+        if report_path and Path(report_path).exists() and not report_text:
+            try:
+                report_text = Path(report_path).read_text(encoding="utf-8")
+            except Exception:
+                report_text = None
+
+        if status not in {"queued", "running", "completed", "failed"}:
+            status = "failed"
+        if force_execution_state_recompute:
+            execution_state = self._execution_state_from_status(status)
+        elif execution_state not in {"idle", "running", "paused", "completed", "failed", "aborted"}:
+            execution_state = self._execution_state_from_status(status)
+
+        # Recovered sessions are loaded from disk without reattaching a live worker.
+        # Any non-terminal status from prior process is stale and should be normalized.
+        if status in {"queued", "running"}:
+            status = "failed"
+            execution_state = "failed"
+            if not str(error or "").strip():
+                error = "Recovered interrupted run (non-terminal checkpoint without active worker)."
+
+        raw_title = str(session_item.get("title", "") or "").strip()
+        if not raw_title or raw_title.lower() == "recovered session":
+            resolved_title = self._default_title_from_task(task)
+        else:
+            resolved_title = raw_title
+
+        return RunState(
+            run_id=session_id,
+            session_id=session_id,
+            owner_id=session_item.get("owner_id"),
+            title=resolved_title,
+            status=status,  # type: ignore[arg-type]
+            execution_state=execution_state,  # type: ignore[arg-type]
+            created_at=created_at,
+            updated_at=updated_at,
+            task=task,
+            max_depth=max(1, max_depth),
+            max_rounds=max(1, max_rounds),
+            results_per_query=max(1, results_per_query),
+            model=model,
+            report_model=report_model,
+            tree=tree,
+            report_text=report_text,
+            report_file_path=report_path or None,
+            state_file_path=state_file_path or None,
+            error=error,
+            token_usage=token_usage,
+        )
+
+    def _execution_state_from_status(self, status: str) -> str:
+        s = str(status or "").strip().lower()
+        if s == "running":
+            return "running"
+        if s == "queued":
+            return "idle"
+        if s == "completed":
+            return "completed"
+        if s == "failed":
+            return "failed"
+        return "idle"
