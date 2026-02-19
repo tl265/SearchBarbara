@@ -220,6 +220,9 @@ h3 { margin: 12px 0 6px; font-size: 0.95rem; }
   max-width: 520px;
   display: none;
 }
+body.ui-debug-on .zoom-debug {
+  display: inline-block;
+}
 .depth-rows {
   display: flex;
   flex-direction: column;

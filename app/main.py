@@ -35,6 +35,7 @@ def _load_web_config() -> Dict[str, Any]:
         "default_results_per_query": 3,
         "model": "gpt-4.1",
         "report_model": "gpt-5.2",
+        "ui_debug": False,
         "min_canvas_zoom": 0.45,
         "auto_fit_safety_px": 10,
         "heartbeat_interval_sec": 8,
@@ -69,6 +70,7 @@ def _load_web_config() -> Dict[str, Any]:
     report_model = str(
         raw.get("report_model", default["report_model"]) or default["report_model"]
     )
+    ui_debug = bool(raw.get("ui_debug", default["ui_debug"]))
     try:
         min_canvas_zoom = float(
             raw.get("min_canvas_zoom", default["min_canvas_zoom"])
@@ -93,6 +95,7 @@ def _load_web_config() -> Dict[str, Any]:
         "default_results_per_query": max(1, min(default_results_per_query, 30)),
         "model": model,
         "report_model": report_model,
+        "ui_debug": ui_debug,
         "min_canvas_zoom": min(max(min_canvas_zoom, 0.1), 0.95),
         "auto_fit_safety_px": max(0, min(auto_fit_safety_px, 200)),
         "heartbeat_interval_sec": min(max(heartbeat_interval_sec, 1.0), 120.0),
@@ -117,6 +120,7 @@ def index(request: Request) -> HTMLResponse:
             "default_results_per_query": int(
                 WEB_CONFIG.get("default_results_per_query", 3)
             ),
+            "ui_debug": bool(WEB_CONFIG.get("ui_debug", False)),
         },
     )
 
@@ -287,7 +291,11 @@ def get_run(run_id: str) -> RunSnapshotResponse:
         session_id=state.session_id or state.run_id,
         title=state.title or state.task,
         status=state.status,
+        version=max(1, int(getattr(state, "version", 1) or 1)),
         execution_state=state.execution_state,
+        research_state=state.research_state,
+        report_state=state.report_state,
+        terminal_reason=state.terminal_reason,
         research_status=_compute_research_status(
             state.status, state.execution_state, state.error
         ),
@@ -316,7 +324,9 @@ def get_run(run_id: str) -> RunSnapshotResponse:
 
 @app.get("/api/sessions", response_model=SessionListResponse)
 def list_sessions() -> SessionListResponse:
-    sessions = run_manager.list_sessions()
+    sessions = run_manager.list_sessions(
+        include_lock_debug=bool(WEB_CONFIG.get("ui_debug", False))
+    )
     return SessionListResponse(sessions=sessions)
 
 
@@ -332,7 +342,11 @@ def get_session(session_id: str) -> RunSnapshotResponse:
         session_id=state.session_id or state.run_id,
         title=state.title or state.task,
         status=state.status,
+        version=max(1, int(getattr(state, "version", 1) or 1)),
         execution_state=state.execution_state,
+        research_state=state.research_state,
+        report_state=state.report_state,
+        terminal_reason=state.terminal_reason,
         research_status=_compute_research_status(
             state.status, state.execution_state, state.error
         ),
@@ -430,54 +444,100 @@ def download_report(
 
 
 @app.post("/api/runs/{run_id}/abort")
-def abort_run(run_id: str) -> dict:
-    status = run_manager.abort_run(run_id)
-    if status is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return {"run_id": run_id, "status": status}
-
-
-@app.post("/api/runs/{run_id}/pause")
-def pause_run(run_id: str) -> dict:
-    status = run_manager.pause_run(run_id)
-    if status is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return {"run_id": run_id, "status": status}
-
-
-@app.post("/api/runs/{run_id}/resume")
-def resume_run(run_id: str) -> dict:
-    status = run_manager.resume_run(run_id)
-    if status is None:
-        raise HTTPException(status_code=404, detail="Run not found")
-    return {"run_id": run_id, "status": status}
-
-
-@app.post("/api/runs/{run_id}/report/partial")
-def generate_partial_report(run_id: str) -> dict:
-    result = run_manager.generate_partial_report(run_id)
+def abort_run(run_id: str, expected_version: int | None = Query(default=None, ge=1)) -> dict:
+    result = run_manager.abort_run(run_id, expected_version=expected_version)
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
     if "error" in result:
-        raise HTTPException(status_code=500, detail=str(result.get("error", "Unknown error")))
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_run(run_id: str, expected_version: int | None = Query(default=None, ge=1)) -> dict:
+    result = run_manager.pause_run(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(run_id: str, expected_version: int | None = Query(default=None, ge=1)) -> dict:
+    result = run_manager.resume_run(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/report/partial")
+def generate_partial_report(
+    run_id: str, expected_version: int | None = Query(default=None, ge=1)
+) -> dict:
+    result = run_manager.generate_partial_report(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"busy", "conflict_report_running", "conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        if code in {"invalid_state"}:
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
     return {"run_id": run_id, **result}
 
 
 @app.post("/api/runs/{run_id}/report")
-def generate_report_now(run_id: str) -> dict:
-    result = run_manager.generate_partial_report(run_id)
+def generate_report_now(
+    run_id: str, expected_version: int | None = Query(default=None, ge=1)
+) -> dict:
+    result = run_manager.generate_partial_report(run_id, expected_version=expected_version)
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
     if "error" in result:
-        raise HTTPException(status_code=500, detail=str(result.get("error", "Unknown error")))
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"busy", "conflict_report_running", "conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        if code in {"invalid_state"}:
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
     return {"run_id": run_id, **result}
 
 
 @app.post("/api/runs/{run_id}/report/select")
-def select_report_version(run_id: str, version_index: int = Query(..., ge=1)) -> dict:
-    result = run_manager.select_report_version(run_id, version_index)
+def select_report_version(
+    run_id: str,
+    version_index: int = Query(..., ge=1),
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    result = run_manager.select_report_version(
+        run_id, version_index, expected_version=expected_version
+    )
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
     if not result:
         raise HTTPException(status_code=404, detail="No report versions available")
     return {"run_id": run_id, **result}

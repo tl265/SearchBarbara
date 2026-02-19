@@ -28,7 +28,11 @@ class RunSnapshotResponse(BaseModel):
     session_id: Optional[str] = None
     title: Optional[str] = None
     status: RunStatus
+    version: int = 1
     execution_state: Optional[ExecutionState] = None
+    research_state: Optional[str] = None
+    report_state: Optional[str] = None
+    terminal_reason: Optional[str] = None
     research_status: Optional[str] = None
     report_status: Optional[str] = None
     created_at: datetime
@@ -65,7 +69,11 @@ class RunState(BaseModel):
     owner_id: Optional[str] = None
     title: Optional[str] = None
     status: RunStatus
+    version: int = 1
     execution_state: ExecutionState = "idle"
+    research_state: Optional[str] = None
+    report_state: Optional[str] = None
+    terminal_reason: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     last_checkpoint_at: Optional[datetime] = None
@@ -94,12 +102,18 @@ class SessionSummary(BaseModel):
     owner_id: Optional[str] = None
     title: str
     status: RunStatus
+    version: int = 1
     execution_state: ExecutionState
+    research_state: Optional[str] = None
+    report_state: Optional[str] = None
     created_at: datetime
     updated_at: datetime
     state_file_path: Optional[str] = None
     report_file_path: Optional[str] = None
+    report_versions_count: int = 0
+    latest_report_at: Optional[datetime] = None
     has_manual_edits: bool = False
+    lock_debug: Optional[Dict[str, Any]] = None
 
 
 class SessionListResponse(BaseModel):

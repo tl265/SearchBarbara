@@ -72,6 +72,11 @@ const BASE_NODE_CARD_WIDTH = 340;
 const MIN_NODE_FONT_SCALE = 0.72;
 const MAX_NODE_FONT_SCALE = 1.25;
 const AUTO_FIT_SAFETY_PX = Math.max(0, Math.floor(Number(APP_CONFIG.auto_fit_safety_px ?? 10)));
+const UI_DEBUG = !!APP_CONFIG.ui_debug;
+let lastDebugReportPhaseKey = "";
+if (document && document.body) {
+  document.body.classList.toggle("ui-debug-on", UI_DEBUG);
+}
 
 function esc(s) {
   return String(s || "").replace(/[&<>\"]/g, (c) => ({
@@ -107,6 +112,7 @@ function resetWorkspaceForNewSession() {
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
   thoughts.length = 0;
+  lastDebugReportPhaseKey = "";
   openDetailKeys.clear();
   forceClosedDetailKeys.clear();
   thoughtStreamEl.innerHTML = "";
@@ -148,6 +154,12 @@ function isReportGeneratingForRun(runId) {
   return !!rid && reportGeneratingRunIds.has(rid);
 }
 
+function currentExpectedVersion() {
+  const v = Number(currentSnapshot && currentSnapshot.version);
+  if (Number.isFinite(v) && v >= 1) return Math.floor(v);
+  return null;
+}
+
 function readRunIdFromUrl() {
   const url = new URL(window.location.href);
   return (url.searchParams.get("session_id") || url.searchParams.get("run_id") || "").trim();
@@ -178,25 +190,37 @@ function showError(msg) {
 
 function renderSessions() {
   if (!sessionListEl) return;
+  const lockLegend = UI_DEBUG
+    ? `<div class="session-meta muted">Debug lock legend: mgr=global RunManager mutex (shows owner section + held ms) · session=per-session mutex · index=sessions_index.json write mutex</div>`
+    : "";
   if (debugSessionLoadError) {
-    sessionListEl.innerHTML = `<div class="error">DEBUG: ${esc(debugSessionLoadError)}</div>`;
+    if (UI_DEBUG) {
+      sessionListEl.innerHTML = `${lockLegend}<div class="error">DEBUG: ${esc(debugSessionLoadError)}</div>`;
+    } else {
+      sessionListEl.innerHTML = `<div class="error">Session list unavailable. Please refresh.</div>`;
+    }
     return;
   }
   if (!Array.isArray(sessions) || sessions.length === 0) {
-    sessionListEl.innerHTML = "<div class=\"muted\">No sessions yet.</div>";
+    sessionListEl.innerHTML = `${lockLegend}<div class="muted">No sessions yet.</div>`;
     return;
   }
-  sessionListEl.innerHTML = sessions
+  sessionListEl.innerHTML = lockLegend + sessions
     .map((s) => {
       const sid = String(s.session_id || "");
       const active = sid && sid === currentRunId ? " active" : "";
       const title = String(s.title || sid || "Untitled");
-      const status = shortStatus(s.execution_state || s.status || "");
+      const research = shortStatus(sessionResearchState(s));
+      const report = shortStatus(sessionReportState(s));
       const updated = fmtTime(s.updated_at);
+      const lockDbg = (UI_DEBUG && s && s.lock_debug && typeof s.lock_debug === "object")
+        ? `Locks: mgr=${esc(String(s.lock_debug.manager_lock || "-"))}${s.lock_debug.manager_lock_owner_section ? `(${esc(String(s.lock_debug.manager_lock_owner_section || ""))})` : ""}${Number(s.lock_debug.manager_lock_held_ms || 0) > 0 ? ` ${Math.round(Number(s.lock_debug.manager_lock_held_ms || 0))}ms` : ""} · session=${esc(String(s.lock_debug.session_lock || "-"))} · index=${esc(String(s.lock_debug.index_write_lock || "-"))}`
+        : "";
       return `<div class="session-row${active}" data-session-id="${esc(sid)}">
         <div>
           <div class="session-title">${esc(title)}</div>
-          <div class="session-meta">${esc(status)} · ${esc(updated)}</div>
+          <div class="session-meta">Research: ${esc(research)} · Report: ${esc(report)} · ${esc(updated)}</div>
+          ${lockDbg ? `<div class="session-meta muted">${lockDbg}</div>` : ""}
         </div>
         <div class="session-actions">
           <button type="button" data-action="open" data-session-id="${esc(sid)}">Open</button>
@@ -219,9 +243,13 @@ async function fetchSessions() {
   } catch (err) {
     const detail = err && err.message ? err.message : String(err);
     debugSessionLoadError = `Session list load failed. ${detail}`;
-    // DEBUG ONLY: explicit banner to distinguish backend/API load issues from
-    // empty data situations.
-    showError(`DEBUG: ${debugSessionLoadError}`);
+    if (UI_DEBUG) {
+      // DEBUG ONLY: explicit banner to distinguish backend/API load issues from
+      // empty data situations.
+      showError(`DEBUG: ${debugSessionLoadError}`);
+    } else {
+      showError("Session list load failed.");
+    }
     renderSessions();
     throw err;
   }
@@ -355,12 +383,14 @@ function applyCanvasZoom() {
   canvasEl.style.minHeight = "320px";
   zoomPctEl.textContent = `${Math.round(canvasZoom * 100)}%`;
   canvasHintEl.textContent = autoFitCanvas ? "Auto-fit" : "Manual zoom";
-  if (fitDebugEl) {
+  if (fitDebugEl && UI_DEBUG) {
     const d = getFitDiagnostics();
     const canvasCw = Math.floor(canvasEl.clientWidth || 0);
     const canvasSw = Math.ceil(canvasEl.scrollWidth || 0);
     const winW = Math.floor(window.innerWidth || 0);
     fitDebugEl.textContent = `dbg rows=${d.rowCount} worst=r${d.worstRow} ov=${d.worstOverflowPx}px vw=${d.worstVisibleWidth} cw=${d.worstClientWidth} sw=${d.worstScrollWidth} safety=${AUTO_FIT_SAFETY_PX}px canvas=${canvasCw}/${canvasSw} win=${winW} ${d.hasOverflow ? "OVERFLOW" : "ok"}`;
+  } else if (fitDebugEl) {
+    fitDebugEl.textContent = "";
   }
 }
 
@@ -373,6 +403,18 @@ function refreshCanvasZoomForCurrentLayout() {
 
 function shortStatus(v) {
   return String(v || "").replaceAll("_", " ") || "-";
+}
+
+function sessionResearchState(s) {
+  const explicit = String((s && s.research_state) || "").trim();
+  if (explicit) return explicit;
+  return String((s && (s.execution_state || s.status)) || "unknown");
+}
+
+function sessionReportState(s) {
+  const explicit = String((s && s.report_state) || "").trim();
+  if (explicit) return explicit;
+  return "idle";
 }
 
 function shortSourceLabel(url) {
@@ -1172,7 +1214,11 @@ function applySnapshot(snap) {
         ...sessions[idx],
         title: snap.title || snap.task || sessions[idx].title,
         status: snap.status,
+        version: snap.version || sessions[idx].version,
         execution_state: snap.execution_state || sessions[idx].execution_state,
+        research_state: snap.research_state || sessions[idx].research_state,
+        report_state: snap.report_state || sessions[idx].report_state,
+        report_status: snap.report_status || sessions[idx].report_status,
         updated_at: snap.updated_at || sessions[idx].updated_at,
       };
     }
@@ -1193,6 +1239,23 @@ function applySnapshot(snap) {
   stopReasonEl.textContent = snap.stop_reason ? `Stop rationale: ${snap.stop_reason}` : "";
   latestThoughtEl.textContent = snap.latest_thought || "";
   coverageNoteEl.textContent = snap.coverage_note || "";
+  if (UI_DEBUG) {
+    const tree = (snap && typeof snap.tree === "object" && snap.tree) ? snap.tree : {};
+    const dbgStatus = String(snap.report_status || tree.report_status || "pending").trim() || "pending";
+    const dbgPhase = String(tree.report_phase || "").trim() || "-";
+    const dbgMode = String(tree.report_mode || "").trim() || "-";
+    const dbgUpdated = String(tree.report_phase_updated_at || "").trim();
+    const dbgError = String(tree.report_error || "").trim();
+    const dbgKey = [sid, dbgStatus, dbgPhase, dbgMode, dbgUpdated, dbgError].join("|");
+    if (dbgKey !== lastDebugReportPhaseKey) {
+      const errTail = dbgError ? ` error=${dbgError.slice(0, 120)}` : "";
+      upsertThought(
+        `[DEBUG] report phase=${dbgPhase} status=${dbgStatus} mode=${dbgMode}${errTail}`,
+        "debug"
+      );
+      lastDebugReportPhaseKey = dbgKey;
+    }
+  }
 
   showError(snap.error || "");
   renderCanvas(snap.tree || {});
@@ -1222,23 +1285,27 @@ function applySnapshot(snap) {
   reportRenderedEl.innerHTML = markdownToHtml(reportText);
   toggleReportMode();
 
-  const es = String(snap.execution_state || "").toLowerCase();
-  const running = es === "running";
-  const paused = es === "paused";
+  const executionState = String(snap.execution_state || "").toLowerCase();
+  const researchState = String(snap.research_state || "").toLowerCase();
+  const running = researchState ? researchState === "running" : executionState === "running";
+  const paused = researchState ? researchState === "paused" : executionState === "paused";
+  const terminal = researchState ? researchState === "terminal" : ["completed", "aborted", "failed"].includes(executionState);
   const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+  const reportState = String(snap.report_state || "").toLowerCase();
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
-  const reportBusy = reportGeneratingForThisRun || reportPhase === "running";
+  const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
   const isNewSessionWorkspace = !currentRunId;
   runBtn.textContent = "Start Research";
   runBtn.classList.add("primary");
   runBtn.disabled = !isNewSessionWorkspace || reportBusy;
   pauseBtn.disabled = !(running && !reportBusy);
   resumeBtn.disabled = !(paused && !reportBusy);
-  abortBtn.disabled = !((running || paused) && !reportBusy && !abortRequested);
+  abortBtn.disabled = !((running || paused) && !reportBusy);
+  abortBtn.textContent = abortRequested && !abortBtn.disabled ? "Stopping..." : "Abort Research";
 
   const hasDownloadableReport = !!reportFilePath;
   downloadBtn.disabled = !hasDownloadableReport;
-  const allowManualReport = !!sid && !reportGeneratingForThisRun && (paused || ["completed", "aborted", "failed"].includes(es));
+  const allowManualReport = !!sid && !reportBusy && (paused || terminal);
   reportBtn.disabled = !allowManualReport;
   reportBtn.textContent = reportGeneratingForThisRun ? "Generating Report..." : "Generate Report From Current Findings";
   if (versions.length && activeIdx) {
@@ -1393,7 +1460,9 @@ async function abortRun() {
   const ok = window.confirm("Abort this research session? This cannot be resumed.");
   if (!ok) return;
   abortRequested = true;
-  const rsp = await fetch(`/api/runs/${currentRunId}/abort`, { method: "POST" });
+  const ev = currentExpectedVersion();
+  const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+  const rsp = await fetch(`/api/runs/${currentRunId}/abort${qs}`, { method: "POST" });
   if (!rsp.ok) {
     abortRequested = false;
     throw new Error(`Abort failed: ${rsp.status}`);
@@ -1402,7 +1471,9 @@ async function abortRun() {
 
 async function pauseRun() {
   if (!currentRunId) return;
-  const rsp = await fetch(`/api/runs/${currentRunId}/pause`, { method: "POST" });
+  const ev = currentExpectedVersion();
+  const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+  const rsp = await fetch(`/api/runs/${currentRunId}/pause${qs}`, { method: "POST" });
   if (!rsp.ok) {
     throw new Error(`Pause failed: ${rsp.status}`);
   }
@@ -1410,7 +1481,9 @@ async function pauseRun() {
 
 async function resumeRun() {
   if (!currentRunId) return;
-  const rsp = await fetch(`/api/runs/${currentRunId}/resume`, { method: "POST" });
+  const ev = currentExpectedVersion();
+  const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+  const rsp = await fetch(`/api/runs/${currentRunId}/resume${qs}`, { method: "POST" });
   if (!rsp.ok) {
     throw new Error(`Resume failed: ${rsp.status}`);
   }
@@ -1420,7 +1493,11 @@ async function selectReportVersion(versionIndex) {
   if (!currentRunId) return;
   const vi = Number(versionIndex);
   if (!Number.isFinite(vi) || vi < 1) return;
-  const rsp = await fetch(`/api/runs/${currentRunId}/report/select?version_index=${Math.floor(vi)}`, {
+  const ev = currentExpectedVersion();
+  const qs = ev
+    ? `version_index=${Math.floor(vi)}&expected_version=${encodeURIComponent(String(ev))}`
+    : `version_index=${Math.floor(vi)}`;
+  const rsp = await fetch(`/api/runs/${currentRunId}/report/select?${qs}`, {
     method: "POST",
   });
   if (!rsp.ok) {
@@ -1451,7 +1528,9 @@ reportBtn.addEventListener("click", async () => {
   upsertThought("Generating report from accumulated findings.", "report");
 
   try {
-    const rsp = await fetch(`/api/runs/${reportRunId}/report`, { method: "POST" });
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${reportRunId}/report${qs}`, { method: "POST" });
     if (!rsp.ok) {
       throw new Error(`Report generation failed: ${rsp.status}`);
     }

@@ -1,0 +1,15 @@
+[Unit]
+Description=SearchBarbara Web Service
+After=network.target
+
+[Service]
+Type=simple
+User=tl265
+WorkingDirectory=/home/tl265/projects/SearchBarbara
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/tl265/projects/SearchBarbara/run_web.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
