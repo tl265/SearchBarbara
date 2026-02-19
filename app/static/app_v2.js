@@ -126,6 +126,8 @@ function resetWorkspaceForNewSession() {
   tokenSummaryEl.textContent = "-";
   usageEl.textContent = "";
   taskEl.value = "";
+  maxDepthEl.value = String(DEFAULT_MAX_DEPTH);
+  resultsPerQueryEl.value = String(DEFAULT_RESULTS_PER_QUERY);
   setTaskBoxLocked(false);
   setRunIdInUrl("");
   renderCanvas(null);

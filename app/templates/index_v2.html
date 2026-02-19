@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>SearchBarbara v02</title>
+  <title>SearchBarbara</title>
   <link rel="stylesheet" href="/static/styles_v2.css" />
 </head>
 <body>
@@ -41,15 +41,12 @@
         <button id="downloadBtn" disabled>Download Report</button>
       </div>
       <details>
-        <summary>Session power controls</summary>
+        <summary>Advanced controls</summary>
         <div class="dock-controls">
           <button id="pauseBtn" type="button" disabled>Pause Research</button>
           <button id="resumeBtn" type="button" disabled>Resume Research</button>
           <button id="abortBtn" type="button" disabled>Abort Research</button>
         </div>
-      </details>
-      <details>
-        <summary>Advanced controls</summary>
         <div class="advanced-grid">
           <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="1" max="8"></label>
           <label>Results/query <input id="resultsPerQuery" type="number" value="{{ default_results_per_query }}" min="1" max="30"></label>
