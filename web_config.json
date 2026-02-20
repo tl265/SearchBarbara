@@ -1,6 +1,10 @@
 {
   "max_rounds": 1,
+  "max_depth_min": 1,
+  "max_depth_max": 4,
   "default_max_depth": 2,
+  "results_per_query_min": 1,
+  "results_per_query_max": 10,
   "default_results_per_query": 1,
   "model": "gpt-4.1",
   "report_model": "gpt-5.2",

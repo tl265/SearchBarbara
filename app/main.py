@@ -31,7 +31,11 @@ app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="stat
 def _load_web_config() -> Dict[str, Any]:
     default = {
         "max_rounds": 1,
+        "max_depth_min": 1,
+        "max_depth_max": 8,
         "default_max_depth": 3,
+        "results_per_query_min": 1,
+        "results_per_query_max": 30,
         "default_results_per_query": 3,
         "model": "gpt-4.1",
         "report_model": "gpt-5.2",
@@ -53,11 +57,35 @@ def _load_web_config() -> Dict[str, Any]:
     except (TypeError, ValueError):
         max_rounds = default["max_rounds"]
     try:
+        max_depth_min = int(raw.get("max_depth_min", default["max_depth_min"]))
+    except (TypeError, ValueError):
+        max_depth_min = default["max_depth_min"]
+    try:
+        max_depth_max = int(raw.get("max_depth_max", default["max_depth_max"]))
+    except (TypeError, ValueError):
+        max_depth_max = default["max_depth_max"]
+    max_depth_min = max(1, max_depth_min)
+    max_depth_max = max(max_depth_min, max_depth_max)
+    try:
         default_max_depth = int(
             raw.get("default_max_depth", default["default_max_depth"])
         )
     except (TypeError, ValueError):
         default_max_depth = default["default_max_depth"]
+    try:
+        results_per_query_min = int(
+            raw.get("results_per_query_min", default["results_per_query_min"])
+        )
+    except (TypeError, ValueError):
+        results_per_query_min = default["results_per_query_min"]
+    try:
+        results_per_query_max = int(
+            raw.get("results_per_query_max", default["results_per_query_max"])
+        )
+    except (TypeError, ValueError):
+        results_per_query_max = default["results_per_query_max"]
+    results_per_query_min = max(1, results_per_query_min)
+    results_per_query_max = max(results_per_query_min, results_per_query_max)
     try:
         default_results_per_query = int(
             raw.get(
@@ -91,8 +119,15 @@ def _load_web_config() -> Dict[str, Any]:
         heartbeat_interval_sec = default["heartbeat_interval_sec"]
     return {
         "max_rounds": max(1, max_rounds),
-        "default_max_depth": max(1, min(default_max_depth, 8)),
-        "default_results_per_query": max(1, min(default_results_per_query, 30)),
+        "max_depth_min": max_depth_min,
+        "max_depth_max": max_depth_max,
+        "default_max_depth": max(max_depth_min, min(default_max_depth, max_depth_max)),
+        "results_per_query_min": results_per_query_min,
+        "results_per_query_max": results_per_query_max,
+        "default_results_per_query": max(
+            results_per_query_min,
+            min(default_results_per_query, results_per_query_max),
+        ),
         "model": model,
         "report_model": report_model,
         "ui_debug": ui_debug,
@@ -116,7 +151,11 @@ def index(request: Request) -> HTMLResponse:
         {
             "min_canvas_zoom": float(WEB_CONFIG.get("min_canvas_zoom", 0.45)),
             "auto_fit_safety_px": int(WEB_CONFIG.get("auto_fit_safety_px", 10)),
+            "max_depth_min": int(WEB_CONFIG.get("max_depth_min", 1)),
+            "max_depth_max": int(WEB_CONFIG.get("max_depth_max", 8)),
             "default_max_depth": int(WEB_CONFIG.get("default_max_depth", 3)),
+            "results_per_query_min": int(WEB_CONFIG.get("results_per_query_min", 1)),
+            "results_per_query_max": int(WEB_CONFIG.get("results_per_query_max", 30)),
             "default_results_per_query": int(
                 WEB_CONFIG.get("default_results_per_query", 3)
             ),
@@ -268,6 +307,20 @@ def _stop_reason(state: Any) -> str:
 
 @app.post("/api/runs", response_model=CreateRunResponse)
 def create_run(req: CreateRunRequest) -> CreateRunResponse:
+    max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
+    max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
+    rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
+    rpq_max = int(WEB_CONFIG.get("results_per_query_max", 30))
+    if not (max_depth_min <= req.max_depth <= max_depth_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"max_depth must be between {max_depth_min} and {max_depth_max}",
+        )
+    if not (rpq_min <= req.results_per_query <= rpq_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
+        )
     run_id = run_manager.create_run(
         task=req.task,
         max_depth=req.max_depth,

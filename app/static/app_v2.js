@@ -129,6 +129,7 @@ function resetWorkspaceForNewSession() {
   maxDepthEl.value = String(DEFAULT_MAX_DEPTH);
   resultsPerQueryEl.value = String(DEFAULT_RESULTS_PER_QUERY);
   setTaskBoxLocked(false);
+  setRunConfigLocked(false);
   setRunIdInUrl("");
   renderCanvas(null);
   showError("");
@@ -170,6 +171,12 @@ function readRunIdFromUrl() {
 function setTaskBoxLocked(locked) {
   taskEl.disabled = !!locked;
   taskEl.classList.toggle("locked", !!locked);
+}
+
+function setRunConfigLocked(locked) {
+  const on = !!locked;
+  maxDepthEl.disabled = on;
+  resultsPerQueryEl.disabled = on;
 }
 
 function fmtTime(iso) {
@@ -1232,6 +1239,7 @@ function applySnapshot(snap) {
   runMeta.textContent = `${title ? `${title} · ` : ""}Run ID: ${snap.run_id}`;
   taskEl.value = String(snap.task || "");
   setTaskBoxLocked(!!sid);
+  setRunConfigLocked(!!sid);
   if (Number.isFinite(Number(snap.max_depth)) && Number(snap.max_depth) >= 1) {
     maxDepthEl.value = String(Math.floor(Number(snap.max_depth)));
   }
@@ -1430,6 +1438,7 @@ async function startRun() {
     showError("Task is required.");
     return;
   }
+  setRunConfigLocked(true);
   showError("");
   abortRequested = false;
   autoFollowActiveNode = true;
@@ -1437,24 +1446,31 @@ async function startRun() {
   thoughts.length = 0;
   thoughtStreamEl.innerHTML = "";
 
-  const rsp = await fetch("/api/runs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      task,
-      max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
-      results_per_query: Number(resultsPerQueryEl.value || DEFAULT_RESULTS_PER_QUERY),
-    }),
-  });
-  if (!rsp.ok) {
-    throw new Error(`Run creation failed: ${rsp.status}`);
+  try {
+    const rsp = await fetch("/api/runs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        task,
+        max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
+        results_per_query: Number(resultsPerQueryEl.value || DEFAULT_RESULTS_PER_QUERY),
+      }),
+    });
+    if (!rsp.ok) {
+      throw new Error(`Run creation failed: ${rsp.status}`);
+    }
+    const data = await rsp.json();
+    currentRunId = data.run_id;
+    setRunIdInUrl(currentRunId);
+    await fetchSnapshot(currentRunId);
+    connectEvents(currentRunId);
+    await fetchSessions();
+  } catch (err) {
+    if (!currentRunId) {
+      setRunConfigLocked(false);
+    }
+    throw err;
   }
-  const data = await rsp.json();
-  currentRunId = data.run_id;
-  setRunIdInUrl(currentRunId);
-  await fetchSnapshot(currentRunId);
-  connectEvents(currentRunId);
-  await fetchSessions();
 }
 
 async function abortRun() {

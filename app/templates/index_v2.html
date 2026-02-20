@@ -48,8 +48,8 @@
           <button id="abortBtn" type="button" disabled>Abort Research</button>
         </div>
         <div class="advanced-grid">
-          <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="1" max="8"></label>
-          <label>Results/query <input id="resultsPerQuery" type="number" value="{{ default_results_per_query }}" min="1" max="30"></label>
+          <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
+          <label>Results/query <input id="resultsPerQuery" type="number" value="{{ default_results_per_query }}" min="{{ results_per_query_min }}" max="{{ results_per_query_max }}"></label>
         </div>
       </details>
       <div id="runMeta" class="muted"></div>
