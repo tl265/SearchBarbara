@@ -46,6 +46,7 @@ let es = null;
 let activeSessionSwitchToken = 0;
 let snapshotFetchInFlight = false;
 let snapshotFetchQueued = false;
+let startRunInFlight = false;
 const reportGeneratingRunIds = new Set();
 let abortRequested = false;
 let selectedReportVersionIndex = null;
@@ -85,6 +86,18 @@ function esc(s) {
     ">": "&gt;",
     "\"": "&quot;",
   })[c]);
+}
+
+function newIdempotencyKey(prefix) {
+  const p = String(prefix || "req").trim() || "req";
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return `${p}_${window.crypto.randomUUID()}`;
+    }
+  } catch (_err) {
+    // fall through to non-crypto fallback
+  }
+  return `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
 }
 
 function setRunIdInUrl(runId) {
@@ -195,6 +208,27 @@ function showError(msg) {
   }
   errorBanner.textContent = msg;
   errorBanner.classList.remove("hidden");
+}
+
+async function responseDetail(rsp, fallback) {
+  let detail = fallback;
+  try {
+    const body = await rsp.json();
+    if (typeof body === "string" && body.trim()) {
+      detail = body.trim();
+    } else if (body && typeof body === "object") {
+      const d = body.detail;
+      if (typeof d === "string" && d.trim()) {
+        detail = d.trim();
+      } else if (d && typeof d === "object") {
+        const msg = String(d.message || d.error || "").trim();
+        if (msg) detail = msg;
+      }
+    }
+  } catch (_err) {
+    // no-op
+  }
+  return detail;
 }
 
 function renderSessions() {
@@ -1332,6 +1366,7 @@ async function fetchSnapshot(runId) {
   const rsp = await fetch(`/api/sessions/${runId}`);
   if (!rsp.ok) throw new Error(`Failed to fetch snapshot: ${rsp.status}`);
   const data = await rsp.json();
+  if (String(currentRunId || "") !== String(runId || "")) return;
   applySnapshot(data);
   renderSessions();
 }
@@ -1432,7 +1467,7 @@ function connectEvents(runId) {
   }
 }
 
-async function startRun() {
+async function startRun(idempotencyKey) {
   const task = taskEl.value.trim();
   if (!task) {
     showError("Task is required.");
@@ -1449,7 +1484,10 @@ async function startRun() {
   try {
     const rsp = await fetch("/api/runs", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
+      },
       body: JSON.stringify({
         task,
         max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
@@ -1478,32 +1516,48 @@ async function abortRun() {
   const ok = window.confirm("Abort this research session? This cannot be resumed.");
   if (!ok) return;
   abortRequested = true;
-  const ev = currentExpectedVersion();
-  const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
-  const rsp = await fetch(`/api/runs/${currentRunId}/abort${qs}`, { method: "POST" });
+  const runId = String(currentRunId || "").trim();
+  const rsp = await fetch(`/api/runs/${runId}/abort`, {
+    method: "POST",
+    headers: { "Idempotency-Key": newIdempotencyKey("abort") },
+  });
   if (!rsp.ok) {
     abortRequested = false;
-    throw new Error(`Abort failed: ${rsp.status}`);
+    throw new Error(await responseDetail(rsp, `Abort failed: ${rsp.status}`));
   }
 }
 
 async function pauseRun() {
   if (!currentRunId) return;
+  const runId = String(currentRunId || "").trim();
   const ev = currentExpectedVersion();
   const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
-  const rsp = await fetch(`/api/runs/${currentRunId}/pause${qs}`, { method: "POST" });
+  let rsp = await fetch(`/api/runs/${runId}/pause${qs}`, { method: "POST" });
+  if (rsp.status === 409) {
+    await fetchSnapshot(runId);
+    const retryEv = currentExpectedVersion();
+    const retryQs = retryEv ? `?expected_version=${encodeURIComponent(String(retryEv))}` : "";
+    rsp = await fetch(`/api/runs/${runId}/pause${retryQs}`, { method: "POST" });
+  }
   if (!rsp.ok) {
-    throw new Error(`Pause failed: ${rsp.status}`);
+    throw new Error(await responseDetail(rsp, `Pause failed: ${rsp.status}`));
   }
 }
 
 async function resumeRun() {
   if (!currentRunId) return;
+  const runId = String(currentRunId || "").trim();
   const ev = currentExpectedVersion();
   const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
-  const rsp = await fetch(`/api/runs/${currentRunId}/resume${qs}`, { method: "POST" });
+  let rsp = await fetch(`/api/runs/${runId}/resume${qs}`, { method: "POST" });
+  if (rsp.status === 409) {
+    await fetchSnapshot(runId);
+    const retryEv = currentExpectedVersion();
+    const retryQs = retryEv ? `?expected_version=${encodeURIComponent(String(retryEv))}` : "";
+    rsp = await fetch(`/api/runs/${runId}/resume${retryQs}`, { method: "POST" });
+  }
   if (!rsp.ok) {
-    throw new Error(`Resume failed: ${rsp.status}`);
+    throw new Error(await responseDetail(rsp, `Resume failed: ${rsp.status}`));
   }
 }
 
@@ -1525,13 +1579,20 @@ async function selectReportVersion(versionIndex) {
 }
 
 runBtn.addEventListener("click", async () => {
+  if (currentRunId || startRunInFlight) {
+    return;
+  }
+  startRunInFlight = true;
+  runBtn.disabled = true;
   try {
-    if (currentRunId) {
-      return;
-    }
-    await startRun();
+    await startRun(newIdempotencyKey("start_run"));
   } catch (err) {
     showError(err.message || String(err));
+  } finally {
+    startRunInFlight = false;
+    if (!currentRunId) {
+      runBtn.disabled = false;
+    }
   }
 });
 
@@ -1546,9 +1607,13 @@ reportBtn.addEventListener("click", async () => {
   upsertThought("Generating report from accumulated findings.", "report");
 
   try {
+    const idempotencyKey = newIdempotencyKey("report");
     const ev = currentExpectedVersion();
     const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
-    const rsp = await fetch(`/api/runs/${reportRunId}/report${qs}`, { method: "POST" });
+    const rsp = await fetch(`/api/runs/${reportRunId}/report${qs}`, {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+    });
     if (!rsp.ok) {
       throw new Error(`Report generation failed: ${rsp.status}`);
     }

@@ -16,6 +16,7 @@ let currentRunId = null;
 let es = null;
 let currentSnapshot = null;
 let partialReportGenerating = false;
+let startRunInFlight = false;
 
 function setStatus(status) {
   statusPill.textContent = status || "unknown";
@@ -38,6 +39,18 @@ function esc(s) {
     ">": "&gt;",
     "\"": "&quot;"
   })[c]);
+}
+
+function newIdempotencyKey(prefix) {
+  const p = String(prefix || "req").trim() || "req";
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return `${p}_${window.crypto.randomUUID()}`;
+    }
+  } catch (_err) {
+    // fall through to fallback
+  }
+  return `${p}_${Date.now()}_${Math.random().toString(36).slice(2, 12)}`;
 }
 
 function renderTree(tree) {
@@ -204,18 +217,24 @@ function connectEvents(runId) {
 }
 
 startBtn.addEventListener("click", async () => {
+  if (startRunInFlight) return;
   const task = taskEl.value.trim();
   if (!task) {
     showError("Task is required.");
     return;
   }
+  startRunInFlight = true;
   showError("");
   setStatus("queued");
   startBtn.disabled = true;
   try {
+    const idempotencyKey = newIdempotencyKey("start_run");
     const rsp = await fetch("/api/runs", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
       body: JSON.stringify({
         task,
         max_depth: Number(maxDepthEl.value || 3),
@@ -232,6 +251,7 @@ startBtn.addEventListener("click", async () => {
   } catch (err) {
     showError(err.message || String(err));
   } finally {
+    startRunInFlight = false;
     startBtn.disabled = false;
   }
 });
@@ -239,7 +259,10 @@ startBtn.addEventListener("click", async () => {
 abortBtn.addEventListener("click", async () => {
   if (!currentRunId) return;
   try {
-    const rsp = await fetch(`/api/runs/${currentRunId}/abort`, { method: "POST" });
+    const rsp = await fetch(`/api/runs/${currentRunId}/abort`, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey("abort") },
+    });
     if (!rsp.ok) {
       throw new Error(`Abort failed: ${rsp.status}`);
     }
@@ -255,8 +278,10 @@ partialReportBtn.addEventListener("click", async () => {
   partialReportBtn.textContent = "Generating Partial Report...";
   showError("");
   try {
+    const idempotencyKey = newIdempotencyKey("report_partial");
     const rsp = await fetch(`/api/runs/${currentRunId}/report/partial`, {
       method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
     });
     if (!rsp.ok) {
       throw new Error(`Partial report failed: ${rsp.status}`);

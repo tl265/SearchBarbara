@@ -1,5 +1,6 @@
 import json
 import copy
+import hashlib
 import os
 import threading
 import uuid
@@ -28,6 +29,8 @@ class RunManager:
     _DEFAULT_HEARTBEAT_INTERVAL_SEC = 8.0
     _SESSIONS_INDEX_SCHEMA_VERSION = 1
     _MAX_EVENTS_PER_RUN = 2000
+    _IDEMPOTENCY_TTL_CREATE_RUN_SEC = 600
+    _IDEMPOTENCY_TTL_REPORT_SEC = 300
 
     def __init__(self, heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC) -> None:
         self._runs: Dict[str, RunState] = {}
@@ -38,6 +41,8 @@ class RunManager:
         self._cancel_flags: Dict[str, bool] = {}
         self._pause_flags: Dict[str, bool] = {}
         self._active_report_runs: set[str] = set()
+        self._idempotency_lock = threading.Lock()
+        self._idempotency_records: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
         self._index_write_lock = threading.Lock()
         self._index_flush_event = threading.Event()
@@ -125,6 +130,108 @@ class RunManager:
         )
         t.start()
         return run_id
+
+    def _idempotency_record_id(self, scope: str, key: str) -> str:
+        return f"{str(scope or '').strip()}::{str(key or '').strip()}"
+
+    def _idempotency_make_hash(self, payload: Dict[str, Any]) -> str:
+        try:
+            serialized = json.dumps(
+                payload if isinstance(payload, dict) else {},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            )
+        except Exception:
+            serialized = "{}"
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+    def _idempotency_gc_locked(self, now_ts: Optional[float] = None) -> None:
+        now = float(now_ts if now_ts is not None else time.time())
+        stale = [
+            rid
+            for rid, rec in self._idempotency_records.items()
+            if float(rec.get("expires_at_ts", 0.0) or 0.0) <= now
+        ]
+        for rid in stale:
+            self._idempotency_records.pop(rid, None)
+
+    def idempotency_begin(
+        self, scope: str, key: str, payload: Dict[str, Any], ttl_sec: int
+    ) -> Dict[str, Any]:
+        clean_key = str(key or "").strip()
+        if not clean_key:
+            return {"state": "new"}
+        clean_scope = str(scope or "").strip()
+        now = time.time()
+        req_hash = self._idempotency_make_hash(payload)
+        rid = self._idempotency_record_id(clean_scope, clean_key)
+        with self._idempotency_lock:
+            self._idempotency_gc_locked(now_ts=now)
+            existing = self._idempotency_records.get(rid)
+            if existing is None:
+                self._idempotency_records[rid] = {
+                    "scope": clean_scope,
+                    "key": clean_key,
+                    "request_hash": req_hash,
+                    "status": "in_progress",
+                    "created_at_ts": now,
+                    "expires_at_ts": now + max(1, int(ttl_sec)),
+                    "response_payload": None,
+                }
+                print(
+                    f"[idempotency] scope={clean_scope} state=new key={clean_key[:12]}"
+                )
+                return {"state": "new"}
+            if str(existing.get("request_hash", "")) != req_hash:
+                print(
+                    f"[idempotency] scope={clean_scope} state=mismatch key={clean_key[:12]}"
+                )
+                return {"state": "mismatch"}
+            if str(existing.get("status", "")) == "completed":
+                print(
+                    f"[idempotency] scope={clean_scope} state=replay key={clean_key[:12]}"
+                )
+                return {
+                    "state": "replay",
+                    "payload": copy.deepcopy(existing.get("response_payload") or {}),
+                }
+            print(
+                f"[idempotency] scope={clean_scope} state=in_progress key={clean_key[:12]}"
+            )
+            return {"state": "in_progress"}
+
+    def idempotency_complete(
+        self, scope: str, key: str, payload: Dict[str, Any], ttl_sec: int
+    ) -> None:
+        clean_key = str(key or "").strip()
+        clean_scope = str(scope or "").strip()
+        if not clean_key:
+            return
+        now = time.time()
+        rid = self._idempotency_record_id(clean_scope, clean_key)
+        with self._idempotency_lock:
+            self._idempotency_gc_locked(now_ts=now)
+            rec = self._idempotency_records.get(rid)
+            if rec is None:
+                return
+            rec["status"] = "completed"
+            rec["response_payload"] = copy.deepcopy(
+                payload if isinstance(payload, dict) else {}
+            )
+            rec["expires_at_ts"] = now + max(1, int(ttl_sec))
+
+    def idempotency_clear_in_progress(self, scope: str, key: str) -> None:
+        clean_key = str(key or "").strip()
+        clean_scope = str(scope or "").strip()
+        if not clean_key:
+            return
+        rid = self._idempotency_record_id(clean_scope, clean_key)
+        with self._idempotency_lock:
+            rec = self._idempotency_records.get(rid)
+            if rec and str(rec.get("status", "")) == "in_progress":
+                self._idempotency_records.pop(rid, None)
 
     def _session_lock_for(self, run_id: str) -> threading.RLock:
         rid = str(run_id or "").strip()

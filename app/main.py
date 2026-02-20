@@ -305,8 +305,34 @@ def _stop_reason(state: Any) -> str:
     return ""
 
 
+def _idempotency_key_from_request(request: Request) -> str:
+    raw = str(request.headers.get("Idempotency-Key", "") or "").strip()
+    if not raw:
+        return ""
+    return raw[:200]
+
+
+def _raise_on_idempotency_state(state: str) -> None:
+    if state == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "idempotency_in_progress",
+                "message": "Request is already in progress.",
+            },
+        )
+    if state == "mismatch":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "idempotency_key_reused",
+                "message": "Idempotency key reused with different payload.",
+            },
+        )
+
+
 @app.post("/api/runs", response_model=CreateRunResponse)
-def create_run(req: CreateRunRequest) -> CreateRunResponse:
+def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
     max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
     max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
     rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
@@ -321,15 +347,48 @@ def create_run(req: CreateRunRequest) -> CreateRunResponse:
             status_code=422,
             detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
         )
-    run_id = run_manager.create_run(
-        task=req.task,
-        max_depth=req.max_depth,
-        max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
-        results_per_query=req.results_per_query,
-        model=str(WEB_CONFIG.get("model", "gpt-4.1")),
-        report_model=str(WEB_CONFIG.get("report_model", "gpt-5.2")),
+    model = str(WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = "create_run"
+    idem_payload = {
+        "task": req.task,
+        "max_depth": int(req.max_depth),
+        "results_per_query": int(req.results_per_query),
+        "model": model,
+        "report_model": report_model,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
     )
-    return CreateRunResponse(run_id=run_id, status="queued")
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload") if isinstance(idem.get("payload"), dict) else {}
+        return CreateRunResponse.model_validate(payload)
+    _raise_on_idempotency_state(idem_state)
+    try:
+        run_id = run_manager.create_run(
+            task=req.task,
+            max_depth=req.max_depth,
+            max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+            results_per_query=req.results_per_query,
+            model=model,
+            report_model=report_model,
+        )
+    except Exception:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise
+    response = CreateRunResponse(run_id=run_id, status="queued")
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response.model_dump(),
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    return response
 
 
 @app.get("/api/runs/{run_id}", response_model=RunSnapshotResponse)
@@ -497,17 +556,45 @@ def download_report(
 
 
 @app.post("/api/runs/{run_id}/abort")
-def abort_run(run_id: str, expected_version: int | None = Query(default=None, ge=1)) -> dict:
-    result = run_manager.abort_run(run_id, expected_version=expected_version)
+def abort_run(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"control_abort:{run_id}"
+    idem_payload = {"run_id": run_id, "action": "abort"}
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    _raise_on_idempotency_state(idem_state)
+    # Abort is monotonic best-effort control. Ignore OCC version during retries/session switches.
+    result = run_manager.abort_run(run_id, expected_version=None)
     if result is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         raise HTTPException(status_code=404, detail="Run not found")
     if "error" in result:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         code = str(result.get("error_code", "") or "")
         detail = str(result.get("error", "Unknown error"))
         if code in {"conflict_state_version"}:
             raise HTTPException(status_code=409, detail=detail)
         raise HTTPException(status_code=500, detail=detail)
-    return {"run_id": run_id, **result}
+    response = {"run_id": run_id, **result}
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    return response
 
 
 @app.post("/api/runs/{run_id}/pause")
@@ -540,12 +627,34 @@ def resume_run(run_id: str, expected_version: int | None = Query(default=None, g
 
 @app.post("/api/runs/{run_id}/report/partial")
 def generate_partial_report(
-    run_id: str, expected_version: int | None = Query(default=None, ge=1)
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"report_partial:{run_id}"
+    idem_payload = {
+        "run_id": run_id,
+        "mode": "partial",
+        "expected_version": expected_version,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    _raise_on_idempotency_state(idem_state)
     result = run_manager.generate_partial_report(run_id, expected_version=expected_version)
     if result is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         raise HTTPException(status_code=404, detail="Run not found")
     if "error" in result:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         code = str(result.get("error_code", "") or "")
         detail = str(result.get("error", "Unknown error"))
         if code in {"busy", "conflict_report_running", "conflict_state_version"}:
@@ -553,17 +662,46 @@ def generate_partial_report(
         if code in {"invalid_state"}:
             raise HTTPException(status_code=400, detail=detail)
         raise HTTPException(status_code=500, detail=detail)
-    return {"run_id": run_id, **result}
+    response = {"run_id": run_id, **result}
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    return response
 
 
 @app.post("/api/runs/{run_id}/report")
 def generate_report_now(
-    run_id: str, expected_version: int | None = Query(default=None, ge=1)
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"report_full:{run_id}"
+    idem_payload = {
+        "run_id": run_id,
+        "mode": "full",
+        "expected_version": expected_version,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    _raise_on_idempotency_state(idem_state)
     result = run_manager.generate_partial_report(run_id, expected_version=expected_version)
     if result is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         raise HTTPException(status_code=404, detail="Run not found")
     if "error" in result:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         code = str(result.get("error_code", "") or "")
         detail = str(result.get("error", "Unknown error"))
         if code in {"busy", "conflict_report_running", "conflict_state_version"}:
@@ -571,7 +709,14 @@ def generate_report_now(
         if code in {"invalid_state"}:
             raise HTTPException(status_code=400, detail=detail)
         raise HTTPException(status_code=500, detail=detail)
-    return {"run_id": run_id, **result}
+    response = {"run_id": run_id, **result}
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    return response
 
 
 @app.post("/api/runs/{run_id}/report/select")
