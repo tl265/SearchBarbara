@@ -766,7 +766,6 @@ class DeepResearchAgent:
         max_depth: int,
         max_rounds: int,
         results_per_query: int,
-        trace_file: str = "",
         state_file: str = "",
         resume_from: str = "",
         token_breakdown: bool = True,
@@ -832,7 +831,6 @@ class DeepResearchAgent:
         self.max_depth = max(1, int(max_depth))
         self.max_rounds = max_rounds
         self.results_per_query = results_per_query
-        self.trace_file = trace_file
         self.state_file = state_file
         self.resume_from = resume_from
         self.token_breakdown = token_breakdown
@@ -1899,8 +1897,6 @@ Runtime context (authoritative):
                     "token_usage": self.usage_tracker.to_dict().get("total", {}),
                 },
             )
-            trace_path = self._write_trace(trace)
-            print(f"[trace] saved: {trace_path}")
             self._print_token_summary(self.usage_tracker.to_dict())
             if self.usage_file:
                 usage_path = self._write_usage_report(self.usage_tracker.to_dict())
@@ -2928,18 +2924,6 @@ Runtime context (authoritative):
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(state_path)
 
-    def _write_trace(self, trace: Dict[str, Any]) -> str:
-        if self.trace_file:
-            path = Path(self.trace_file)
-            path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            runs_dir = Path("runs")
-            runs_dir.mkdir(parents=True, exist_ok=True)
-            ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            path = runs_dir / f"research_trace_{ts}.json"
-        path.write_text(json.dumps(trace, ensure_ascii=False, indent=2), encoding="utf-8")
-        return str(path)
-
     def _write_usage_report(self, usage: Dict[str, Any]) -> str:
         path = Path(self.usage_file)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -3074,11 +3058,6 @@ def main() -> None:
         "--results-per-query", type=int, default=3, help="Baseline search results per query"
     )
     parser.add_argument(
-        "--trace-file",
-        default="",
-        help="Optional path for execution trace JSON output",
-    )
-    parser.add_argument(
         "--state-file",
         default="",
         help="Optional path for incremental run state checkpoint JSON",
@@ -3132,7 +3111,6 @@ def main() -> None:
         max_depth=args.max_depth,
         max_rounds=args.max_rounds,
         results_per_query=args.results_per_query,
-        trace_file=args.trace_file,
         state_file=args.state_file,
         resume_from=args.resume_from,
         token_breakdown=not args.no_token_breakdown,

@@ -61,7 +61,6 @@ Options:
 - `--max-depth` max recursive decomposition depth per question node (default `3`)
 - `--max-rounds` max iterative research rounds (default `1`)
 - `--results-per-query` baseline results per web query before adaptive broadening (default `3`)
-- `--trace-file` optional custom path for execution trace JSON
 - `--state-file` optional custom path for incremental checkpoint state JSON
 - `--resume-from` resume from a previous checkpoint state JSON
 - `--report-file` optional custom path for final report output
@@ -78,8 +77,6 @@ Options:
 - The agent uses OpenAI web search via the Responses API (no external search provider key required).
 - It tries web-search tool types in this order by default: `web_search_preview`, then `web_search`.
 - Override tool order with `OPENAI_WEB_SEARCH_TOOL_TYPES` (comma-separated).
-- Each run writes a full execution trace JSON to `runs/research_trace_<timestamp>.json` by default.
-- Use `--trace-file path/to/trace.json` to override the output path.
 - Each run also writes crash-safe incremental state checkpoints to `runs/state_<query-slug>_<timestamp>.json` by default.
 - Use `--resume-from path/to/state.json` to continue from the latest checkpoint.
 - Each run writes the final report to `reports/report_<query-slug>_<timestamp>.md` by default.
