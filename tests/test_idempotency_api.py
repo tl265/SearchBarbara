@@ -1,4 +1,5 @@
 from fastapi.testclient import TestClient
+from types import SimpleNamespace
 
 from app import main
 
@@ -130,3 +131,44 @@ def test_abort_ignores_expected_version_and_replays_with_same_key(monkeypatch):
     assert calls["count"] == 1
     assert calls["expected_version"] is None
     assert r1.json() == r2.json()
+
+
+def test_delete_session_blocks_when_report_generating():
+    sid = "delete-guard-generating"
+    rm = main.run_manager
+    with rm._lock:
+        rm._runs[sid] = SimpleNamespace(
+            status="completed",
+            execution_state="completed",
+            report_state="generating",
+        )
+        rm._sessions[sid] = {"session_id": sid, "state_file_path": ""}
+    try:
+        result = rm.delete_session(sid)
+        assert result == "conflict_running"
+    finally:
+        with rm._lock:
+            rm._runs.pop(sid, None)
+            rm._sessions.pop(sid, None)
+            rm._active_report_runs.discard(sid)
+
+
+def test_delete_session_blocks_when_report_worker_active():
+    sid = "delete-guard-active-worker"
+    rm = main.run_manager
+    with rm._lock:
+        rm._runs[sid] = SimpleNamespace(
+            status="completed",
+            execution_state="completed",
+            report_state="completed",
+        )
+        rm._sessions[sid] = {"session_id": sid, "state_file_path": ""}
+        rm._active_report_runs.add(sid)
+    try:
+        result = rm.delete_session(sid)
+        assert result == "conflict_running"
+    finally:
+        with rm._lock:
+            rm._runs.pop(sid, None)
+            rm._sessions.pop(sid, None)
+            rm._active_report_runs.discard(sid)

@@ -502,7 +502,10 @@ def delete_session(session_id: str) -> dict:
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
     if result == "conflict_running":
-        raise HTTPException(status_code=409, detail="Cannot delete a running session. Abort first.")
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete an active session. Stop research/report first.",
+        )
     return {"session_id": session_id, "status": "deleted"}
 
 

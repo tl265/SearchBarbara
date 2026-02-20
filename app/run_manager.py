@@ -547,8 +547,22 @@ class RunManager:
     def delete_session(self, session_id: str) -> Optional[str]:
         with self._lock:
             state = self._runs.get(session_id)
-            if state and state.status in {"queued", "running"}:
-                return "conflict_running"
+            if state:
+                status = str(getattr(state, "status", "") or "").strip().lower()
+                execution_state = str(
+                    getattr(state, "execution_state", "") or ""
+                ).strip().lower()
+                report_state = str(
+                    getattr(state, "report_state", "") or ""
+                ).strip().lower()
+                report_worker_active = str(session_id or "").strip() in self._active_report_runs
+                if (
+                    status in {"queued", "running"}
+                    or execution_state in {"running", "paused"}
+                    or report_state == "generating"
+                    or report_worker_active
+                ):
+                    return "conflict_running"
             sess = self._sessions.get(session_id)
             if not sess:
                 return None

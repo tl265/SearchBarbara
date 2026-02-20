@@ -39,6 +39,18 @@ const reportVersionLabel = document.getElementById("reportVersionLabel");
 const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
   ? window.APP_CONFIG
   : {};
+const SESSION_SYNC_CHANNEL = "searchbarbara:sessions:v1";
+const SESSION_SYNC_STORAGE_KEY = "searchbarbara:sessions:signal";
+const SESSION_SYNC_TAB_ID = (() => {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return `tab_${window.crypto.randomUUID()}`;
+    }
+  } catch (_err) {
+    // no-op
+  }
+  return `tab_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+})();
 
 let currentRunId = null;
 let currentSnapshot = null;
@@ -59,6 +71,9 @@ const forceClosedDetailKeys = new Set();
 let canvasZoom = 1;
 let autoFitCanvas = true;
 let sessions = [];
+let sessionSyncChannel = null;
+let sessionsRefreshTimer = null;
+let sessionsRefreshInFlight = false;
 // DEBUG ONLY: surface session-list load failures prominently while session
 // management is being stabilized.
 let debugSessionLoadError = "";
@@ -231,6 +246,79 @@ async function responseDetail(rsp, fallback) {
   return detail;
 }
 
+function scheduleSessionsRefresh(_reason) {
+  if (sessionsRefreshTimer) {
+    clearTimeout(sessionsRefreshTimer);
+  }
+  sessionsRefreshTimer = setTimeout(async () => {
+    sessionsRefreshTimer = null;
+    if (sessionsRefreshInFlight) return;
+    sessionsRefreshInFlight = true;
+    try {
+      await fetchSessions();
+    } catch (_err) {
+      // no-op
+    } finally {
+      sessionsRefreshInFlight = false;
+    }
+  }, 250);
+}
+
+function emitSessionMutation(reason, sessionId = "") {
+  const payload = {
+    kind: "sessions_mutated",
+    reason: String(reason || "unknown"),
+    session_id: String(sessionId || ""),
+    ts: Date.now(),
+    origin_tab_id: SESSION_SYNC_TAB_ID,
+  };
+  try {
+    if (sessionSyncChannel) {
+      sessionSyncChannel.postMessage(payload);
+    }
+  } catch (_err) {
+    // no-op
+  }
+  try {
+    localStorage.setItem(SESSION_SYNC_STORAGE_KEY, JSON.stringify(payload));
+  } catch (_err) {
+    // no-op
+  }
+}
+
+function initSessionSyncListeners() {
+  try {
+    if ("BroadcastChannel" in window) {
+      sessionSyncChannel = new BroadcastChannel(SESSION_SYNC_CHANNEL);
+      sessionSyncChannel.onmessage = (evt) => {
+        const msg = evt && evt.data && typeof evt.data === "object" ? evt.data : {};
+        if (String(msg.origin_tab_id || "") === SESSION_SYNC_TAB_ID) return;
+        scheduleSessionsRefresh("broadcast");
+      };
+    }
+  } catch (_err) {
+    sessionSyncChannel = null;
+  }
+  window.addEventListener("storage", (evt) => {
+    if (!evt || evt.key !== SESSION_SYNC_STORAGE_KEY || !evt.newValue) return;
+    try {
+      const msg = JSON.parse(String(evt.newValue || "{}"));
+      if (String(msg.origin_tab_id || "") === SESSION_SYNC_TAB_ID) return;
+    } catch (_err) {
+      // ignore malformed values
+    }
+    scheduleSessionsRefresh("storage");
+  });
+  window.addEventListener("focus", () => {
+    scheduleSessionsRefresh("focus");
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      scheduleSessionsRefresh("visible");
+    }
+  });
+}
+
 function renderSessions() {
   if (!sessionListEl) return;
   const lockLegend = UI_DEBUG
@@ -281,6 +369,12 @@ async function fetchSessions() {
     if (!rsp.ok) throw new Error(`Failed to list sessions: ${rsp.status}`);
     const data = await rsp.json();
     sessions = Array.isArray(data.sessions) ? data.sessions : [];
+    if (currentRunId) {
+      const activeExists = sessions.some((s) => String((s && s.session_id) || "") === String(currentRunId || ""));
+      if (!activeExists) {
+        resetWorkspaceForNewSession();
+      }
+    }
     debugSessionLoadError = "";
     renderSessions();
   } catch (err) {
@@ -1503,6 +1597,7 @@ async function startRun(idempotencyKey) {
     await fetchSnapshot(currentRunId);
     connectEvents(currentRunId);
     await fetchSessions();
+    emitSessionMutation("create", currentRunId);
   } catch (err) {
     if (!currentRunId) {
       setRunConfigLocked(false);
@@ -1729,6 +1824,7 @@ async function bootstrapFromUrl() {
 }
 
 bootstrapFromUrl();
+initSessionSyncListeners();
 
 function disableAutoFollowFromUserAction(evt) {
   if (evt) {
@@ -1794,6 +1890,7 @@ if (sessionListEl) {
         });
         if (!rsp.ok) throw new Error(`Rename failed: ${rsp.status}`);
         await fetchSessions();
+        emitSessionMutation("rename", sid);
         return;
       }
       if (action === "delete") {
@@ -1817,6 +1914,7 @@ if (sessionListEl) {
           runMeta.textContent = "";
         }
         await fetchSessions();
+        emitSessionMutation("delete", sid);
       }
     } catch (err) {
       const detail = err && err.message ? err.message : String(err);
