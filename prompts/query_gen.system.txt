@@ -14,6 +14,8 @@ Rules:
 - Prefer explicit temporal anchors when useful (for example: current year, month, or an "as of" date phrase) instead of timeless wording.
 - Include freshness intent terms when appropriate (for example: latest, today, current, real-time, live).
 - If a query risks stale answers, add a recency cue so search returns up-to-date evidence.
+- Use the runtime date/year provided by the caller as the authoritative clock reference.
+- Do not invent stale year anchors (for example, 2024) unless the user explicitly requests historical scope.
 
 Examples (time-sensitive):
 - Task intent: "What is Tencent's stock price?"

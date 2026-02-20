@@ -12,5 +12,22 @@
   "default": {
     "input_per_1m": 2.0,
     "output_per_1m": 8.0
+  },
+  "search_query_pricing": {
+    "default_per_1k_queries": 10.0,
+    "by_tool_type": {
+      "web_search": {
+        "per_1k_queries": 10.0
+      },
+      "web_search_preview": {
+        "per_1k_queries_reasoning": 10.0,
+        "per_1k_queries_non_reasoning": 25.0
+      }
+    },
+    "reasoning_model_prefixes": [
+      "o",
+      "gpt-5"
+    ],
+    "reasoning_model_names": []
   }
 }

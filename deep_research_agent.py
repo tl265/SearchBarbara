@@ -261,12 +261,16 @@ class UsageTracker:
         pricing_source: str,
         pricing_models: Dict[str, Dict[str, float]],
         pricing_default: Dict[str, float],
+        search_query_pricing: Dict[str, Any],
     ) -> None:
         self.enabled = enabled
         self.cost_enabled = cost_enabled
         self.pricing_source = pricing_source
         self.pricing_models = pricing_models
         self.pricing_default = pricing_default
+        self.search_query_pricing = (
+            search_query_pricing if isinstance(search_query_pricing, dict) else {}
+        )
         self.events: List[Dict[str, Any]] = []
 
     def record(
@@ -280,10 +284,22 @@ class UsageTracker:
     ) -> None:
         if not self.enabled:
             return
+        event_meta = dict(metadata or {})
         input_tokens, output_tokens, total_tokens, usage_missing = self._extract_usage(
             usage
         )
-        cost = self._estimate_cost(model, input_tokens, output_tokens)
+        token_cost = self._estimate_cost(model, input_tokens, output_tokens)
+        search_query_cost = 0.0
+        if stage == "web_search":
+            tool_type = str(event_meta.get("tool_type", "unknown") or "unknown")
+            per_1k = self._search_query_rate_per_1k(tool_type=tool_type, model=model)
+            search_query_cost = self._estimate_search_query_cost(
+                tool_type=tool_type, model=model, calls=1
+            )
+            event_meta["model_reasoning_class"] = (
+                "reasoning" if self._is_reasoning_model(model) else "non_reasoning"
+            )
+            event_meta["search_query_pricing_per_1k"] = per_1k
         event = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "stage": stage,
@@ -293,8 +309,10 @@ class UsageTracker:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "total_tokens": total_tokens,
-            "estimated_cost_usd": round(cost, 8),
-            "metadata": metadata or {},
+            "token_cost_usd": round(token_cost, 8),
+            "search_query_cost_usd": round(search_query_cost, 8),
+            "estimated_cost_usd": round(token_cost + search_query_cost, 8),
+            "metadata": event_meta,
         }
         if usage_missing:
             event["metadata"]["usage_missing"] = True
@@ -339,41 +357,147 @@ class UsageTracker:
             output_tokens / 1_000_000.0
         ) * out_rate
 
+    def _is_reasoning_model(self, model: str) -> bool:
+        m = str(model or "").strip().lower()
+        if not m:
+            return False
+        names = self.search_query_pricing.get("reasoning_model_names", [])
+        if isinstance(names, list):
+            for name in names:
+                n = str(name or "").strip().lower()
+                if n and m == n:
+                    return True
+        prefixes = self.search_query_pricing.get("reasoning_model_prefixes", [])
+        if isinstance(prefixes, list):
+            for prefix in prefixes:
+                p = str(prefix or "").strip().lower()
+                if p and m.startswith(p):
+                    return True
+        return False
+
+    def _search_query_rate_per_1k(self, tool_type: str, model: str) -> float:
+        if not self.cost_enabled:
+            return 0.0
+        cfg = self.search_query_pricing if isinstance(self.search_query_pricing, dict) else {}
+        by_tool = cfg.get("by_tool_type", {})
+        if not isinstance(by_tool, dict):
+            by_tool = {}
+        tool_cfg = by_tool.get(str(tool_type or "").strip(), {})
+        if not isinstance(tool_cfg, dict):
+            tool_cfg = {}
+        if str(tool_type or "").strip() == "web_search_preview":
+            key = (
+                "per_1k_queries_reasoning"
+                if self._is_reasoning_model(model)
+                else "per_1k_queries_non_reasoning"
+            )
+            v = tool_cfg.get(key)
+            if isinstance(v, (int, float)):
+                return max(0.0, float(v))
+        v = tool_cfg.get("per_1k_queries")
+        if isinstance(v, (int, float)):
+            return max(0.0, float(v))
+        d = cfg.get("default_per_1k_queries", 0.0)
+        if isinstance(d, (int, float)):
+            return max(0.0, float(d))
+        return 0.0
+
+    def _estimate_search_query_cost(self, tool_type: str, model: str, calls: int) -> float:
+        rate_per_1k = self._search_query_rate_per_1k(tool_type=tool_type, model=model)
+        return (max(0, int(calls)) / 1000.0) * rate_per_1k
+
     def to_dict(self) -> Dict[str, Any]:
         by_stage: Dict[str, Dict[str, float]] = {}
         by_model: Dict[str, Dict[str, float]] = {}
+        by_search_tool_type: Dict[str, Dict[str, float]] = {}
         totals = {
             "input_tokens": 0,
             "output_tokens": 0,
             "total_tokens": 0,
+            "token_cost_usd": 0.0,
+            "search_query_cost_usd": 0.0,
             "estimated_cost_usd": 0.0,
             "calls": len(self.events),
         }
         for e in self.events:
             stage = e["stage"]
             model = e["model"]
+            token_cost_usd = float(
+                e.get("token_cost_usd", e.get("estimated_cost_usd", 0.0))
+            )
+            search_query_cost_usd = float(e.get("search_query_cost_usd", 0.0))
+            estimated_cost_usd = float(
+                e.get(
+                    "estimated_cost_usd",
+                    token_cost_usd + search_query_cost_usd,
+                )
+            )
             for bucket, key in ((by_stage, stage), (by_model, model)):
                 if key not in bucket:
                     bucket[key] = {
                         "input_tokens": 0,
                         "output_tokens": 0,
                         "total_tokens": 0,
+                        "token_cost_usd": 0.0,
+                        "search_query_cost_usd": 0.0,
                         "estimated_cost_usd": 0.0,
                         "calls": 0,
                     }
                 bucket[key]["input_tokens"] += e["input_tokens"]
                 bucket[key]["output_tokens"] += e["output_tokens"]
                 bucket[key]["total_tokens"] += e["total_tokens"]
-                bucket[key]["estimated_cost_usd"] += e["estimated_cost_usd"]
+                bucket[key]["token_cost_usd"] += token_cost_usd
+                bucket[key]["search_query_cost_usd"] += search_query_cost_usd
+                bucket[key]["estimated_cost_usd"] += estimated_cost_usd
                 bucket[key]["calls"] += 1
+            if stage == "web_search":
+                meta = e.get("metadata", {})
+                if not isinstance(meta, dict):
+                    meta = {}
+                tool_type = str(meta.get("tool_type", "unknown") or "unknown")
+                if tool_type not in by_search_tool_type:
+                    by_search_tool_type[tool_type] = {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "token_cost_usd": 0.0,
+                        "search_query_cost_usd": 0.0,
+                        "estimated_cost_usd": 0.0,
+                        "calls": 0,
+                        "returned_results_raw": 0,
+                    }
+                rec = by_search_tool_type[tool_type]
+                rec["input_tokens"] += e["input_tokens"]
+                rec["output_tokens"] += e["output_tokens"]
+                rec["total_tokens"] += e["total_tokens"]
+                rec["token_cost_usd"] += token_cost_usd
+                rec["search_query_cost_usd"] += search_query_cost_usd
+                rec["estimated_cost_usd"] += estimated_cost_usd
+                rec["calls"] += 1
+                try:
+                    rec["returned_results_raw"] += max(
+                        0, int(meta.get("returned_results_raw", 0) or 0)
+                    )
+                except (TypeError, ValueError):
+                    pass
             totals["input_tokens"] += e["input_tokens"]
             totals["output_tokens"] += e["output_tokens"]
             totals["total_tokens"] += e["total_tokens"]
-            totals["estimated_cost_usd"] += e["estimated_cost_usd"]
+            totals["token_cost_usd"] += token_cost_usd
+            totals["search_query_cost_usd"] += search_query_cost_usd
+            totals["estimated_cost_usd"] += estimated_cost_usd
 
+        totals["token_cost_usd"] = round(totals["token_cost_usd"], 8)
+        totals["search_query_cost_usd"] = round(totals["search_query_cost_usd"], 8)
         totals["estimated_cost_usd"] = round(totals["estimated_cost_usd"], 8)
-        for bucket in (by_stage, by_model):
+        for bucket in (by_stage, by_model, by_search_tool_type):
             for key in bucket:
+                bucket[key]["token_cost_usd"] = round(
+                    bucket[key]["token_cost_usd"], 8
+                )
+                bucket[key]["search_query_cost_usd"] = round(
+                    bucket[key]["search_query_cost_usd"], 8
+                )
                 bucket[key]["estimated_cost_usd"] = round(
                     bucket[key]["estimated_cost_usd"], 8
                 )
@@ -385,6 +509,7 @@ class UsageTracker:
             "events": self.events,
             "by_stage": by_stage,
             "by_model": by_model,
+            "by_search_tool_type": by_search_tool_type,
             "total": totals,
         }
 
@@ -396,10 +521,23 @@ class UsageTracker:
             self.events = [e for e in events if isinstance(e, dict)]
 
 
-def load_pricing_config(path_str: str) -> tuple[Dict[str, Dict[str, float]], Dict[str, float], str]:
+def load_pricing_config(
+    path_str: str,
+) -> tuple[Dict[str, Dict[str, float]], Dict[str, float], Dict[str, Any], str]:
+    default_search_query_pricing: Dict[str, Any] = {
+        "default_per_1k_queries": 0.0,
+        "by_tool_type": {},
+        "reasoning_model_prefixes": [],
+        "reasoning_model_names": [],
+    }
     path = Path(path_str)
     if not path.exists():
-        return {}, {"input_per_1m": 0.0, "output_per_1m": 0.0}, f"{path} (missing)"
+        return (
+            {},
+            {"input_per_1m": 0.0, "output_per_1m": 0.0},
+            default_search_query_pricing,
+            f"{path} (missing)",
+        )
     raw = json.loads(path.read_text(encoding="utf-8"))
     models_raw = raw.get("models", {}) if isinstance(raw, dict) else {}
     default_raw = raw.get("default", {}) if isinstance(raw, dict) else {}
@@ -420,7 +558,40 @@ def load_pricing_config(path_str: str) -> tuple[Dict[str, Dict[str, float]], Dic
         if isinstance(default_raw, dict)
         else 0.0,
     }
-    return models, default, str(path)
+    sq_raw = raw.get("search_query_pricing", {}) if isinstance(raw, dict) else {}
+    sq = dict(default_search_query_pricing)
+    if isinstance(sq_raw, dict):
+        v = sq_raw.get("default_per_1k_queries")
+        if isinstance(v, (int, float)):
+            sq["default_per_1k_queries"] = max(0.0, float(v))
+        by_tool_raw = sq_raw.get("by_tool_type", {})
+        by_tool: Dict[str, Any] = {}
+        if isinstance(by_tool_raw, dict):
+            for tool_type, tool_cfg in by_tool_raw.items():
+                if not isinstance(tool_cfg, dict):
+                    continue
+                rec: Dict[str, float] = {}
+                for field_name in (
+                    "per_1k_queries",
+                    "per_1k_queries_reasoning",
+                    "per_1k_queries_non_reasoning",
+                ):
+                    fv = tool_cfg.get(field_name)
+                    if isinstance(fv, (int, float)):
+                        rec[field_name] = max(0.0, float(fv))
+                by_tool[str(tool_type)] = rec
+        sq["by_tool_type"] = by_tool
+        prefixes = sq_raw.get("reasoning_model_prefixes", [])
+        if isinstance(prefixes, list):
+            sq["reasoning_model_prefixes"] = [
+                str(x).strip().lower() for x in prefixes if str(x).strip()
+            ]
+        names = sq_raw.get("reasoning_model_names", [])
+        if isinstance(names, list):
+            sq["reasoning_model_names"] = [
+                str(x).strip().lower() for x in names if str(x).strip()
+            ]
+    return models, default, sq, str(path)
 
 
 class LLM:
@@ -543,6 +714,9 @@ class WebSearch:
                     tool_choice={"type": tool_type},
                     input=prompt,
                 )
+                data = self._parse_results_json(rsp.output_text)
+                raw_items = data.get("results", [])
+                raw_results_count = len(raw_items) if isinstance(raw_items, list) else 0
                 if self.usage_tracker:
                     self.usage_tracker.record(
                         stage="web_search",
@@ -550,9 +724,12 @@ class WebSearch:
                         model=self.model,
                         usage=getattr(rsp, "usage", None),
                         attempt=1,
-                        metadata={"query": query, "tool_type": tool_type},
+                        metadata={
+                            "query": query,
+                            "tool_type": tool_type,
+                            "returned_results_raw": raw_results_count,
+                        },
                     )
-                data = self._parse_results_json(rsp.output_text)
                 items = data.get("results", [])[:k]
                 return [
                     SearchResult(
@@ -604,20 +781,40 @@ class DeepResearchAgent:
         pricing_error = ""
         if cost_estimate_enabled:
             try:
-                pricing_models, pricing_default, pricing_source = load_pricing_config(
-                    pricing_file
-                )
+                (
+                    pricing_models,
+                    pricing_default,
+                    search_query_pricing,
+                    pricing_source,
+                ) = load_pricing_config(pricing_file)
             except Exception as exc:
-                pricing_models, pricing_default, pricing_source = (
+                (
+                    pricing_models,
+                    pricing_default,
+                    search_query_pricing,
+                    pricing_source,
+                ) = (
                     {},
                     {"input_per_1m": 0.0, "output_per_1m": 0.0},
+                    {
+                        "default_per_1k_queries": 0.0,
+                        "by_tool_type": {},
+                        "reasoning_model_prefixes": [],
+                        "reasoning_model_names": [],
+                    },
                     f"{pricing_file} (invalid)",
                 )
                 pricing_error = str(exc)
         else:
-            pricing_models, pricing_default, pricing_source = (
+            pricing_models, pricing_default, search_query_pricing, pricing_source = (
                 {},
                 {"input_per_1m": 0.0, "output_per_1m": 0.0},
+                {
+                    "default_per_1k_queries": 0.0,
+                    "by_tool_type": {},
+                    "reasoning_model_prefixes": [],
+                    "reasoning_model_names": [],
+                },
                 f"{pricing_file} (skipped: cost estimation disabled)",
             )
         self.usage_tracker = UsageTracker(
@@ -626,6 +823,7 @@ class DeepResearchAgent:
             pricing_source=pricing_source,
             pricing_models=pricing_models,
             pricing_default=pricing_default,
+            search_query_pricing=search_query_pricing,
         )
         self.llm = LLM(model=model, usage_tracker=self.usage_tracker)
         self.decompose_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
@@ -1017,6 +1215,7 @@ class DeepResearchAgent:
                         "query_steps": [],
                     }
                     round_trace["questions"].append(question_trace)
+                    now_utc = datetime.now(timezone.utc)
                     query_prompt = f"""Original task:
 {task}
 
@@ -1028,6 +1227,12 @@ Question depth:
 
 Known success criteria:
 {json.dumps(success_criteria, ensure_ascii=False)}
+
+Runtime context (authoritative):
+- Current datetime (UTC): {now_utc.isoformat()}
+- Current date (UTC): {now_utc.date().isoformat()}
+- Current year (UTC): {now_utc.year}
+- If you need a year anchor for freshness, prefer {now_utc.year} unless user explicitly asks for a historical period.
 """
                     qobj = self.llm.json(
                         SYSTEM_QUERY_GEN,

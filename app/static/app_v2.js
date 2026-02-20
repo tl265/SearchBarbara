@@ -622,9 +622,42 @@ function renderTokenSummary(usage) {
   const total = usage.total || {};
   const inTok = Number(total.input_tokens || 0);
   const outTok = Number(total.output_tokens || 0);
+  const tokenCost = Number(total.token_cost_usd || 0);
+  const searchQueryCost = Number(total.search_query_cost_usd || 0);
   const cost = Number(total.estimated_cost_usd || 0);
   tokenSummaryEl.textContent = `${inTok + outTok} tokens | $${cost.toFixed(4)}`;
-  usageEl.textContent = JSON.stringify(total, null, 2);
+  const byToolRaw = usage.by_search_tool_type || {};
+  const byTool = {};
+  if (byToolRaw && typeof byToolRaw === "object") {
+    const toolKeys = Object.keys(byToolRaw).sort();
+    for (const k of toolKeys) {
+      const v = byToolRaw[k];
+      if (!v || typeof v !== "object") continue;
+      byTool[k] = {
+        calls: Number(v.calls || 0),
+        returned_results_raw: Number(v.returned_results_raw || 0),
+        input_tokens: Number(v.input_tokens || 0),
+        output_tokens: Number(v.output_tokens || 0),
+        total_tokens: Number(v.total_tokens || 0),
+        token_cost_usd: Number(v.token_cost_usd || 0),
+        search_query_cost_usd: Number(v.search_query_cost_usd || 0),
+        estimated_cost_usd: Number(v.estimated_cost_usd || 0),
+      };
+    }
+  }
+  const usageView = {
+    total: {
+      calls: Number(total.calls || 0),
+      input_tokens: inTok,
+      output_tokens: outTok,
+      total_tokens: Number(total.total_tokens || (inTok + outTok)),
+      token_cost_usd: tokenCost,
+      search_query_cost_usd: searchQueryCost,
+      estimated_cost_usd: cost,
+    },
+    search_by_tool_type: byTool,
+  };
+  usageEl.textContent = JSON.stringify(usageView, null, 2);
 }
 
 function renderInlineMarkdown(text) {

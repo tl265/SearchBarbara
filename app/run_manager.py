@@ -2059,6 +2059,12 @@ class RunManager:
             pricing_source=pricing_source,
             pricing_models={},
             pricing_default={"input_per_1m": 0.0, "output_per_1m": 0.0},
+            search_query_pricing={
+                "default_per_1k_queries": 0.0,
+                "by_tool_type": {},
+                "reasoning_model_prefixes": [],
+                "reasoning_model_names": [],
+            },
         )
         tracker.load_from_dict({"events": combined_events})
         out = tracker.to_dict()
