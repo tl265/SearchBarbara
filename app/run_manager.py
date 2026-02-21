@@ -34,6 +34,7 @@ class RunManager:
     _DEFAULT_HEARTBEAT_INTERVAL_SEC = 8.0
     _SESSIONS_INDEX_SCHEMA_VERSION = 1
     _MAX_EVENTS_PER_RUN = 2000
+    _MAX_SSE_REPLAY_EVENTS = 120
     _IDEMPOTENCY_TTL_CREATE_RUN_SEC = 600
     _IDEMPOTENCY_TTL_REPORT_SEC = 300
 
@@ -56,6 +57,8 @@ class RunManager:
         self._session_locks_guard = threading.Lock()
         self._cancel_flags: Dict[str, bool] = {}
         self._pause_flags: Dict[str, bool] = {}
+        self._event_seq: Dict[str, int] = {}
+        self._run_workers: Dict[str, threading.Thread] = {}
         self._active_report_runs: set[str] = set()
         self._idempotency_lock = threading.Lock()
         self._idempotency_records: Dict[str, Dict[str, Any]] = {}
@@ -265,6 +268,8 @@ class RunManager:
             args=(run_id,),
             daemon=True,
         )
+        with self._lock:
+            self._run_workers[run_id] = t
         t.start()
 
     def start_draft_session_run(
@@ -1263,11 +1268,18 @@ class RunManager:
 
     def get_snapshot(self, run_id: str) -> Optional[RunState]:
         session_lock = self._session_lock_for(run_id)
+        t0 = time.perf_counter()
         acquired_session = session_lock.acquire(timeout=0.5)
+        wait_ms = (time.perf_counter() - t0) * 1000.0
         if acquired_session:
             try:
                 state = self._ensure_run_loaded_session_locked(run_id)
                 if state:
+                    state.snapshot_source = "memory"
+                    state.snapshot_fallback_reason = ""
+                    state.snapshot_lock_wait_ms = wait_ms
+                    worker = self._run_workers.get(run_id)
+                    state.worker_thread_seen = bool(worker and worker.is_alive())
                     self._refresh_lifecycle_fields_locked(state)
                     payload = self._snapshot_payload_locked(state)
                     return RunState.model_validate(payload)
@@ -1276,6 +1288,19 @@ class RunManager:
                 session_lock.release()
         else:
             session_item = None
+            # If run is active in memory but session lock is contended, prefer
+            # memory snapshot over stale disk fallback to avoid contradictory UI.
+            with self._lock:
+                mem_state = self._runs.get(run_id)
+                if mem_state is not None:
+                    mem_state.snapshot_source = "memory"
+                    mem_state.snapshot_fallback_reason = "session_lock_timeout"
+                    mem_state.snapshot_lock_wait_ms = wait_ms
+                    worker = self._run_workers.get(run_id)
+                    mem_state.worker_thread_seen = bool(worker and worker.is_alive())
+                    self._refresh_lifecycle_fields_locked(mem_state)
+                    payload = self._snapshot_payload_locked(mem_state)
+                    return RunState.model_validate(payload)
 
         loaded = self._load_sessions_index()
         for item in loaded.get("sessions", []):
@@ -1297,6 +1322,14 @@ class RunManager:
         state = self._load_run_state_from_files(run_id, state_path, session_item)
         if state:
             self._recover_stale_report_generation_on_load_locked(state, run_id=run_id)
+            state.snapshot_source = "disk_fallback"
+            state.snapshot_fallback_reason = (
+                "session_lock_timeout" if not acquired_session else "memory_miss"
+            )
+            state.snapshot_lock_wait_ms = wait_ms
+            with self._lock:
+                worker = self._run_workers.get(run_id)
+                state.worker_thread_seen = bool(worker and worker.is_alive())
             state.research_state = self._derive_research_state_locked(state)
             state.report_state = self._derive_report_state_locked(state)
             state.terminal_reason = self._derive_terminal_reason_locked(state)
@@ -1311,6 +1344,16 @@ class RunManager:
             with self._lock:
                 q: Queue = Queue()
                 self._subscribers[run_id].append(q)
+                active = (
+                    state.status in {"queued", "running"}
+                    or state.execution_state in {"running", "paused"}
+                )
+                if active and state.events:
+                    for ev in state.events[-self._MAX_SSE_REPLAY_EVENTS :]:
+                        try:
+                            q.put(ev)
+                        except Exception:
+                            break
                 return q
 
     def unsubscribe(self, run_id: str, queue: Queue) -> None:
@@ -1335,6 +1378,19 @@ class RunManager:
                 "failed",
             ):
                 return
+            current_seq = int(self._event_seq.get(run_id, 0))
+            if current_seq <= 0 and state.events:
+                try:
+                    current_seq = max(
+                        int(ev.get("event_seq", 0) or 0)
+                        for ev in state.events
+                        if isinstance(ev, dict)
+                    )
+                except Exception:
+                    current_seq = 0
+            current_seq += 1
+            self._event_seq[run_id] = current_seq
+            event["event_seq"] = current_seq
             state.events.append(event)
             if len(state.events) > self._MAX_EVENTS_PER_RUN:
                 del state.events[:-self._MAX_EVENTS_PER_RUN]
@@ -1360,6 +1416,8 @@ class RunManager:
                 self._sync_session_from_state_locked(state)
                 if self._should_flush_sessions_index(event_type):
                     self._save_sessions_index_locked(force=True)
+                if event_type in {"run_completed", "run_failed", "run_aborted"}:
+                    self._run_workers.pop(run_id, None)
                 subscribers = list(self._subscribers.get(run_id, []))
         for q in subscribers:
             try:
@@ -1430,6 +1488,10 @@ class RunManager:
             "token_usage": copy.deepcopy(state.token_usage),
             "manual_edit_log": copy.deepcopy(state.manual_edit_log),
             "manual_assertions": copy.deepcopy(state.manual_assertions),
+            "snapshot_source": state.snapshot_source,
+            "snapshot_fallback_reason": state.snapshot_fallback_reason,
+            "snapshot_lock_wait_ms": state.snapshot_lock_wait_ms,
+            "worker_thread_seen": state.worker_thread_seen,
         }
 
     def _persist_run_state_locked(self, state: RunState) -> None:
@@ -1537,6 +1599,18 @@ class RunManager:
                 state.execution_state = "running"
             return
         if et == "context_binding_started":
+            if isinstance(tree, dict):
+                tree["startup_phase"] = "binding_context"
+            return
+        if et == "context_binding_parsing_started":
+            if isinstance(tree, dict):
+                tree["startup_phase"] = "parsing_context"
+            return
+        if et == "context_binding_parsing_file_completed":
+            if isinstance(tree, dict):
+                tree["startup_phase"] = "parsing_context"
+            return
+        if et == "context_binding_parsing_completed":
             if isinstance(tree, dict):
                 tree["startup_phase"] = "binding_context"
             return
@@ -2071,6 +2145,60 @@ class RunManager:
                 },
             )
 
+        def finalize_run_failure(
+            error_text: str, token_usage: Optional[Dict[str, Any]] = None
+        ) -> None:
+            terminal_event_type = (
+                "run_aborted" if error_text == "Run aborted by user" else "run_failed"
+            )
+            emit_terminal_event = False
+            with session_lock:
+                with self._lock:
+                    state = self._ensure_run_loaded_locked(run_id)
+                    if not state:
+                        return
+                    state.status = "failed"
+                    state.execution_state = (
+                        "aborted" if error_text == "Run aborted by user" else "failed"
+                    )
+                    self._pause_flags[run_id] = False
+                    state.error = error_text
+                    if isinstance(token_usage, dict):
+                        state.token_usage = token_usage
+                    self._set_report_phase_locked(
+                        state,
+                        report_status="failed",
+                        report_phase="failed",
+                        report_mode="final",
+                        report_error=error_text,
+                    )
+                    self._next_state_version_locked(state)
+                    self._sync_session_from_state_locked(state)
+                    try:
+                        self._persist_run_state_locked(state)
+                    except Exception:
+                        pass
+                    self._save_sessions_index_locked(force=True)
+                    self._run_workers.pop(run_id, None)
+                    last_event_type = (
+                        state.events[-1].get("event_type", "") if state.events else ""
+                    )
+                    emit_terminal_event = last_event_type not in {
+                        "run_completed",
+                        "run_failed",
+                        "run_aborted",
+                    }
+            if emit_terminal_event:
+                self._publish_event(
+                    run_id,
+                    {
+                        "run_id": run_id,
+                        "timestamp": _now().isoformat(),
+                        "event_type": terminal_event_type,
+                        "payload": {"error": error_text},
+                    },
+                )
+
         pending_workspace_id = ""
         with session_lock:
             with self._lock:
@@ -2086,7 +2214,10 @@ class RunManager:
                 {"workspace_id": pending_workspace_id},
             )
             if is_cancel_requested():
-                raise RuntimeError("Run aborted by user")
+                finalize_run_failure("Run aborted by user")
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
+                return
             try:
                 ws_set = self.get_workspace_context_set(pending_workspace_id) or {}
                 ws_files = ws_set.get("files", []) if isinstance(ws_set, dict) else []
@@ -2131,9 +2262,15 @@ class RunManager:
                     "context_binding_failed",
                     {"workspace_id": pending_workspace_id, "error": str(exc)},
                 )
-                raise
+                finalize_run_failure(str(exc))
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
+                return
             if is_cancel_requested():
-                raise RuntimeError("Run aborted by user")
+                finalize_run_failure("Run aborted by user")
+                heartbeat_stop.set()
+                heartbeat_thread.join(timeout=1.0)
+                return
             bound_files = 0
             bound_revision = 0
             try:
@@ -2159,19 +2296,25 @@ class RunManager:
 
         user_context_bundle = self._build_user_context_bundle_for_session(run_id)
 
-        agent = DeepResearchAgent(
-            model=snapshot.model,
-            report_model=snapshot.report_model,
-            max_depth=snapshot.max_depth,
-            max_rounds=snapshot.max_rounds,
-            results_per_query=snapshot.results_per_query,
-            state_file=str(state_path),
-            verbose=True,
-            event_callback=callback,
-            run_id=run_id,
-            should_abort=should_abort,
-            user_context_bundle=user_context_bundle,
-        )
+        try:
+            agent = DeepResearchAgent(
+                model=snapshot.model,
+                report_model=snapshot.report_model,
+                max_depth=snapshot.max_depth,
+                max_rounds=snapshot.max_rounds,
+                results_per_query=snapshot.results_per_query,
+                state_file=str(state_path),
+                verbose=True,
+                event_callback=callback,
+                run_id=run_id,
+                should_abort=should_abort,
+                user_context_bundle=user_context_bundle,
+            )
+        except Exception as exc:
+            finalize_run_failure(str(exc))
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=1.0)
+            return
         try:
             report = agent.run(task)
             report_path.write_text(report, encoding="utf-8")
@@ -2217,50 +2360,7 @@ class RunManager:
             )
         except Exception as exc:
             error_text = str(exc)
-            terminal_event_type = (
-                "run_aborted" if error_text == "Run aborted by user" else "run_failed"
-            )
-            emit_terminal_event = False
-            with session_lock:
-                with self._lock:
-                    state = self._ensure_run_loaded_locked(run_id)
-                    if not state:
-                        return
-                    state.status = "failed"
-                    state.execution_state = (
-                        "aborted" if error_text == "Run aborted by user" else "failed"
-                    )
-                    self._pause_flags[run_id] = False
-                    state.error = error_text
-                    state.token_usage = agent.usage_tracker.to_dict()
-                    self._set_report_phase_locked(
-                        state,
-                        report_status="failed",
-                        report_phase="failed",
-                        report_mode="final",
-                        report_error=error_text,
-                    )
-                    self._next_state_version_locked(state)
-                    self._sync_session_from_state_locked(state)
-                    self._save_sessions_index_locked()
-                    last_event_type = (
-                        state.events[-1].get("event_type", "") if state.events else ""
-                    )
-                    emit_terminal_event = last_event_type not in {
-                        "run_completed",
-                        "run_failed",
-                        "run_aborted",
-                    }
-            if emit_terminal_event:
-                self._publish_event(
-                    run_id,
-                    {
-                        "run_id": run_id,
-                        "timestamp": _now().isoformat(),
-                        "event_type": terminal_event_type,
-                        "payload": {"error": error_text},
-                    },
-                )
+            finalize_run_failure(error_text, token_usage=agent.usage_tracker.to_dict())
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1.0)

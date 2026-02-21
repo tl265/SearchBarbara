@@ -695,6 +695,10 @@ def get_run(run_id: str) -> RunSnapshotResponse:
         current_report_version_index=state.current_report_version_index,
         error=state.error,
         token_usage=state.token_usage,
+        snapshot_source=state.snapshot_source,
+        snapshot_fallback_reason=state.snapshot_fallback_reason,
+        snapshot_lock_wait_ms=state.snapshot_lock_wait_ms,
+        worker_thread_seen=state.worker_thread_seen,
     )
 
 
@@ -746,6 +750,10 @@ def get_session(session_id: str) -> RunSnapshotResponse:
         current_report_version_index=state.current_report_version_index,
         error=state.error,
         token_usage=state.token_usage,
+        snapshot_source=state.snapshot_source,
+        snapshot_fallback_reason=state.snapshot_fallback_reason,
+        snapshot_lock_wait_ms=state.snapshot_lock_wait_ms,
+        worker_thread_seen=state.worker_thread_seen,
     )
 
 

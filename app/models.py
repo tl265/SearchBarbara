@@ -64,6 +64,10 @@ class RunSnapshotResponse(BaseModel):
     current_report_version_index: Optional[int] = None
     error: Optional[str] = None
     token_usage: Optional[Dict[str, Any]] = None
+    snapshot_source: Optional[str] = None
+    snapshot_fallback_reason: Optional[str] = None
+    snapshot_lock_wait_ms: Optional[float] = None
+    worker_thread_seen: Optional[bool] = None
 
 
 class RunEvent(BaseModel):
@@ -105,6 +109,10 @@ class RunState(BaseModel):
     token_usage: Optional[Dict[str, Any]] = None
     manual_edit_log: List[Dict[str, Any]] = Field(default_factory=list)
     manual_assertions: Dict[str, Any] = Field(default_factory=dict)
+    snapshot_source: Optional[str] = None
+    snapshot_fallback_reason: Optional[str] = None
+    snapshot_lock_wait_ms: Optional[float] = None
+    worker_thread_seen: Optional[bool] = None
 
 
 class SessionSummary(BaseModel):

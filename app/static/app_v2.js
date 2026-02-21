@@ -83,6 +83,7 @@ let sessions = [];
 let sessionSyncChannel = null;
 let sessionsRefreshTimer = null;
 let sessionsRefreshInFlight = false;
+const lastEventSeqByRun = new Map();
 // DEBUG ONLY: surface session-list load failures prominently while session
 // management is being stabilized.
 let debugSessionLoadError = "";
@@ -429,6 +430,46 @@ function renderContextPane() {
     }).join("");
     contextFilesEl.innerHTML = existingHtml + pendingHtml;
   }
+}
+
+function markContextFilesParsingStarted() {
+  if (!currentContextSet || typeof currentContextSet !== "object") return;
+  const files = Array.isArray(currentContextSet.files) ? currentContextSet.files : [];
+  if (!files.length) return;
+  for (const f of files) {
+    if (!f || typeof f !== "object") continue;
+    const st = String(f.digest_status || "").trim().toLowerCase();
+    if (!st || st === "stale" || st === "uploaded" || st === "error") {
+      f.digest_status = "parsing";
+      if (st !== "error") {
+        f.error = "";
+      }
+    }
+  }
+  currentContextSet.aggregate_digest_status = "parsing";
+  renderContextPane();
+}
+
+function markContextFileParsingProgress(payload) {
+  if (!currentContextSet || typeof currentContextSet !== "object") return;
+  const files = Array.isArray(currentContextSet.files) ? currentContextSet.files : [];
+  if (!files.length) return;
+  const idx = Number(payload && payload.index);
+  const status = String((payload && payload.status) || "").trim().toLowerCase();
+  const err = String((payload && payload.error) || "").trim();
+  if (!Number.isFinite(idx) || idx < 1 || idx > files.length) return;
+  const f = files[Math.floor(idx) - 1];
+  if (!f || typeof f !== "object") return;
+  if (status === "ready" || status === "parsed") {
+    f.digest_status = "ready";
+    f.error = "";
+  } else if (status === "error" || status === "failed") {
+    f.digest_status = "error";
+    f.error = err || f.error || "Parse failed.";
+  } else {
+    f.digest_status = "parsing";
+  }
+  renderContextPane();
 }
 
 async function fetchContextAggregateDigest() {
@@ -1857,6 +1898,7 @@ async function openSession(runId, opts = {}) {
 
 function connectEvents(runId) {
   if (es) es.close();
+  lastEventSeqByRun.set(String(runId), 0);
   es = new EventSource(`/api/runs/${runId}/events`);
 
   es.onmessage = async (evt) => {
@@ -1864,6 +1906,15 @@ function connectEvents(runId) {
     try {
       if (evt.data) {
         const parsed = JSON.parse(evt.data);
+        const seq = Number(parsed && parsed.event_seq);
+        if (Number.isFinite(seq)) {
+          const k = String(runId);
+          const prev = Number(lastEventSeqByRun.get(k) || 0);
+          if (seq <= prev) {
+            return;
+          }
+          lastEventSeqByRun.set(k, seq);
+        }
         const narration = eventNarration(parsed);
         if (narration) {
           upsertThought(narration, parsed.event_type || "event");
@@ -1892,9 +1943,23 @@ function connectEvents(runId) {
       if (String(runId) !== String(currentRunId || "")) return;
       try {
         const parsed = JSON.parse(evt.data || "{}");
+        const seq = Number(parsed && parsed.event_seq);
+        if (Number.isFinite(seq)) {
+          const k = String(runId);
+          const prev = Number(lastEventSeqByRun.get(k) || 0);
+          if (seq <= prev) {
+            return;
+          }
+          lastEventSeqByRun.set(k, seq);
+        }
         const narration = eventNarration(parsed);
         if (narration) {
           upsertThought(narration, parsed.event_type || e);
+        }
+        if (parsed.event_type === "context_binding_parsing_started") {
+          markContextFilesParsingStarted();
+        } else if (parsed.event_type === "context_binding_parsing_file_completed") {
+          markContextFileParsingProgress(parsed.payload || {});
         }
         if (UI_DEBUG && parsed.event_type === "context_for_node_ready" && contextAggregateDigestEl) {
           const ctx = parsed.payload && typeof parsed.payload === "object"
@@ -1927,6 +1992,7 @@ async function startRun(idempotencyKey) {
   setRunConfigLocked(true);
   showError("");
   abortRequested = false;
+  markContextFilesParsingStarted();
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
   thoughts.length = 0;
