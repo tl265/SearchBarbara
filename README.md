@@ -103,8 +103,10 @@ System prompts for each sub-agent are stored as separate files in `prompts/`:
 - `prompts/decompose.system.txt`
 - `prompts/query_gen.system.txt`
 - `prompts/synthesize.system.txt`
-- `prompts/sufficiency.system.txt`
+- `prompts/sufficiency_node.system.txt`
+- `prompts/sufficiency_pass.system.txt`
 - `prompts/report.system.txt`
+- `prompts/context_split.system.txt`
 
 Edit these files to change sub-agent behavior without changing Python code.
 

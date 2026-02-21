@@ -4,7 +4,8 @@
 Upgrade SearchBarbara so uploaded user files become first-class evidence in the research lifecycle, with parsing deferred until run start and context propagated recursively through node exploration/decomposition/sufficiency/reporting.
 
 Chosen defaults:
-- Child-node context routing: **LLM relevance filter**
+- Root context assignment: **full parsed context (with safety compaction only)**
+- Child-node context assignment: **split once at parent decomposition time, then inherit**
 - Prompt payload form: **structured digest only**
 - UI behavior when `ui_debug=false`: **hide digest pane entirely**
 
@@ -16,7 +17,7 @@ Chosen defaults:
 1. Parse uploaded files **only after** user clicks `Start Research`.
 2. Provide context to every node:
    - root gets full parsed context
-   - child nodes get routed, relevant context slices.
+   - child nodes get child-specific context slices produced when the parent decomposes.
 3. Include context in:
    - node-level sufficiency
    - decomposition decisions
@@ -34,8 +35,8 @@ Chosen defaults:
 ## 2) Current-State Constraints (for implementer)
 - Context preprocessing currently runs in `RunManager`.
 - Research logic is in `deep_research_agent.py`.
-- Worker startup now includes binding phase events (`context_binding_*`).
-- Context currently parsed during bind; this spec formalizes that parse-on-start behavior and then routes context inside agent execution.
+- Worker startup includes binding phase events (`context_binding_*`).
+- Context is parsed during bind/start and then consumed inside the agent.
 
 ---
 
@@ -58,13 +59,10 @@ Define a normalized internal structure used by the agent:
   - `revision`
   - `files[]` (metadata + per-file digest refs)
   - `aggregate_digest` (structured JSON)
-  - `routing_index` (derived lightweight index from digest: claims/tags/entities/source refs)
 - `NodeContextSlice` (node-level):
   - `node_id`
   - `selection_reason`
   - `selected_items[]` (facts/uncertainties/etc with source refs)
-  - `coverage_note`
-  - `dropped_items_count`
 
 ---
 
@@ -73,24 +71,24 @@ Define a normalized internal structure used by the agent:
 ### 4.1 Node entry
 When entering any node:
 - Root:
-  - receives full `ContextBundle.aggregate_digest` + top-level file metadata.
+  - receives full `ContextBundle.aggregate_digest` (compacted only for token/char safety).
 - Non-root:
-  - call context-router LLM (`context_router` stage) with:
-    - original task
-    - parent task
-    - current node task
-    - node depth
-    - parent node context slice
-    - unresolved gaps (if any)
-  - router outputs `NodeContextSlice` for this node.
+  - receives the already assigned child context slice from parent decomposition.
+  - no per-node context rerouting call.
 
 Emit event:
-- `context_for_node_ready` with `{ node_id, depth, selected_items_count, mode: root|routed }`.
+- `context_for_node_ready` with `{ node_id, depth, selected_items_count, mode }`.
+- Allowed `mode` values:
+  - `root_full`
+  - `split_from_parent`
+  - `split_fallback`
+  - `inherited_from_parent`
+  - `fallback_inherit_missing_parent`
 
 ### 4.2 Lazy query stage
 No hard requirement to inject context into query generation in this phase unless explicitly configured. Default:
 - keep query generation behavior unchanged.
-- context participates starting at synthesis/sufficiency/decompose as below.
+- context participates starting at sufficiency/decompose/report as below.
 
 ### 4.3 Node synthesis + sufficiency
 Node sufficiency prompt input must include:
@@ -101,20 +99,20 @@ Node sufficiency prompt input must include:
 
 Output unchanged shape (`is_sufficient`, `reasoning`, `gaps`) but reasoning should reference context when used.
 
-### 4.4 Decomposition with context routing
+### 4.4 Decomposition with context split
 When node is insufficient:
 1. Decompose prompt receives:
    - node task
    - insufficiency gaps
    - `NodeContextSlice`
 2. Decomposer returns children (MECE as already required).
-3. For each child, run router step to derive child slice from parent slice.
-4. Recurse DFS with child slice.
+3. A single context split step runs once for that decomposition:
+   - input: parent context slice + child list
+   - output: child-specific slices
+4. Each child then inherits its assigned slice recursively.
 
-Emit events:
-- `context_routing_started`
-- `context_routing_completed`
-- `context_routing_failed` (non-fatal fallback described below)
+If split output is malformed or missing children:
+- use deterministic token-overlap fallback assignment per child.
 
 ### 4.5 Final report stage
 Report writer receives full context again:
@@ -133,30 +131,34 @@ Instruction: use user context as supplemental evidence; preserve source attribut
   - `prompts/context_preprocess_per_file.system.txt`
   - `prompts/context_preprocess_aggregate.system.txt`
 - Add new:
-  - `prompts/context_router.system.txt` (node slice selection)
+  - `prompts/context_split.system.txt` (assign parent context to child questions)
 - Update existing:
-  - node sufficiency system prompt (or the prompt text builder if inline) to include user context usage rules.
   - `prompts/decompose.system.txt` to explicitly use node context for MECE child planning.
+  - `prompts/sufficiency_node.system.txt` to explicitly judge against both web evidence and provided node context.
   - `prompts/report.system.txt` add clause: include user context evidence where relevant.
 
-### 5.2 Router output JSON schema (strict)
+### 5.2 Context-split output JSON schema (strict)
 ```json
 {
-  "selected_items": [
+  "child_contexts": [
     {
-      "kind": "fact|uncertainty|analysis|constraint|case|definition|lead|conflict",
-      "text": "...",
-      "sources": ["file::S1"],
-      "why_relevant": "..."
+      "child_question": "...",
+      "selected_items": [
+        {
+          "kind": "fact|uncertainty|analysis|constraint|case|definition|lead|conflict",
+          "text": "...",
+          "sources": ["file::S1"]
+        }
+      ],
+      "selection_reason": "..."
     }
   ],
-  "selection_reason": "...",
-  "coverage_note": "..."
+  "overall_note": "..."
 }
 ```
 
 Fallback if malformed:
-- deterministic top-N from aggregate facts + keyword overlap.
+- deterministic token-overlap assignment per child.
 
 ---
 
@@ -167,9 +169,6 @@ Fallback if malformed:
 - `context_binding_parsing_file_completed`
 - `context_binding_parsing_completed`
 - `context_for_node_ready`
-- `context_routing_started`
-- `context_routing_completed`
-- `context_routing_failed`
 - `report_context_attached`
 
 ### 6.2 Thought stream mapping
@@ -177,7 +176,6 @@ Each above event must have human-readable narration in `app/static/app_v2.js`.
 Examples:
 - “Parsing context file 2/5…”
 - “Prepared context slice for node 1.2 (12 items).”
-- “Routing context to child tasks…”
 - “Attached full user context for report writing.”
 
 ---
@@ -185,7 +183,7 @@ Examples:
 ## 7) UI/Debug Behavior
 
 ### 7.1 When `ui_debug=false`
-- Hide right-side “Aggregate Digest” JSON pane entirely.
+- Hide digest pane entirely.
 - Keep file list/status visible.
 
 ### 7.2 When `ui_debug=true`
@@ -206,10 +204,9 @@ Examples:
 1. File-level parse failures are isolated:
 - failed file marked `error`.
 - aggregate built from successfully parsed files when any exist.
-2. Context router failures:
+2. Context split failures:
 - do not fail run.
-- fallback to parent slice passthrough (or top-N deterministic).
-- emit `context_routing_failed`.
+- fallback to deterministic per-child assignment.
 3. No-context case:
 - if all files fail parse, continue run with “no usable context” warning in thought stream.
 
@@ -225,7 +222,7 @@ In state tree (or structured state section):
   - `files_ready`
   - `files_error`
 - per-node:
-  - `context_slice_ref` or inline compact slice (debug mode may include full slice)
+  - inline compact `context_slice` (debug snapshot usage)
 
 ### 9.2 No breaking REST changes required
 Optional additions:
@@ -243,11 +240,11 @@ Optional additions:
 3. Root node:
 - receives full context.
 4. Child node:
-- receives routed slice, not full context.
+- receives split child-specific slice (not full context by default).
 5. Sufficiency:
 - reflects combined web + context evidence.
 6. Decompose:
-- uses context and routes to each child recursively.
+- uses context and creates child context splits once per decomposition.
 7. Report:
 - receives full context and cites accordingly.
 
@@ -256,8 +253,8 @@ Optional additions:
 - run continues; aggregate from successful files.
 2. All files fail parse:
 - run continues with no-context warning.
-3. Router malformed output:
-- fallback logic invoked, run continues.
+3. Context split malformed output:
+- deterministic fallback logic invoked; run continues.
 
 ### UI
 1. `ui_debug=false` hides digest pane.
@@ -270,7 +267,8 @@ Optional additions:
 
 ## 11) Assumptions and Defaults
 
-- Context routing uses LLM-based selector (default model = same as decompose model unless separately configured).
+- Root uses full parsed context with safety compaction only.
+- Child context is assigned once at decomposition and then inherited recursively.
 - Context payload passed to prompts is structured digest only (not raw file bodies).
 - Query generation remains unchanged for now; context enters at sufficiency/decompose/report.
 - Existing source citation format remains unchanged.
@@ -279,10 +277,10 @@ Optional additions:
 
 ## 12) Implementation Sequence (recommended)
 
-1. Introduce context-router prompt + schema validator + fallback.
-2. Move upload stage to metadata-only (disable upload-time parse).
+1. Add context-split prompt + parser + deterministic fallback.
+2. Keep upload stage metadata-only (disable upload-time parse).
 3. Ensure start-time parse pipeline emits detailed events.
-4. Wire node context propagation in agent (root full, child routed).
+4. Wire node context propagation in agent (root full, child split+inherit).
 5. Update sufficiency/decompose/report prompt builders to include context payloads.
 6. Add UI debug behavior switches + node-slice rendering in digest pane.
 7. Add tests and regression checks.

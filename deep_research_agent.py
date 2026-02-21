@@ -227,6 +227,7 @@ SYSTEM_SYNTHESIZE = load_prompt("synthesize.system.txt")
 SYSTEM_SUFFICIENCY_NODE = load_prompt("sufficiency_node.system.txt")
 SYSTEM_SUFFICIENCY_PASS = load_prompt("sufficiency_pass.system.txt")
 SYSTEM_REPORT = load_prompt("report.system.txt")
+SYSTEM_CONTEXT_SPLIT = load_prompt("context_split.system.txt")
 
 
 @dataclass
@@ -776,6 +777,7 @@ class DeepResearchAgent:
         event_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
         run_id: str = "",
         should_abort: Optional[Callable[[], bool]] = None,
+        user_context_bundle: Optional[Dict[str, Any]] = None,
     ) -> None:
         pricing_error = ""
         if cost_estimate_enabled:
@@ -842,6 +844,11 @@ class DeepResearchAgent:
         self.event_callback = event_callback
         self.run_id = run_id
         self.should_abort = should_abort
+        self.user_context_bundle = (
+            user_context_bundle
+            if isinstance(user_context_bundle, dict)
+            else {"available": False, "aggregate_digest": {}, "files": []}
+        )
         self.source_policy = load_source_policy()
         self.search_policy = load_search_policy()
         self.decompose_policy = load_decompose_policy()
@@ -872,6 +879,7 @@ class DeepResearchAgent:
         question_depths: Dict[str, int] = {}
         question_parents: Dict[str, str] = {}
         question_node_ids: Dict[str, str] = {}
+        question_gaps: Dict[str, List[str]] = {}
         decomposed_questions: set[str] = set()
         resolved_questions: set[str] = set()
         final_suff: Dict[str, Any] = {}
@@ -1144,6 +1152,15 @@ class DeepResearchAgent:
                         recheck_queries, "recheck_queries_for_recheck"
                     )
                 }
+                full_context_digest = (
+                    self.user_context_bundle.get("aggregate_digest", {})
+                    if isinstance(self.user_context_bundle, dict)
+                    else {}
+                )
+                full_context_items = self._context_items_from_digest(
+                    full_context_digest if isinstance(full_context_digest, dict) else {}
+                )
+                node_context_slices: Dict[str, Dict[str, Any]] = {}
                 next_unresolved: List[str] = []
                 processed_questions_in_pass: set[str] = set()
                 active_questions_in_branch: set[str] = set()
@@ -1213,6 +1230,78 @@ class DeepResearchAgent:
                         "query_steps": [],
                     }
                     round_trace["questions"].append(question_trace)
+                    if depth <= 1:
+                        node_context_slice = {
+                            "mode": "root_full",
+                            "selection_reason": "Root node uses full parsed user context.",
+                            "selected_items": self._compact_context_items(
+                                full_context_items, max_items=40, char_budget=9000
+                            ),
+                        }
+                    else:
+                        preset_slice = node_context_slices.get(sq, {})
+                        if isinstance(preset_slice, dict) and isinstance(
+                            preset_slice.get("selected_items", []), list
+                        ):
+                            node_context_slice = {
+                                "mode": str(
+                                    preset_slice.get("mode", "inherited_from_parent")
+                                ),
+                                "selection_reason": str(
+                                    preset_slice.get(
+                                        "selection_reason",
+                                        "Inherited from parent context split.",
+                                    )
+                                ),
+                                "selected_items": self._compact_context_items(
+                                    preset_slice.get("selected_items", []),
+                                    max_items=24,
+                                    char_budget=7000,
+                                ),
+                            }
+                        else:
+                            parent_slice = node_context_slices.get(parent, {})
+                            parent_items = (
+                                parent_slice.get("selected_items", [])
+                                if isinstance(parent_slice, dict)
+                                else []
+                            )
+                            if isinstance(parent_items, list) and parent_items:
+                                node_context_slice = {
+                                    "mode": "inherited_from_parent",
+                                    "selection_reason": "Inherited parent node context directly.",
+                                    "selected_items": self._compact_context_items(
+                                        parent_items, max_items=24, char_budget=7000
+                                    ),
+                                }
+                            else:
+                                node_context_slice = {
+                                    "mode": "fallback_inherit_missing_parent",
+                                    "selection_reason": (
+                                        "Parent context missing; fallback to full user context."
+                                    ),
+                                    "selected_items": self._compact_context_items(
+                                        full_context_items, max_items=24, char_budget=7000
+                                    ),
+                                }
+                    node_context_slices[sq] = node_context_slice
+                    question_trace["context_slice"] = node_context_slice
+                    self._emit(
+                        "context_for_node_ready",
+                        {
+                            "round": round_i,
+                            "sub_question": sq,
+                            "depth": depth,
+                            "node_id": node_id,
+                            "mode": str(node_context_slice.get("mode", "")),
+                            "selected_items_count": len(
+                                node_context_slice.get("selected_items", [])
+                                if isinstance(node_context_slice.get("selected_items", []), list)
+                                else []
+                            ),
+                            "context_slice": node_context_slice,
+                        },
+                    )
                     now_utc = datetime.now(timezone.utc)
                     query_prompt = f"""Original task:
 {task}
@@ -1598,6 +1687,7 @@ Runtime context (authoritative):
                                     success_criteria=success_criteria,
                                     finding=findings[sq],
                                     depth=depth,
+                                    node_context_slice=node_context_slice,
                                 ),
                                 stage="node_sufficiency",
                                 metadata={
@@ -1613,6 +1703,7 @@ Runtime context (authoritative):
                         node_is_sufficient = bool(node_suff.get("is_sufficient", False))
                         node_reasoning = str(node_suff.get("reasoning", "")).strip()
                         node_gaps = self._normalize_llm_list(node_suff.get("gaps"), "node_gaps")
+                        question_gaps[sq] = node_gaps
                         question_trace["node_sufficiency"] = {
                             "is_sufficient": node_is_sufficient,
                             "reasoning": node_reasoning,
@@ -1663,6 +1754,7 @@ Runtime context (authoritative):
                                 depth=depth,
                                 max_depth=self.max_depth,
                                 finding=findings[sq],
+                                node_context_slice=node_context_slice,
                             )
                             children = self._dedupe_preserve_order(children)
                             if children:
@@ -1672,6 +1764,17 @@ Runtime context (authoritative):
                                     if child not in question_parents or not question_parents.get(child, ""):
                                         question_parents[child] = sq
                                     child_node_ids.append(get_or_assign_node_id(child, sq))
+                                child_context_slices = self._split_context_for_children(
+                                    task=task,
+                                    parent_question=sq,
+                                    children=children,
+                                    parent_context_slice=node_context_slice,
+                                    node_gaps=node_gaps,
+                                    depth=depth,
+                                )
+                                for child in children:
+                                    if child in child_context_slices:
+                                        node_context_slices[child] = child_context_slices[child]
                                 decomposed_questions.add(sq)
                                 self._emit(
                                     "node_decomposed",
@@ -1779,6 +1882,11 @@ Runtime context (authoritative):
                             success_criteria=success_criteria,
                             findings=findings,
                             round_i=round_i,
+                            full_user_context=(
+                                self.user_context_bundle.get("aggregate_digest", {})
+                                if isinstance(self.user_context_bundle, dict)
+                                else {}
+                            ),
                         ),
                         stage="sufficiency",
                         metadata={"round": round_i},
@@ -1870,6 +1978,24 @@ Runtime context (authoritative):
                     "mode": "final",
                 },
             )
+            full_ctx = (
+                self.user_context_bundle.get("aggregate_digest", {})
+                if isinstance(self.user_context_bundle, dict)
+                else {}
+            )
+            self._emit(
+                "report_context_attached",
+                {
+                    "mode": "final",
+                    "context_available": bool(isinstance(full_ctx, dict) and full_ctx),
+                    "context_items": len(
+                        full_ctx.get("facts", [])
+                        if isinstance(full_ctx, dict)
+                        and isinstance(full_ctx.get("facts", []), list)
+                        else []
+                    ),
+                },
+            )
             report_prompt = self._format_report_prompt(
                 task=task,
                 success_criteria=success_criteria,
@@ -1877,6 +2003,7 @@ Runtime context (authoritative):
                 evidence_status=evidence_status,
                 evidence_note=evidence_note,
                 search_stats=trace["search_stats"],
+                full_user_context=full_ctx,
             )
             report = self.report_llm.text(
                 SYSTEM_REPORT,
@@ -1927,6 +2054,7 @@ Runtime context (authoritative):
         success_criteria: List[str],
         finding: SubQuestionFinding,
         depth: int,
+        node_context_slice: Dict[str, Any],
     ) -> str:
         compact = self._compact_findings(
             findings={sub_question: finding},
@@ -1949,12 +2077,198 @@ Runtime context (authoritative):
             Success criteria:
             {json.dumps(success_criteria, ensure_ascii=False)}
 
+            User-provided context slice for this node:
+            {json.dumps(node_context_slice, ensure_ascii=False)}
+
             Evidence for this sub-question:
             {json.dumps(compact, ensure_ascii=False)}
 
             Evaluate only whether this specific sub-question is sufficiently answered.
+            Consider both web evidence and user-provided context evidence.
             """
         ).strip()
+
+    def _context_items_from_digest(
+        self, digest: Dict[str, Any], limit_per_section: int = 40
+    ) -> List[Dict[str, Any]]:
+        if not isinstance(digest, dict):
+            return []
+        out: List[Dict[str, Any]] = []
+        for fact in digest.get("facts", []) if isinstance(digest.get("facts", []), list) else []:
+            if not isinstance(fact, dict):
+                continue
+            claim = str(fact.get("claim", "")).strip()
+            if not claim:
+                continue
+            out.append(
+                {
+                    "kind": "fact",
+                    "text": claim,
+                    "sources": as_clean_str_list(fact.get("sources", [])),
+                }
+            )
+            if len(out) >= limit_per_section:
+                break
+        unc_added = 0
+        for unc in digest.get("uncertainties", []) if isinstance(digest.get("uncertainties", []), list) else []:
+            text = str(unc or "").strip()
+            if not text:
+                continue
+            out.append({"kind": "uncertainty", "text": text, "sources": []})
+            unc_added += 1
+            if unc_added >= max(1, limit_per_section // 3):
+                break
+        return out
+
+    def _compact_context_items(
+        self, items: List[Dict[str, Any]], max_items: int = 20, char_budget: int = 5000
+    ) -> List[Dict[str, Any]]:
+        cleaned: List[Dict[str, Any]] = []
+        seen = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            kind = str(item.get("kind", "")).strip() or "fact"
+            text = self._trim_text(str(item.get("text", "")).strip(), 260)
+            if not text:
+                continue
+            key = f"{kind}::{text.lower()}"
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(
+                {
+                    "kind": kind,
+                    "text": text,
+                    "sources": as_clean_str_list(item.get("sources", [])),
+                }
+            )
+            if len(cleaned) >= max_items:
+                break
+        payload = json.dumps(cleaned, ensure_ascii=False)
+        while len(payload) > char_budget and cleaned:
+            cleaned = cleaned[:-1]
+            payload = json.dumps(cleaned, ensure_ascii=False)
+        return cleaned
+
+    def _split_context_for_children(
+        self,
+        task: str,
+        parent_question: str,
+        children: List[str],
+        parent_context_slice: Dict[str, Any],
+        node_gaps: List[str],
+        depth: int,
+    ) -> Dict[str, Dict[str, Any]]:
+        child_list = self._dedupe_preserve_order(children)
+        if not child_list:
+            return {}
+        parent_items = parent_context_slice.get("selected_items", [])
+        parent_items = parent_items if isinstance(parent_items, list) else []
+        compact_parent = self._compact_context_items(
+            parent_items, max_items=40, char_budget=9000
+        )
+        if not compact_parent:
+            return {
+                child: {
+                    "mode": "fallback_inherit_missing_parent",
+                    "selection_reason": "Parent context is empty; child inherits empty context.",
+                    "selected_items": [],
+                }
+                for child in child_list
+            }
+        prompt = textwrap.dedent(
+            f"""
+            Original task:
+            {task}
+
+            Parent node question:
+            {parent_question}
+
+            Current depth:
+            {depth}
+
+            Child questions to assign context:
+            {json.dumps(child_list, ensure_ascii=False)}
+
+            Parent unresolved gaps:
+            {json.dumps(node_gaps, ensure_ascii=False)}
+
+            Parent context items:
+            {json.dumps(compact_parent, ensure_ascii=False)}
+
+            Split the parent context into child-specific slices.
+            """
+        ).strip()
+        out: Dict[str, Dict[str, Any]] = {}
+        try:
+            split = self.decompose_llm.json(
+                SYSTEM_CONTEXT_SPLIT,
+                prompt,
+                stage="context_split",
+                metadata={
+                    "depth": depth,
+                    "parent_question": self._trim_text(parent_question, 120),
+                },
+            )
+            rows = split.get("child_contexts", [])
+            if not isinstance(rows, list):
+                rows = []
+            by_child: Dict[str, Dict[str, Any]] = {}
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                child = str(row.get("child_question", "")).strip()
+                if not child:
+                    continue
+                selected_items = row.get("selected_items", [])
+                selected_items = selected_items if isinstance(selected_items, list) else []
+                by_child[child] = {
+                    "mode": "split_from_parent",
+                    "selection_reason": str(row.get("selection_reason", "")).strip()
+                    or "Assigned from parent context split.",
+                    "selected_items": self._compact_context_items(
+                        selected_items, max_items=20, char_budget=6000
+                    ),
+                }
+            unmatched = [c for c in child_list if c not in by_child]
+            if unmatched:
+                # Allow slight wording drift from LLM by semantic remap.
+                keys = list(by_child.keys())
+                for child in list(unmatched):
+                    if not keys:
+                        break
+                    mapped = self._best_match_question(child, keys)
+                    if mapped in by_child and by_child[mapped].get("selected_items"):
+                        by_child[child] = by_child[mapped]
+            out.update(by_child)
+        except Exception as exc:
+            self._log(f"Context split failed; falling back to deterministic split. error={exc}")
+
+        # Deterministic fallback for missing child slices.
+        for child in child_list:
+            if child in out and out[child].get("selected_items"):
+                continue
+            child_tokens = self._tokenize(child)
+            ranked: List[tuple[int, Dict[str, Any]]] = []
+            for item in compact_parent:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text", "")).strip()
+                score = len(child_tokens & self._tokenize(text)) if child_tokens else 0
+                ranked.append((score, item))
+            ranked.sort(key=lambda x: x[0], reverse=True)
+            selected = [item for score, item in ranked if score > 0][:12]
+            if not selected:
+                selected = [item for _, item in ranked[:6]]
+            out[child] = {
+                "mode": "split_fallback",
+                "selection_reason": "Deterministic token-overlap split from parent context.",
+                "selected_items": self._compact_context_items(
+                    selected, max_items=12, char_budget=4000
+                ),
+            }
+        return out
 
     def _decompose_sub_question(
         self,
@@ -1966,6 +2280,7 @@ Runtime context (authoritative):
         depth: int,
         max_depth: int,
         finding: SubQuestionFinding,
+        node_context_slice: Dict[str, Any],
     ) -> List[str]:
         mode = self._compute_decompose_mode_hint(
             parent_question=sub_question,
@@ -2007,6 +2322,9 @@ Runtime context (authoritative):
 
             Current node evidence snapshot:
             {json.dumps(compact, ensure_ascii=False)}
+
+            User-provided context slice for this node:
+            {json.dumps(node_context_slice, ensure_ascii=False)}
 
             Decomposition style hint (guidance, not rigid):
             {json.dumps(mode, ensure_ascii=False)}
@@ -2282,6 +2600,7 @@ Runtime context (authoritative):
         success_criteria: List[str],
         findings: Dict[str, SubQuestionFinding],
         round_i: int,
+        full_user_context: Dict[str, Any],
     ) -> str:
         compact = self._compact_findings(
             findings=findings,
@@ -2303,6 +2622,9 @@ Runtime context (authoritative):
 
             Current findings:
             {json.dumps(compact, ensure_ascii=False)}
+
+            Full user-provided parsed context:
+            {json.dumps(full_user_context, ensure_ascii=False)}
             """
         ).strip()
 
@@ -2314,6 +2636,7 @@ Runtime context (authoritative):
         evidence_status: str,
         evidence_note: str,
         search_stats: Dict[str, int],
+        full_user_context: Dict[str, Any],
     ) -> str:
         compact = self._compact_findings(
             findings=findings,
@@ -2343,6 +2666,9 @@ Runtime context (authoritative):
 
             Evidence base:
             {json.dumps(compact, ensure_ascii=False)}
+
+            Full user-provided parsed context:
+            {json.dumps(full_user_context, ensure_ascii=False)}
             """
         ).strip()
 

@@ -20,6 +20,7 @@ const contextDiffBannerEl = document.getElementById("contextDiffBanner");
 const contextFilesEl = document.getElementById("contextFiles");
 const contextAggregateDigestEl = document.getElementById("contextAggregateDigest");
 const contextFileDigestEl = document.getElementById("contextFileDigest");
+const contextDigestPaneEl = document.querySelector(".context-digest-pane");
 
 const runStatusEl = document.getElementById("runStatus");
 const researchStatusEl = document.getElementById("researchStatus");
@@ -108,6 +109,9 @@ let contextInputLocked = false;
 let errorBannerTimer = null;
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
+}
+if (contextDigestPaneEl) {
+  contextDigestPaneEl.style.display = UI_DEBUG ? "" : "none";
 }
 
 function esc(s) {
@@ -316,15 +320,18 @@ async function responseDetail(rsp, fallback) {
 
 function contextStateClass(v) {
   const s = String(v || "").toLowerCase();
-  if (s === "ready" || s === "completed" || s === "partial_ready") return "ready";
+  if (s === "ready" || s === "completed" || s === "partial_ready" || s === "parsed") return "ready";
   if (s === "running" || s === "parsing" || s === "generating") return "parsing";
   if (s === "error" || s === "failed") return "error";
+  if (s === "uploaded") return "stale";
   return "stale";
 }
 
 function contextStatusLabel(v) {
   const s = String(v || "").trim().toLowerCase();
-  if (!s) return "stale";
+  if (!s) return "uploaded";
+  if (s === "stale") return "uploaded";
+  if (s === "ready" || s === "completed" || s === "partial_ready") return "parsed";
   return s.replaceAll("_", " ");
 }
 
@@ -425,6 +432,12 @@ function renderContextPane() {
 }
 
 async function fetchContextAggregateDigest() {
+  if (!UI_DEBUG) {
+    if (contextAggregateDigestEl) {
+      contextAggregateDigestEl.textContent = "";
+    }
+    return;
+  }
   const set = currentContextSet && typeof currentContextSet === "object" ? currentContextSet : {};
   const files = Array.isArray(set.files) ? set.files.filter((f) => f && typeof f === "object") : [];
   const base = contextBasePath();
@@ -497,7 +510,11 @@ async function fetchContextSet() {
     const data = await rsp.json();
     currentContextSet = data && data.context_set ? data.context_set : null;
     renderContextPane();
-    await fetchContextAggregateDigest();
+    if (UI_DEBUG) {
+      await fetchContextAggregateDigest();
+    } else if (contextAggregateDigestEl) {
+      contextAggregateDigestEl.textContent = "";
+    }
     if (selectedContextFileId && contextFileDigestEl) {
       await fetchContextFileDigest(selectedContextFileId);
     } else if (contextFileDigestEl) {
@@ -1124,6 +1141,10 @@ function eventNarration(ev) {
   const et = String(ev.event_type || "");
   const p = (ev.payload && typeof ev.payload === "object") ? ev.payload : {};
   if (et === "run_started") return "Research started.";
+  if (et === "context_binding_parsing_started") return `Parsing uploaded context files (${Number(p.files_total || 0)} total)...`;
+  if (et === "context_binding_parsing_file_completed") return `Parsed context file ${Number(p.index || 0)}/${Number(p.total || 0)}: ${p.filename || ""}`;
+  if (et === "context_binding_parsing_completed") return "Context parsing completed.";
+  if (et === "context_for_node_ready") return `Prepared context for node ${p.node_id || ""} (${Number(p.selected_items_count || 0)} items).`;
   if (et === "context_binding_started") return "Binding uploaded context files...";
   if (et === "context_binding_completed") return "Context binding completed. Starting research...";
   if (et === "context_binding_failed") return `Context binding failed: ${p.error || "unknown error"}`;
@@ -1152,6 +1173,7 @@ function eventNarration(ev) {
   if (et === "run_paused") return "Research paused.";
   if (et === "run_resumed") return "Research resumed.";
   if (et === "report_generation_started") return "Agent is writing the report, please wait a few moments...";
+  if (et === "report_context_attached") return "Attached full user context for report writing.";
   if (et === "report_heartbeat") return "Still writing report...";
   if (et === "report_generation_completed") return "Report generation completed.";
   if (et === "report_generation_failed") return "Report generation failed.";
@@ -1661,6 +1683,9 @@ function applySnapshot(snap) {
   currentSnapshot = snap;
   const sid = String(snap.session_id || snap.run_id || "").trim();
   setContextEnabled(!!sid);
+  if (contextDigestPaneEl) {
+    contextDigestPaneEl.style.display = UI_DEBUG ? "" : "none";
+  }
   if (sid && Array.isArray(sessions)) {
     const idx = sessions.findIndex((s) => String((s && s.session_id) || "") === sid);
     if (idx >= 0) {
@@ -1852,12 +1877,14 @@ function connectEvents(runId) {
 
   const events = [
     "run_started", "context_binding_started", "context_binding_completed", "context_binding_failed",
+    "context_binding_parsing_started", "context_binding_parsing_file_completed", "context_binding_parsing_completed", "context_for_node_ready",
     "plan_created", "round_started", "sub_question_started", "queries_generated",
     "query_started", "query_diagnostic", "query_skipped_cached", "query_rerun_allowed",
     "query_broadened", "query_blocked_diminishing_returns", "search_completed", "synthesis_completed",
     "node_sufficiency_started", "node_sufficiency_completed", "node_decomposition_started", "node_decomposed", "node_completed", "node_unresolved",
     "sufficiency_started", "sufficiency_completed", "run_paused", "run_resumed", "run_abort_requested", "abort_requested", "run_aborted",
     "report_generation_started", "report_heartbeat", "report_generation_completed", "report_generation_failed",
+    "report_context_attached",
     "partial_report_generated", "report_version_created", "report_version_selected", "run_heartbeat", "run_completed", "run_failed"
   ];
   for (const e of events) {
@@ -1868,6 +1895,14 @@ function connectEvents(runId) {
         const narration = eventNarration(parsed);
         if (narration) {
           upsertThought(narration, parsed.event_type || e);
+        }
+        if (UI_DEBUG && parsed.event_type === "context_for_node_ready" && contextAggregateDigestEl) {
+          const ctx = parsed.payload && typeof parsed.payload === "object"
+            ? parsed.payload.context_slice
+            : null;
+          if (ctx && typeof ctx === "object") {
+            contextAggregateDigestEl.textContent = JSON.stringify(ctx, null, 2);
+          }
         }
         if (parsed.event_type === "report_generation_completed" || parsed.event_type === "report_generation_failed") {
           reportGeneratingRunIds.delete(String(runId));
@@ -1918,11 +1953,12 @@ async function startRun(idempotencyKey) {
     const data = await rsp.json();
     currentRunId = String(data.run_id || currentRunId || "");
     setRunIdInUrl(currentRunId);
+    // Subscribe immediately so startup parsing events are not missed.
+    connectEvents(currentRunId);
+    connectContextEvents(currentRunId);
     await fetchSnapshot(currentRunId);
     setContextEnabled(true);
     await fetchContextSet();
-    connectEvents(currentRunId);
-    connectContextEvents(currentRunId);
     await fetchSessions();
     emitSessionMutation("create", currentRunId);
   } catch (err) {
@@ -2011,7 +2047,9 @@ async function uploadContextFiles(files) {
   const uploadedNames = list.map((f) => String(f.name || "context.txt"));
   pendingUploadFiles = uploadedNames;
   renderContextPane();
-  contextAggregateDigestEl.textContent = `Parsing uploaded files, please wait...\n- ${uploadedNames.join("\n- ")}`;
+  if (UI_DEBUG && contextAggregateDigestEl) {
+    contextAggregateDigestEl.textContent = `Parsing uploaded files, please wait...\n- ${uploadedNames.join("\n- ")}`;
+  }
   setContextBusy(true);
   const fd = new FormData();
   for (const f of list) {

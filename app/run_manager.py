@@ -12,7 +12,7 @@ from glob import glob
 from pathlib import Path
 from queue import Queue
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from app.models import RunState, SessionSummary
 from deep_research_agent import (
@@ -526,7 +526,12 @@ class RunManager:
             else:
                 return None
         state_path = str(session_item.get("state_file_path", "")).strip()
-        state = self._load_run_state_from_files(run_id, state_path, session_item)
+        state = self._load_run_state_from_files(
+            run_id,
+            state_path,
+            session_item,
+            normalize_interrupted_non_terminal=False,
+        )
         if not state:
             return None
         recovered = self._recover_stale_report_generation_on_load_locked(state, run_id=run_id)
@@ -2083,11 +2088,44 @@ class RunManager:
             if is_cancel_requested():
                 raise RuntimeError("Run aborted by user")
             try:
-                ok = self.bind_workspace_context_to_session(pending_workspace_id, run_id)
+                ws_set = self.get_workspace_context_set(pending_workspace_id) or {}
+                ws_files = ws_set.get("files", []) if isinstance(ws_set, dict) else []
+                files_total = len(ws_files) if isinstance(ws_files, list) else 0
+                emit_worker_event(
+                    "context_binding_parsing_started",
+                    {
+                        "workspace_id": pending_workspace_id,
+                        "files_total": files_total,
+                    },
+                )
+
+                def _on_context_progress(info: Dict[str, Any]) -> None:
+                    emit_worker_event(
+                        "context_binding_parsing_file_completed",
+                        {
+                            "workspace_id": pending_workspace_id,
+                            "index": int(info.get("index", 0) or 0),
+                            "total": int(info.get("total", files_total) or files_total),
+                            "filename": str(info.get("filename", "") or ""),
+                            "status": str(info.get("status", "") or ""),
+                            "error": str(info.get("error", "") or ""),
+                        },
+                    )
+
+                ok = self.bind_workspace_context_to_session(
+                    pending_workspace_id, run_id, progress_callback=_on_context_progress
+                )
                 if not ok:
                     raise RuntimeError(
                         "Context binding failed: invalid workspace/session reference."
                     )
+                emit_worker_event(
+                    "context_binding_parsing_completed",
+                    {
+                        "workspace_id": pending_workspace_id,
+                        "files_total": files_total,
+                    },
+                )
             except Exception as exc:
                 emit_worker_event(
                     "context_binding_failed",
@@ -2119,6 +2157,8 @@ class RunManager:
                 },
             )
 
+        user_context_bundle = self._build_user_context_bundle_for_session(run_id)
+
         agent = DeepResearchAgent(
             model=snapshot.model,
             report_model=snapshot.report_model,
@@ -2130,6 +2170,7 @@ class RunManager:
             event_callback=callback,
             run_id=run_id,
             should_abort=should_abort,
+            user_context_bundle=user_context_bundle,
         )
         try:
             report = agent.run(task)
@@ -2255,6 +2296,9 @@ class RunManager:
                 token_breakdown=True,
                 cost_estimate_enabled=True,
                 verbose=False,
+                user_context_bundle=self._build_user_context_bundle_for_session(
+                    snapshot.run_id
+                ),
             )
         except Exception:
             return "", None
@@ -2316,6 +2360,11 @@ class RunManager:
                 evidence_status=evidence_status,
                 evidence_note=evidence_note,
                 search_stats=stats,
+                full_user_context=(
+                    agent.user_context_bundle.get("aggregate_digest", {})
+                    if isinstance(agent.user_context_bundle, dict)
+                    else {}
+                ),
             )
             report_text = agent.report_llm.text(
                 SYSTEM_REPORT,
@@ -2530,6 +2579,9 @@ class RunManager:
         if event_type in {
             "run_started",
             "context_binding_started",
+            "context_binding_parsing_started",
+            "context_binding_parsing_file_completed",
+            "context_binding_parsing_completed",
             "context_binding_completed",
             "context_binding_failed",
             "run_paused",
@@ -2538,6 +2590,7 @@ class RunManager:
             "run_failed",
             "run_aborted",
             "report_generation_started",
+            "report_context_attached",
             "report_generation_completed",
             "report_generation_failed",
             "partial_report_generated",
@@ -2687,6 +2740,7 @@ class RunManager:
         state_file_path: str,
         session_item: Dict[str, Any],
         force_execution_state_recompute: bool = False,
+        normalize_interrupted_non_terminal: bool = True,
     ) -> Optional[RunState]:
         # Authoritative source: state_web_<session_id>.json checkpoint.
         # sessions_index entries are cache/projection only and should not
@@ -2888,9 +2942,9 @@ class RunManager:
         elif execution_state not in {"idle", "running", "paused", "completed", "failed", "aborted"}:
             execution_state = self._execution_state_from_status(status)
 
-        # Recovered sessions are loaded from disk without reattaching a live worker.
-        # Any non-terminal status from prior process is stale and should be normalized.
-        if status in {"queued", "running"}:
+        # Recovered sessions loaded from disk without a live worker may carry stale
+        # non-terminal status. Only normalize when explicitly requested by caller.
+        if normalize_interrupted_non_terminal and status in {"queued", "running"}:
             status = "failed"
             execution_state = "failed"
             if not str(error or "").strip():
@@ -3557,14 +3611,40 @@ class RunManager:
                 return None
             return json.loads(Path(ref).read_text(encoding="utf-8"))
 
+    def _build_user_context_bundle_for_session(self, session_id: str) -> Dict[str, Any]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return {"available": False, "aggregate_digest": {}, "files": []}
+        context_set = self.get_context_set(sid)
+        aggregate = self.get_context_aggregate_digest(sid)
+        files = (
+            context_set.get("files", [])
+            if isinstance(context_set, dict) and isinstance(context_set.get("files", []), list)
+            else []
+        )
+        return {
+            "available": bool(isinstance(aggregate, dict) and aggregate),
+            "session_id": sid,
+            "revision": int(context_set.get("revision", 0) or 0)
+            if isinstance(context_set, dict)
+            else 0,
+            "files": files,
+            "aggregate_digest": aggregate if isinstance(aggregate, dict) else {},
+        }
+
     def _run_context_recompute_locked(
-        self, session_id: str, context_set: Dict[str, Any], force_aggregate: bool
+        self,
+        session_id: str,
+        context_set: Dict[str, Any],
+        force_aggregate: bool,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, int]:
         diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0}
         files = [f for f in context_set.get("files", []) if isinstance(f, dict)]
         had_file_error = False
         ready_files = 0
-        for f in files:
+        total_files = len(files)
+        for idx, f in enumerate(files, start=1):
             p = str(f.get("path", "") or "")
             if not p or not Path(p).exists():
                 f["digest_status"] = "error"
@@ -3572,6 +3652,16 @@ class RunManager:
                 f["digest_ref"] = ""
                 f["digest_hash"] = ""
                 had_file_error = True
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "index": idx,
+                            "total": total_files,
+                            "filename": str(f.get("filename", "") or ""),
+                            "status": "error",
+                            "error": "File missing on disk.",
+                        }
+                    )
                 continue
             try:
                 b = Path(p).read_bytes()
@@ -3593,12 +3683,32 @@ class RunManager:
                     else:
                         diff["new"] += 1
                     ready_files += 1
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "index": idx,
+                            "total": total_files,
+                            "filename": str(f.get("filename", "") or ""),
+                            "status": "ready",
+                            "error": "",
+                        }
+                    )
             except Exception as exc:
                 f["digest_status"] = "error"
                 f["error"] = str(exc)
                 f["digest_ref"] = ""
                 f["digest_hash"] = ""
                 had_file_error = True
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "index": idx,
+                            "total": total_files,
+                            "filename": str(f.get("filename", "") or ""),
+                            "status": "error",
+                            "error": str(exc),
+                        }
+                    )
         if self._context_preprocess_enabled:
             try:
                 if force_aggregate or diff["changed"] > 0 or diff["new"] > 0 or diff["deleted"] > 0:
@@ -4062,10 +4172,11 @@ class RunManager:
                 )
                 existing_files.append(context_set["files"][-1])
                 diff["new"] += 1
+            # Workspace stage: defer parsing until start-time binding.
             context_set["aggregate_digest_status"] = "stale"
-            recompute_diff = self._run_context_recompute_locked(ctx_key, context_set, force_aggregate=True)
-            diff["changed"] += recompute_diff["changed"]
-            diff["unchanged"] += recompute_diff["unchanged"]
+            context_set["aggregate_digest_ref"] = ""
+            context_set["aggregate_digest_hash"] = ""
+            context_set["aggregate_error"] = ""
             context_set["revision"] = cur_rev + 1
             context_set["updated_at"] = _now().isoformat()
             context_set["last_diff"] = diff
@@ -4148,10 +4259,18 @@ class RunManager:
             )
             if diff["unchanged"] == 0:
                 diff["changed"] = 1
+            # Workspace stage: defer parsing until start-time binding.
+            target["extracted_text_hash"] = ""
+            target["chunking_version"] = ""
+            target["spans_hash"] = ""
+            target["prompt_version"] = ""
+            target["digest_status"] = "stale"
+            target["digest_hash"] = ""
+            target["digest_ref"] = ""
             context_set["aggregate_digest_status"] = "stale"
-            recompute_diff = self._run_context_recompute_locked(ctx_key, context_set, force_aggregate=True)
-            diff["changed"] += recompute_diff["changed"]
-            diff["unchanged"] += recompute_diff["unchanged"]
+            context_set["aggregate_digest_ref"] = ""
+            context_set["aggregate_digest_hash"] = ""
+            context_set["aggregate_error"] = ""
             context_set["revision"] = cur_rev + 1
             context_set["updated_at"] = _now().isoformat()
             context_set["last_diff"] = diff
@@ -4215,8 +4334,11 @@ class RunManager:
                 except Exception:
                     pass
             context_set["files"] = kept
+            # Workspace stage: defer parsing until start-time binding.
             context_set["aggregate_digest_status"] = "stale"
-            self._run_context_recompute_locked(ctx_key, context_set, force_aggregate=True)
+            context_set["aggregate_digest_ref"] = ""
+            context_set["aggregate_digest_hash"] = ""
+            context_set["aggregate_error"] = ""
             context_set["revision"] = cur_rev + 1
             context_set["updated_at"] = _now().isoformat()
             context_set["last_diff"] = diff
@@ -4225,7 +4347,12 @@ class RunManager:
         self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
         return out
 
-    def bind_workspace_context_to_session(self, workspace_id: str, session_id: str) -> bool:
+    def bind_workspace_context_to_session(
+        self,
+        workspace_id: str,
+        session_id: str,
+        progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> bool:
         wid = str(workspace_id or "").strip()
         sid = str(session_id or "").strip()
         if not wid or not sid:
@@ -4270,7 +4397,12 @@ class RunManager:
                         }
                     )
                 dst["aggregate_digest_status"] = "stale"
-                self._run_context_recompute_locked(sid, dst, force_aggregate=True)
+                self._run_context_recompute_locked(
+                    sid,
+                    dst,
+                    force_aggregate=True,
+                    progress_callback=progress_callback,
+                )
                 dst["revision"] = 1
                 dst["updated_at"] = _now().isoformat()
                 self._save_context_set_for_key_locked(sid, dst)

@@ -12,6 +12,7 @@ Rules:
   - node sufficiency failure reasoning
   - unresolved gaps
   - current node evidence snapshot
+  - user-provided node context slice
   - decomposition style hint (guidance)
 - Use these context fields explicitly; do not ignore them.
 - Depth is guidance, not a rigid rule:
@@ -26,3 +27,5 @@ Rules:
 - Do not generate paraphrases of the same question.
 - Use clear partition axes (e.g., by segment, mechanism, geography, time, stakeholder, or pipeline stage).
 - Do not exceed the requested child-count cap from the user prompt.
+- The returned child list will be used for a one-time context split from parent to children.
+  Keep children semantically distinct so child-specific context assignment is clean.

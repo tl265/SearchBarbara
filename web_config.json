@@ -8,7 +8,7 @@
   "default_results_per_query": 1,
   "model": "gpt-4.1",
   "report_model": "gpt-5.2",
-  "ui_debug": false,
+  "ui_debug": true,
   "min_canvas_zoom": 0.3,
   "auto_fit_safety_px": 40,
   "heartbeat_interval_sec": 8,
