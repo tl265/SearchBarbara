@@ -688,6 +688,7 @@ class RunManager:
     ) -> Optional[Dict[str, Any]]:
         session_lock = self._session_lock_for(run_id)
         snapshot: Optional[RunState] = None
+        report_mode = "partial"
         start_persist_error = ""
         acquired = session_lock.acquire(timeout=2.0)
         if not acquired:
@@ -732,11 +733,14 @@ class RunManager:
                     ),
                     "error_code": "invalid_state",
                 }
+            report_mode = (
+                "partial" if state.research_state == "paused" else "final_from_snapshot"
+            )
             self._set_report_phase_locked(
                 state,
                 report_status="running",
                 report_phase="started",
-                report_mode="partial",
+                report_mode=report_mode,
                 report_error="",
             )
             self._next_state_version_locked(state)
@@ -768,7 +772,7 @@ class RunManager:
                     "run_id": run_id,
                     "timestamp": _now().isoformat(),
                     "event_type": "report_generation_failed",
-                    "payload": {"mode": "partial", "error": start_persist_error},
+                    "payload": {"mode": report_mode, "error": start_persist_error},
                 },
             )
             return {"error": start_persist_error, "error_code": "persist_failed"}
@@ -779,7 +783,7 @@ class RunManager:
                 "run_id": run_id,
                 "timestamp": _now().isoformat(),
                 "event_type": "report_generation_started",
-                "payload": {"mode": "partial"},
+                "payload": {"mode": report_mode},
             },
         )
         report_heartbeat_stop = threading.Event()
@@ -805,7 +809,9 @@ class RunManager:
         )
         report_heartbeat_thread.start()
         try:
-            report_text, partial_usage = self._build_partial_report_with_agent(snapshot)
+            report_text, partial_usage = self._build_partial_report_with_agent(
+                snapshot, report_mode
+            )
         except Exception:
             with self._lock:
                 self._active_report_runs.discard(run_id)
@@ -822,7 +828,7 @@ class RunManager:
                     "run_id": run_id,
                     "timestamp": _now().isoformat(),
                     "event_type": "report_generation_failed",
-                    "payload": {"mode": "partial"},
+                    "payload": {"mode": report_mode},
                 },
             )
             return {
@@ -893,7 +899,7 @@ class RunManager:
                 state,
                 report_status="completed",
                 report_phase="completed",
-                report_mode="partial",
+                report_mode=report_mode,
                 report_error="",
             )
             self._next_state_version_locked(state)
@@ -928,7 +934,7 @@ class RunManager:
                     "run_id": run_id,
                     "timestamp": _now().isoformat(),
                     "event_type": "report_generation_failed",
-                    "payload": {"mode": "partial", "error": persist_error},
+                    "payload": {"mode": report_mode, "error": persist_error},
                 },
             )
             return {"error": persist_error, "error_code": "persist_failed"}
@@ -942,7 +948,7 @@ class RunManager:
                 "payload": {
                     "report_file_path": str(report_path),
                     "version_index": int(created.get("version_index", 1)),
-                    "mode": "partial",
+                    "mode": report_mode,
                 },
             },
         )
@@ -955,7 +961,7 @@ class RunManager:
                 "payload": {
                     "report_file_path": str(report_path),
                     "version_index": int(created.get("version_index", 1)),
-                    "mode": "partial",
+                    "mode": report_mode,
                 },
             },
         )
@@ -1943,7 +1949,7 @@ class RunManager:
         return token_usage if isinstance(token_usage, dict) else None
 
     def _build_partial_report_with_agent(
-        self, snapshot: RunState
+        self, snapshot: RunState, report_mode: str
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         try:
             agent = DeepResearchAgent(
@@ -2001,9 +2007,14 @@ class RunManager:
                 queries_with_evidence=queries_with_evidence,
                 total_selected_results=total_selected_results,
             )
-            evidence_note = (
-                f"{evidence_note} This is a partial report generated before run completion."
-            )
+            if report_mode == "partial":
+                evidence_note = (
+                    f"{evidence_note} This is a partial report generated before run completion."
+                )
+            else:
+                evidence_note = (
+                    f"{evidence_note} This report is generated from the current finalized findings snapshot."
+                )
             prompt = agent._format_report_prompt(
                 task=snapshot.task,
                 success_criteria=success_criteria,
@@ -2015,7 +2026,11 @@ class RunManager:
             report_text = agent.report_llm.text(
                 SYSTEM_REPORT,
                 prompt,
-                stage="report_partial",
+                stage=(
+                    "report_partial"
+                    if report_mode == "partial"
+                    else "report_final_from_snapshot"
+                ),
                 metadata={"task": snapshot.task[:120]},
             )
             return report_text, agent.usage_tracker.to_dict()
