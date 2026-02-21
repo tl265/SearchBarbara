@@ -1,0 +1,45 @@
+Task specialization: AGGREGATE_DIGEST.
+
+Source reference constraints for this task:
+- Every extracted item must have `sources[]`.
+- sources must be copied/merged from input per-file digests.
+- Do NOT invent new sources.
+- Use ONLY provided FILE_DIGESTS (no raw spans).
+
+Input format:
+TASK: AGGREGATE_DIGEST
+MANIFEST:
+- filename: ...
+  format: ...
+- filename: ...
+  format: ...
+FILE_DIGESTS:
+<DOC1_JSON>
+<DOC2_JSON>
+...
+END_FILE_DIGESTS
+
+Rules:
+- Do NOT invent new claims. You may rephrase for clarity but preserve meaning.
+- Detect cross-file contradictions and surface them in conflicts/uncertainties.
+- Deduplicate obvious repeats across files and union sources.
+
+Required task-specific output fields:
+- mode = "batch"
+- document: { "filename": "__BATCH__", "format": "mixed" }
+- batch.files[] from manifest
+
+Output skeleton:
+{
+  "schema_version": "context_digest.v1",
+  "mode": "batch",
+  "document": { "filename": "__BATCH__", "format": "mixed" },
+  "batch": { "files": [ { "filename": "...", "format": "..." } ] },
+  "summary": "...",
+  "facts": [ { "claim": "...", "sources": ["..."] } ],
+  "uncertainties": [ "..." ],
+  "conflicts": [ { "conflict": "...", "sources": ["..."] } ],
+  "index": { "entities": ["..."], "topic_tags": ["..."], "query_seeds": ["..."] }
+}
+
+Return JSON only.

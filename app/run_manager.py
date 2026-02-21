@@ -1,7 +1,10 @@
 import json
 import copy
 import hashlib
+import mimetypes
+import io
 import os
+import tempfile
 import threading
 import uuid
 from datetime import datetime, timezone
@@ -14,9 +17,11 @@ from typing import Any, Dict, List, Optional
 from app.models import RunState, SessionSummary
 from deep_research_agent import (
     DeepResearchAgent,
+    LLM,
     SYSTEM_REPORT,
     SubQuestionFinding,
     UsageTracker,
+    load_prompt,
     slugify_for_filename,
 )
 
@@ -32,10 +37,21 @@ class RunManager:
     _IDEMPOTENCY_TTL_CREATE_RUN_SEC = 600
     _IDEMPOTENCY_TTL_REPORT_SEC = 300
 
-    def __init__(self, heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC) -> None:
+    def __init__(
+        self,
+        heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC,
+        context_preprocess_enabled: bool = True,
+        context_preprocess_model: str = "gpt-4.1",
+        context_preprocess_prompt_path_common: str = "prompts/context_preprocess_common.system.txt",
+        context_preprocess_prompt_path_per_file: str = "prompts/context_preprocess_per_file.system.txt",
+        context_preprocess_prompt_path_aggregate: str = "prompts/context_preprocess_aggregate.system.txt",
+        context_preprocess_prompt_version: str = "v1.4",
+        context_chunking_version: str = "context_chunk.v1",
+    ) -> None:
         self._runs: Dict[str, RunState] = {}
         self._sessions: Dict[str, Dict[str, Any]] = {}
         self._subscribers: Dict[str, List[Queue]] = {}
+        self._context_subscribers: Dict[str, List[Queue]] = {}
         self._session_locks: Dict[str, threading.RLock] = {}
         self._session_locks_guard = threading.Lock()
         self._cancel_flags: Dict[str, bool] = {}
@@ -60,10 +76,36 @@ class RunManager:
         self._lock_owner_thread_id: int = 0
         self._lock_owner_acquired_at: float = 0.0
         self._heartbeat_interval_sec = max(1.0, float(heartbeat_interval_sec))
+        self._context_preprocess_enabled = bool(context_preprocess_enabled)
+        self._context_preprocess_model = str(context_preprocess_model or "gpt-4.1")
+        self._context_preprocess_prompt_path_common = str(
+            context_preprocess_prompt_path_common
+            or "prompts/context_preprocess_common.system.txt"
+        )
+        self._context_preprocess_prompt_path_per_file = str(
+            context_preprocess_prompt_path_per_file
+            or "prompts/context_preprocess_per_file.system.txt"
+        )
+        self._context_preprocess_prompt_path_aggregate = str(
+            context_preprocess_prompt_path_aggregate
+            or "prompts/context_preprocess_aggregate.system.txt"
+        )
+        self._context_preprocess_prompt_version = str(
+            context_preprocess_prompt_version or "v1.4"
+        )
+        self._context_chunking_version = str(context_chunking_version or "context_chunk.v1")
+        self._context_prompt_cache: Dict[str, str] = {}
         self._index_flush_min_interval_sec = 2.0
         self._last_index_flush_ts = 0.0
         self._runs_dir = Path("runs")
         self._runs_dir.mkdir(parents=True, exist_ok=True)
+        self._contexts_dir = self._runs_dir / "contexts"
+        self._contexts_dir.mkdir(parents=True, exist_ok=True)
+        self._context_files_dir = self._contexts_dir / "files"
+        self._context_files_dir.mkdir(parents=True, exist_ok=True)
+        self._context_digests_dir = self._contexts_dir / "digests"
+        (self._context_digests_dir / "per_file").mkdir(parents=True, exist_ok=True)
+        (self._context_digests_dir / "aggregate").mkdir(parents=True, exist_ok=True)
         self._sessions_index_path = self._runs_dir / "sessions_index.json"
         self._sessions_index_meta: Dict[str, Any] = {
             "schema_version": self._SESSIONS_INDEX_SCHEMA_VERSION,
@@ -82,7 +124,68 @@ class RunManager:
         report_model: str,
     ) -> str:
         run_id = str(uuid.uuid4())
+        return self._create_run_with_id(
+            run_id=run_id,
+            task=task,
+            max_depth=max_depth,
+            max_rounds=max_rounds,
+            results_per_query=results_per_query,
+            model=model,
+            report_model=report_model,
+            start_worker=True,
+            is_draft=False,
+        )
+
+    def create_draft_session(
+        self,
+        max_depth: int,
+        max_rounds: int,
+        results_per_query: int,
+        model: str,
+        report_model: str,
+    ) -> str:
+        run_id = str(uuid.uuid4())
+        return self._create_run_with_id(
+            run_id=run_id,
+            task="",
+            max_depth=max_depth,
+            max_rounds=max_rounds,
+            results_per_query=results_per_query,
+            model=model,
+            report_model=report_model,
+            start_worker=False,
+            is_draft=True,
+        )
+
+    def _create_run_with_id(
+        self,
+        run_id: str,
+        task: str,
+        max_depth: int,
+        max_rounds: int,
+        results_per_query: int,
+        model: str,
+        report_model: str,
+        start_worker: bool,
+        is_draft: bool,
+    ) -> str:
         now = _now()
+        runs_dir = Path("runs")
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        state_path = runs_dir / f"state_web_{run_id}.json"
+        tree = {
+            "task": task,
+            "plan": {"sub_questions": [], "success_criteria": []},
+            "max_depth": max_depth,
+            "rounds": [],
+            "final_sufficiency": None,
+            "report_status": "pending",
+            "report_phase": "",
+            "report_mode": "",
+            "report_phase_updated_at": "",
+            "report_error": "",
+            "is_draft": bool(is_draft),
+        }
         state = RunState(
             run_id=run_id,
             session_id=run_id,
@@ -99,37 +202,132 @@ class RunManager:
             results_per_query=results_per_query,
             model=model,
             report_model=report_model,
-            state_file_path=None,
-            tree={
-                "task": task,
-                "plan": {"sub_questions": [], "success_criteria": []},
-                "max_depth": max_depth,
-                "rounds": [],
-                "final_sufficiency": None,
-                "report_status": "pending",
-                "report_phase": "",
-                "report_mode": "",
-                "report_phase_updated_at": "",
-                "report_error": "",
-            },
+            state_file_path=str(state_path),
+            tree=tree,
         )
         with self._lock:
             self._refresh_lifecycle_fields_locked(state)
             self._runs[run_id] = state
             self._session_locks.setdefault(run_id, threading.RLock())
             self._subscribers[run_id] = []
+            self._context_subscribers[run_id] = []
             self._cancel_flags[run_id] = False
             self._pause_flags[run_id] = False
             self._sync_session_from_state_locked(state)
+            self._persist_run_state_locked(state)
             self._save_sessions_index_locked(force=True)
+        if start_worker:
+            self._start_run_worker(run_id)
+        return run_id
 
+    def create_run_from_workspace(
+        self,
+        workspace_id: str,
+        task: str,
+        max_depth: int,
+        max_rounds: int,
+        results_per_query: int,
+        model: str,
+        report_model: str,
+    ) -> str:
+        run_id = str(uuid.uuid4())
+        self._create_run_with_id(
+            run_id=run_id,
+            task=task,
+            max_depth=max_depth,
+            max_rounds=max_rounds,
+            results_per_query=results_per_query,
+            model=model,
+            report_model=report_model,
+            start_worker=False,
+            is_draft=False,
+        )
+        wid = str(workspace_id or "").strip()
+        session_lock = self._session_lock_for(run_id)
+        with session_lock:
+            with self._lock:
+                state = self._ensure_run_loaded_locked(run_id)
+                if state and isinstance(state.tree, dict):
+                    state.tree["pending_workspace_id"] = wid
+                    state.tree["startup_phase"] = "queued_for_binding"
+                    state.updated_at = _now()
+                    self._refresh_lifecycle_fields_locked(state)
+                    self._next_state_version_locked(state)
+                    self._sync_session_from_state_locked(state)
+                    self._persist_run_state_locked(state)
+                    self._save_sessions_index_locked(force=True)
+        self._start_run_worker(run_id)
+        return run_id
+
+    def _start_run_worker(self, run_id: str) -> None:
         t = threading.Thread(
             target=self._execute_run,
             args=(run_id,),
             daemon=True,
         )
         t.start()
-        return run_id
+
+    def start_draft_session_run(
+        self,
+        run_id: str,
+        task: str,
+        max_depth: int,
+        max_rounds: int,
+        results_per_query: int,
+        model: str,
+        report_model: str,
+    ) -> Optional[Dict[str, Any]]:
+        rid = str(run_id or "").strip()
+        if not rid:
+            return None
+        session_lock = self._session_lock_for(rid)
+        with session_lock:
+            with self._lock:
+                state = self._ensure_run_loaded_locked(rid)
+                if not state:
+                    return None
+                if state.execution_state in {"running", "paused"} or state.status == "running":
+                    return {"error": "Session is already running.", "error_code": "conflict_running"}
+                tree = state.tree if isinstance(state.tree, dict) else {}
+                if not bool(tree.get("is_draft", False)):
+                    return {"error": "Session is not in draft mode.", "error_code": "conflict_not_draft"}
+                state.task = str(task or "").strip()
+                state.max_depth = int(max_depth)
+                state.max_rounds = int(max_rounds)
+                state.results_per_query = int(results_per_query)
+                state.model = str(model or state.model)
+                state.report_model = str(report_model or state.report_model)
+                state.status = "queued"
+                state.execution_state = "idle"
+                state.error = None
+                state.events = []
+                state.report_text = None
+                state.report_file_path = None
+                state.report_versions = []
+                state.current_report_version_index = None
+                state.token_usage = None
+                state.updated_at = _now()
+                state.title = self._default_title_from_task(state.task)
+                state.tree = {
+                    "task": state.task,
+                    "plan": {"sub_questions": [], "success_criteria": []},
+                    "max_depth": state.max_depth,
+                    "rounds": [],
+                    "final_sufficiency": None,
+                    "report_status": "pending",
+                    "report_phase": "",
+                    "report_mode": "",
+                    "report_phase_updated_at": "",
+                    "report_error": "",
+                    "is_draft": False,
+                }
+                self._refresh_lifecycle_fields_locked(state)
+                self._next_state_version_locked(state)
+                self._sync_session_from_state_locked(state)
+                self._persist_run_state_locked(state)
+                self._save_sessions_index_locked(force=True)
+            self._start_run_worker(rid)
+            return {"run_id": rid, "status": "queued"}
 
     def _idempotency_record_id(self, scope: str, key: str) -> str:
         return f"{str(scope or '').strip()}::{str(key or '').strip()}"
@@ -335,6 +533,7 @@ class RunManager:
         self._runs[run_id] = state
         self._session_locks.setdefault(run_id, threading.RLock())
         self._subscribers.setdefault(run_id, [])
+        self._context_subscribers.setdefault(run_id, [])
         self._cancel_flags.setdefault(run_id, False)
         self._pause_flags.setdefault(run_id, False)
         self._refresh_lifecycle_fields_locked(state)
@@ -394,6 +593,7 @@ class RunManager:
             self._runs[run_id] = loaded_state
             self._session_locks.setdefault(run_id, threading.RLock())
             self._subscribers.setdefault(run_id, [])
+            self._context_subscribers.setdefault(run_id, [])
             self._cancel_flags.setdefault(run_id, False)
             self._pause_flags.setdefault(run_id, False)
             if run_id not in self._sessions:
@@ -571,6 +771,7 @@ class RunManager:
             self._runs.pop(session_id, None)
             self._session_locks.pop(session_id, None)
             self._subscribers.pop(session_id, None)
+            self._context_subscribers.pop(session_id, None)
             self._cancel_flags.pop(session_id, None)
             self._pause_flags.pop(session_id, None)
             self._save_sessions_index_locked(force=True)
@@ -581,6 +782,10 @@ class RunManager:
                     path.unlink()
             except Exception:
                 pass
+        try:
+            self._delete_context_set_files(session_id)
+        except Exception:
+            pass
         return "deleted"
 
     def abort_run(
@@ -1326,6 +1531,19 @@ class RunManager:
             if state.status == "running":
                 state.execution_state = "running"
             return
+        if et == "context_binding_started":
+            if isinstance(tree, dict):
+                tree["startup_phase"] = "binding_context"
+            return
+        if et == "context_binding_completed":
+            if isinstance(tree, dict):
+                tree["startup_phase"] = "binding_completed"
+                tree.pop("pending_workspace_id", None)
+            return
+        if et == "context_binding_failed":
+            if isinstance(tree, dict):
+                tree["startup_phase"] = "binding_failed"
+            return
         if et == "plan_created":
             tree["plan"] = {
                 "sub_questions": payload.get("sub_questions", []),
@@ -1736,6 +1954,12 @@ class RunManager:
                 phase = "run_sufficiency"
             elif event_type in {"report_generation_started", "partial_report_generated"}:
                 phase = "writing_report"
+            elif event_type == "context_binding_started":
+                phase = "binding_context"
+            elif event_type == "context_binding_completed":
+                phase = "initializing"
+            elif event_type == "context_binding_failed":
+                phase = "terminal"
             elif event_type == "run_paused":
                 phase = "paused"
             elif event_type == "run_resumed":
@@ -1824,6 +2048,76 @@ class RunManager:
                     )
                     paused_announced = False
                 return False
+
+        def is_cancel_requested() -> bool:
+            with self._lock:
+                return bool(self._cancel_flags.get(run_id, False))
+
+        def emit_worker_event(event_type: str, payload: Optional[Dict[str, Any]] = None) -> None:
+            pl = payload if isinstance(payload, dict) else {}
+            set_phase(event_type, pl)
+            self._publish_event(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "timestamp": _now().isoformat(),
+                    "event_type": event_type,
+                    "payload": pl,
+                },
+            )
+
+        pending_workspace_id = ""
+        with session_lock:
+            with self._lock:
+                state_for_binding = self._ensure_run_loaded_locked(run_id)
+                if state_for_binding and isinstance(state_for_binding.tree, dict):
+                    pending_workspace_id = str(
+                        state_for_binding.tree.get("pending_workspace_id", "") or ""
+                    ).strip()
+
+        if pending_workspace_id:
+            emit_worker_event(
+                "context_binding_started",
+                {"workspace_id": pending_workspace_id},
+            )
+            if is_cancel_requested():
+                raise RuntimeError("Run aborted by user")
+            try:
+                ok = self.bind_workspace_context_to_session(pending_workspace_id, run_id)
+                if not ok:
+                    raise RuntimeError(
+                        "Context binding failed: invalid workspace/session reference."
+                    )
+            except Exception as exc:
+                emit_worker_event(
+                    "context_binding_failed",
+                    {"workspace_id": pending_workspace_id, "error": str(exc)},
+                )
+                raise
+            if is_cancel_requested():
+                raise RuntimeError("Run aborted by user")
+            bound_files = 0
+            bound_revision = 0
+            try:
+                bound_ctx = self.get_context_set(run_id)
+                if isinstance(bound_ctx, dict):
+                    files = bound_ctx.get("files", [])
+                    bound_files = (
+                        len(files)
+                        if isinstance(files, list)
+                        else 0
+                    )
+                    bound_revision = int(bound_ctx.get("revision", 0) or 0)
+            except Exception:
+                pass
+            emit_worker_event(
+                "context_binding_completed",
+                {
+                    "workspace_id": pending_workspace_id,
+                    "files_bound": bound_files,
+                    "revision": bound_revision,
+                },
+            )
 
         agent = DeepResearchAgent(
             model=snapshot.model,
@@ -2235,6 +2529,9 @@ class RunManager:
     def _should_flush_sessions_index(self, event_type: str) -> bool:
         if event_type in {
             "run_started",
+            "context_binding_started",
+            "context_binding_completed",
+            "context_binding_failed",
             "run_paused",
             "run_resumed",
             "run_completed",
@@ -2302,6 +2599,7 @@ class RunManager:
                 self._sessions[sid] = item
                 self._session_locks.setdefault(sid, threading.RLock())
                 self._subscribers.setdefault(sid, [])
+                self._context_subscribers.setdefault(sid, [])
                 self._cancel_flags.setdefault(sid, False)
                 self._pause_flags.setdefault(sid, False)
 
@@ -2347,6 +2645,7 @@ class RunManager:
                     self._runs[sid] = state
                     self._session_locks.setdefault(sid, threading.RLock())
                     self._subscribers.setdefault(sid, [])
+                    self._context_subscribers.setdefault(sid, [])
                     self._cancel_flags.setdefault(sid, False)
                     self._pause_flags.setdefault(sid, False)
                     self._sync_session_from_state_locked(state)
@@ -2643,3 +2942,1336 @@ class RunManager:
         if s == "failed":
             return "failed"
         return "idle"
+
+    # ----------------------------
+    # Context management subsystem
+    # ----------------------------
+    def _workspace_context_key(self, workspace_id: str) -> str:
+        wid = str(workspace_id or "").strip()
+        return f"ws__{wid}"
+
+    def _context_set_path_for_key(self, context_key: str) -> Path:
+        key = str(context_key or "").strip()
+        return self._contexts_dir / f"context_set_{key}.json"
+
+    def _context_file_path_for_key(self, context_key: str, file_id: str, filename: str) -> Path:
+        key = str(context_key or "").strip()
+        ext = Path(str(filename or "")).suffix
+        safe_ext = ext if ext and len(ext) <= 12 else ""
+        d = self._context_files_dir / key
+        d.mkdir(parents=True, exist_ok=True)
+        return d / f"{file_id}{safe_ext}"
+
+    def _context_default_set_for_key(
+        self, context_key: str, owner_kind: str, owner_id: str
+    ) -> Dict[str, Any]:
+        now_iso = _now().isoformat()
+        return {
+            "context_set_id": f"ctx_{context_key}",
+            "session_id": str(owner_id or "").strip(),
+            "owner_kind": str(owner_kind or "session").strip(),
+            "owner_id": str(owner_id or "").strip(),
+            "context_key": str(context_key or "").strip(),
+            "revision": 1,
+            "updated_at": now_iso,
+            "files": [],
+            "aggregate_digest_status": "stale",
+            "aggregate_digest_ref": "",
+            "aggregate_digest_hash": "",
+            "aggregate_error": "",
+            "last_diff": {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0},
+        }
+
+    def _load_context_set_for_key_locked(
+        self, context_key: str, owner_kind: str, owner_id: str
+    ) -> Dict[str, Any]:
+        path = self._context_set_path_for_key(context_key)
+        if not path.exists():
+            return self._context_default_set_for_key(context_key, owner_kind, owner_id)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return self._context_default_set_for_key(context_key, owner_kind, owner_id)
+        if not isinstance(raw, dict):
+            return self._context_default_set_for_key(context_key, owner_kind, owner_id)
+        out = self._context_default_set_for_key(context_key, owner_kind, owner_id)
+        out.update(raw)
+        out["session_id"] = str(owner_id or "").strip()
+        out["owner_kind"] = str(owner_kind or "session").strip()
+        out["owner_id"] = str(owner_id or "").strip()
+        out["context_key"] = str(context_key or "").strip()
+        out["files"] = [f for f in out.get("files", []) if isinstance(f, dict)]
+        out["revision"] = max(1, int(out.get("revision", 1) or 1))
+        return out
+
+    def _save_context_set_for_key_locked(self, context_key: str, context_set: Dict[str, Any]) -> None:
+        path = self._context_set_path_for_key(context_key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(context_set, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _context_set_path(self, session_id: str) -> Path:
+        sid = str(session_id or "").strip()
+        return self._context_set_path_for_key(sid)
+
+    def _context_file_path(self, session_id: str, file_id: str, filename: str) -> Path:
+        sid = str(session_id or "").strip()
+        return self._context_file_path_for_key(sid, file_id, filename)
+
+    def _delete_context_set_files(self, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        set_path = self._context_set_path(sid)
+        if set_path.exists():
+            set_path.unlink()
+        file_dir = self._context_files_dir / sid
+        if file_dir.exists() and file_dir.is_dir():
+            for p in file_dir.glob("*"):
+                try:
+                    if p.is_file():
+                        p.unlink()
+                except Exception:
+                    pass
+            try:
+                file_dir.rmdir()
+            except Exception:
+                pass
+        for p in (self._context_digests_dir / "per_file").glob(f"{sid}_*.json"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+        for p in (self._context_digests_dir / "aggregate").glob(f"{sid}_*.json"):
+            try:
+                p.unlink()
+            except Exception:
+                pass
+
+    def _context_default_set(self, session_id: str) -> Dict[str, Any]:
+        sid = str(session_id or "").strip()
+        return self._context_default_set_for_key(sid, "session", sid)
+
+    def _load_context_set_locked(self, session_id: str) -> Dict[str, Any]:
+        sid = str(session_id or "").strip()
+        return self._load_context_set_for_key_locked(sid, "session", sid)
+
+    def _save_context_set_locked(self, context_set: Dict[str, Any]) -> None:
+        session_id = str(context_set.get("session_id", "")).strip()
+        if not session_id:
+            return
+        self._save_context_set_for_key_locked(session_id, context_set)
+
+    def _context_prompt_text(self, kind: str) -> str:
+        k = str(kind or "").strip().lower()
+        if k not in {"per_file", "aggregate"}:
+            k = "per_file"
+        cached = self._context_prompt_cache.get(k)
+        if isinstance(cached, str) and cached.strip():
+            return cached
+        common_text = ""
+        common_path = Path(self._context_preprocess_prompt_path_common)
+        if common_path.exists():
+            common_text = common_path.read_text(encoding="utf-8").strip()
+        path_str = (
+            self._context_preprocess_prompt_path_per_file
+            if k == "per_file"
+            else self._context_preprocess_prompt_path_aggregate
+        )
+        p = Path(path_str)
+        if p.exists():
+            stage_text = p.read_text(encoding="utf-8").strip()
+            txt = (
+                f"{common_text}\n\n---\n\n{stage_text}".strip()
+                if common_text
+                else stage_text
+            )
+            self._context_prompt_cache[k] = txt
+            return txt
+        # Backward compatibility fallback.
+        fallback = load_prompt("context_preprocess.system.txt")
+        txt = f"{common_text}\n\n---\n\n{fallback}".strip() if common_text else fallback
+        self._context_prompt_cache[k] = txt
+        return txt
+
+    def _sha256_bytes(self, b: bytes) -> str:
+        return hashlib.sha256(b).hexdigest()
+
+    def _sha256_text(self, s: str) -> str:
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+    def _sha256_json(self, obj: Any) -> str:
+        try:
+            payload = json.dumps(obj, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except Exception:
+            payload = "{}"
+        return self._sha256_text(payload)
+
+    def _extract_text(self, file_bytes: bytes, mime_type: str, filename: str) -> str:
+        mt = str(mime_type or "").lower().strip()
+        if not mt:
+            mt = mimetypes.guess_type(str(filename or ""))[0] or "text/plain"
+        # Browsers often upload unknown text files as application/octet-stream.
+        # Fall back to extension-based type detection before rejecting.
+        if mt == "application/octet-stream":
+            guessed = mimetypes.guess_type(str(filename or ""))[0] or ""
+            if guessed:
+                mt = guessed
+            else:
+                ext = Path(str(filename or "")).suffix.lower()
+                if ext in {".md", ".markdown", ".txt", ".json", ".csv", ".log", ".yaml", ".yml"}:
+                    mt = "text/plain"
+        if mt.startswith("text/") or mt in {"application/json", "text/csv"}:
+            for enc in ("utf-8", "utf-8-sig", "gb18030", "latin-1"):
+                try:
+                    return file_bytes.decode(enc)
+                except Exception:
+                    continue
+        if mt == "application/pdf" or str(filename or "").lower().endswith(".pdf"):
+            text = self._extract_pdf_text_layer(file_bytes)
+            if text:
+                return text
+            ocr_text = self._extract_pdf_text_via_ocr(file_bytes)
+            if ocr_text:
+                return ocr_text
+            raise ValueError(
+                "PDF parsed but no extractable text was found. "
+                "If this is a scanned PDF, OCR dependencies may be missing."
+            )
+        raise ValueError(f"Unsupported context file type: {mt}")
+
+    def _extract_pdf_text_layer(self, file_bytes: bytes) -> str:
+        # Fast path for searchable PDFs.
+        try:
+            from pypdf import PdfReader  # type: ignore
+        except Exception:
+            raise ValueError(
+                "PDF support requires 'pypdf'. Install dependencies and retry."
+            )
+        try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            pages: List[str] = []
+            for pg in reader.pages:
+                pages.append((pg.extract_text() or "").strip())
+            return "\n\n".join([p for p in pages if p]).strip()
+        except Exception as exc:
+            raise ValueError(f"Failed to parse PDF text layer: {exc}")
+
+    def _extract_pdf_text_via_ocr(self, file_bytes: bytes) -> str:
+        # OCR fallback for scanned/image-only PDFs.
+        try:
+            import fitz  # type: ignore
+            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+        except Exception:
+            return ""
+        try:
+            doc = fitz.open(stream=file_bytes, filetype="pdf")
+        except Exception:
+            return ""
+        engine = RapidOCR()
+        page_texts: List[str] = []
+        max_pages = min(len(doc), 60)
+        for i in range(max_pages):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=200, alpha=False)
+            tmp_path = ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                    tmp_path = tmp.name
+                pix.save(tmp_path)
+                result, _elapsed = engine(tmp_path)
+                lines: List[str] = []
+                if isinstance(result, list):
+                    for item in result:
+                        if not isinstance(item, (list, tuple)) or len(item) < 2:
+                            continue
+                        txt = str(item[1] or "").strip()
+                        if txt:
+                            lines.append(txt)
+                if lines:
+                    page_texts.append("\n".join(lines))
+            except Exception:
+                continue
+            finally:
+                if tmp_path and Path(tmp_path).exists():
+                    try:
+                        Path(tmp_path).unlink()
+                    except Exception:
+                        pass
+        try:
+            doc.close()
+        except Exception:
+            pass
+        return "\n\n".join(page_texts).strip()
+
+    def _spans_from_text(self, text: str) -> List[Dict[str, str]]:
+        chunks: List[str] = []
+        lines = [ln.strip() for ln in str(text or "").splitlines()]
+        buf: List[str] = []
+        cur_len = 0
+        for ln in lines:
+            if not ln:
+                if buf:
+                    chunks.append("\n".join(buf).strip())
+                    buf = []
+                    cur_len = 0
+                continue
+            if cur_len + len(ln) + 1 > 900 and buf:
+                chunks.append("\n".join(buf).strip())
+                buf = [ln]
+                cur_len = len(ln)
+            else:
+                buf.append(ln)
+                cur_len += len(ln) + 1
+        if buf:
+            chunks.append("\n".join(buf).strip())
+        if not chunks:
+            chunks = [""]
+        spans: List[Dict[str, str]] = []
+        for i, c in enumerate(chunks, start=1):
+            spans.append({"span_id": f"S{i}", "text": c})
+        return spans
+
+    def _spans_hash(self, spans: List[Dict[str, str]]) -> str:
+        joined = "\n".join(f"{s.get('span_id','')}::{s.get('text','')}" for s in spans)
+        return self._sha256_text(joined)
+
+    def _build_per_file_task_input(
+        self, filename: str, fmt: str, spans: List[Dict[str, str]]
+    ) -> str:
+        parts = [
+            "TASK: PER_FILE_DIGEST",
+            f"FILE: {filename}",
+            f"FORMAT: {fmt}",
+            "SOURCE_SPANS:",
+        ]
+        for s in spans:
+            parts.append(f"[{s.get('span_id','S?')}] {s.get('text','')}")
+        parts.append("END_FILE")
+        return "\n".join(parts)
+
+    def _build_aggregate_task_input(
+        self, manifest: List[Dict[str, str]], file_digests: List[Dict[str, Any]]
+    ) -> str:
+        parts = ["TASK: AGGREGATE_DIGEST", "MANIFEST:"]
+        for m in manifest:
+            parts.append(f"- filename: {m.get('filename','')}")
+            parts.append(f"  format: {m.get('format','')}")
+        parts.append("FILE_DIGESTS:")
+        for d in file_digests:
+            parts.append(json.dumps(d, ensure_ascii=False))
+        parts.append("END_FILE_DIGESTS")
+        return "\n".join(parts)
+
+    def _digest_has_minimum_shape(self, digest: Dict[str, Any], mode: str) -> bool:
+        if not isinstance(digest, dict):
+            return False
+        if str(digest.get("schema_version", "")) != "context_digest.v1":
+            return False
+        if str(digest.get("mode", "")) != mode:
+            return False
+        if not isinstance(digest.get("summary", ""), str):
+            return False
+        facts = digest.get("facts", [])
+        if not isinstance(facts, list):
+            return False
+        for f in facts:
+            if not isinstance(f, dict):
+                return False
+            if not isinstance(f.get("claim", ""), str):
+                return False
+            src = f.get("sources", [])
+            if not isinstance(src, list) or not src:
+                return False
+        unc = digest.get("uncertainties", [])
+        if not isinstance(unc, list):
+            return False
+        return True
+
+    def _context_llm_json(self, user_prompt: str, stage: str, kind: str) -> Dict[str, Any]:
+        llm = LLM(model=self._context_preprocess_model)
+        return llm.json(
+            self._context_prompt_text(kind),
+            user_prompt,
+            stage=stage,
+            metadata={},
+        )
+
+    def _per_file_digest_cache_ref(self, session_id: str, file_id: str, digest_hash: str) -> str:
+        path = self._context_digests_dir / "per_file" / f"{session_id}_{file_id}_{digest_hash}.json"
+        return str(path)
+
+    def _aggregate_digest_ref(self, session_id: str, digest_hash: str) -> str:
+        path = self._context_digests_dir / "aggregate" / f"{session_id}_{digest_hash}.json"
+        return str(path)
+
+    def _write_json_file(self, path: Path, payload: Dict[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def _compute_file_digest(
+        self, session_id: str, file_entry: Dict[str, Any], file_bytes: bytes
+    ) -> tuple[Optional[Dict[str, Any]], str, str, str, str]:
+        filename = str(file_entry.get("filename", "") or "")
+        mime_type = str(file_entry.get("mime_type", "") or "text/plain")
+        extracted = self._extract_text(file_bytes, mime_type, filename)
+        extracted_hash = self._sha256_text(extracted)
+        spans = self._spans_from_text(extracted)
+        spans_hash = self._spans_hash(spans)
+        prompt_version = self._context_preprocess_prompt_version
+        unchanged = (
+            str(file_entry.get("extracted_text_hash", "")) == extracted_hash
+            and str(file_entry.get("chunking_version", "")) == self._context_chunking_version
+            and str(file_entry.get("prompt_version", "")) == prompt_version
+            and str(file_entry.get("digest_ref", ""))
+            and Path(str(file_entry.get("digest_ref", ""))).exists()
+            and str(file_entry.get("digest_status", "")) == "ready"
+        )
+        if unchanged:
+            digest = json.loads(Path(str(file_entry.get("digest_ref"))).read_text(encoding="utf-8"))
+            return digest, extracted_hash, spans_hash, prompt_version, "unchanged"
+        prompt = self._build_per_file_task_input(filename, mime_type or "text/plain", spans)
+        digest = self._context_llm_json(
+            prompt, stage="context_preprocess_file", kind="per_file"
+        )
+        if not self._digest_has_minimum_shape(digest, "single"):
+            raise ValueError("Context per-file digest shape validation failed.")
+        digest_hash = self._sha256_json(digest)
+        ref = self._per_file_digest_cache_ref(session_id, str(file_entry.get("file_id", "")), digest_hash)
+        self._write_json_file(Path(ref), digest)
+        file_entry["digest_hash"] = digest_hash
+        file_entry["digest_ref"] = ref
+        file_entry["digest_status"] = "ready"
+        file_entry["error"] = ""
+        return digest, extracted_hash, spans_hash, prompt_version, "changed"
+
+    def _compute_aggregate_digest(
+        self, session_id: str, context_set: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        files = [f for f in context_set.get("files", []) if isinstance(f, dict)]
+        ready_files = [
+            f
+            for f in files
+            if str(f.get("digest_status", "")).strip().lower() == "ready"
+            and str(f.get("digest_ref", "")).strip()
+        ]
+        if not ready_files:
+            digest: Dict[str, Any] = {
+                "schema_version": "context_digest.v1",
+                "mode": "batch",
+                "document": {"filename": "__BATCH__", "format": "mixed"},
+                "batch": {"files": []},
+                "summary": "",
+                "facts": [],
+                "uncertainties": [],
+            }
+            d_hash = self._sha256_json(digest)
+            ref = self._aggregate_digest_ref(session_id, d_hash)
+            self._write_json_file(Path(ref), digest)
+            context_set["aggregate_digest_hash"] = d_hash
+            context_set["aggregate_digest_ref"] = ref
+            context_set["aggregate_digest_status"] = "ready"
+            context_set["aggregate_error"] = ""
+            return digest
+
+        manifest: List[Dict[str, str]] = []
+        file_digests: List[Dict[str, Any]] = []
+        for f in ready_files:
+            digest_ref = str(f.get("digest_ref", "") or "")
+            if not digest_ref or not Path(digest_ref).exists():
+                return None
+            digest = json.loads(Path(digest_ref).read_text(encoding="utf-8"))
+            file_digests.append(digest)
+            manifest.append(
+                {
+                    "filename": str(f.get("filename", "")),
+                    "format": str(f.get("mime_type", "") or "text/plain"),
+                }
+            )
+        # For a single file, avoid an extra aggregate LLM call; reuse the
+        # per-file digest content and wrap it into batch schema deterministically.
+        if len(file_digests) == 1:
+            single = file_digests[0] if isinstance(file_digests[0], dict) else {}
+            digest: Dict[str, Any] = {
+                "schema_version": "context_digest.v1",
+                "mode": "batch",
+                "document": {"filename": "__BATCH__", "format": "mixed"},
+                "batch": {"files": manifest},
+                "summary": str(single.get("summary", "") or ""),
+                "facts": single.get("facts", []) if isinstance(single.get("facts", []), list) else [],
+                "uncertainties": single.get("uncertainties", [])
+                if isinstance(single.get("uncertainties", []), list)
+                else [],
+                "conflicts": single.get("conflicts", [])
+                if isinstance(single.get("conflicts", []), list)
+                else [],
+                "index": single.get("index", {})
+                if isinstance(single.get("index", {}), dict)
+                else {},
+            }
+            d_hash = self._sha256_json(digest)
+            ref = self._aggregate_digest_ref(session_id, d_hash)
+            self._write_json_file(Path(ref), digest)
+            context_set["aggregate_digest_hash"] = d_hash
+            context_set["aggregate_digest_ref"] = ref
+            context_set["aggregate_digest_status"] = "ready"
+            context_set["aggregate_error"] = ""
+            return digest
+        prompt = self._build_aggregate_task_input(manifest, file_digests)
+        digest = self._context_llm_json(
+            prompt, stage="context_preprocess_aggregate", kind="aggregate"
+        )
+        if not self._digest_has_minimum_shape(digest, "batch"):
+            raise ValueError("Context aggregate digest shape validation failed.")
+        d_hash = self._sha256_json(digest)
+        ref = self._aggregate_digest_ref(session_id, d_hash)
+        self._write_json_file(Path(ref), digest)
+        context_set["aggregate_digest_hash"] = d_hash
+        context_set["aggregate_digest_ref"] = ref
+        context_set["aggregate_digest_status"] = "ready"
+        context_set["aggregate_error"] = ""
+        return digest
+
+    def _session_exists_session_locked(self, session_id: str) -> bool:
+        state = self._ensure_run_loaded_session_locked(session_id)
+        return state is not None
+
+    def subscribe_context(self, session_id: str) -> Optional[Queue]:
+        session_lock = self._session_lock_for(session_id)
+        with session_lock:
+            if not self._session_exists_session_locked(session_id):
+                return None
+            with self._lock:
+                q: Queue = Queue()
+                self._context_subscribers.setdefault(session_id, []).append(q)
+                return q
+
+    def unsubscribe_context(self, session_id: str, queue: Queue) -> None:
+        session_lock = self._session_lock_for(session_id)
+        with session_lock:
+            if not self._session_exists_session_locked(session_id):
+                return
+            with self._lock:
+                subs = self._context_subscribers.get(session_id, [])
+                if queue in subs:
+                    subs.remove(queue)
+
+    def _publish_context_event(self, session_id: str, event_type: str, payload: Dict[str, Any]) -> None:
+        subscribers: List[Queue] = []
+        with self._lock:
+            subscribers = list(self._context_subscribers.get(session_id, []))
+        event = {
+            "run_id": session_id,
+            "timestamp": _now().isoformat(),
+            "event_type": event_type,
+            "payload": payload,
+        }
+        for q in subscribers:
+            try:
+                q.put(event)
+            except Exception:
+                pass
+
+    def get_context_set(self, session_id: str) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                return None
+            context_set = self._load_context_set_locked(sid)
+            return copy.deepcopy(context_set)
+
+    def get_context_file(self, session_id: str, file_id: str) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not sid or not fid:
+            return None
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                return None
+            context_set = self._load_context_set_locked(sid)
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    p = str(f.get("path", "") or "")
+                    return {
+                        "file": copy.deepcopy(f),
+                        "download_url": f"/api/sessions/{sid}/context/files/{fid}/download",
+                    }
+        return None
+
+    def get_context_file_bytes(self, session_id: str, file_id: str) -> Optional[tuple[bytes, str, str]]:
+        sid = str(session_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not sid or not fid:
+            return None
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                return None
+            context_set = self._load_context_set_locked(sid)
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    p = str(f.get("path", "") or "")
+                    if not p or not Path(p).exists():
+                        return None
+                    filename = str(f.get("filename", "") or f"{fid}.txt")
+                    mime_type = str(f.get("mime_type", "") or "application/octet-stream")
+                    return Path(p).read_bytes(), filename, mime_type
+        return None
+
+    def get_context_file_digest(self, session_id: str, file_id: str) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not sid or not fid:
+            return None
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                return None
+            context_set = self._load_context_set_locked(sid)
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    ref = str(f.get("digest_ref", "") or "")
+                    if ref and Path(ref).exists():
+                        return json.loads(Path(ref).read_text(encoding="utf-8"))
+                    return None
+        return None
+
+    def get_context_aggregate_digest(self, session_id: str) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                return None
+            context_set = self._load_context_set_locked(sid)
+            ref = str(context_set.get("aggregate_digest_ref", "") or "")
+            if not ref or not Path(ref).exists():
+                return None
+            return json.loads(Path(ref).read_text(encoding="utf-8"))
+
+    def _run_context_recompute_locked(
+        self, session_id: str, context_set: Dict[str, Any], force_aggregate: bool
+    ) -> Dict[str, int]:
+        diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0}
+        files = [f for f in context_set.get("files", []) if isinstance(f, dict)]
+        had_file_error = False
+        ready_files = 0
+        for f in files:
+            p = str(f.get("path", "") or "")
+            if not p or not Path(p).exists():
+                f["digest_status"] = "error"
+                f["error"] = "File missing on disk."
+                f["digest_ref"] = ""
+                f["digest_hash"] = ""
+                had_file_error = True
+                continue
+            try:
+                b = Path(p).read_bytes()
+                digest, extracted_hash, spans_hash, prompt_version, state = self._compute_file_digest(
+                    session_id, f, b
+                )
+                f["content_hash"] = self._sha256_bytes(b)
+                f["extracted_text_hash"] = extracted_hash
+                f["chunking_version"] = self._context_chunking_version
+                f["spans_hash"] = spans_hash
+                f["prompt_version"] = prompt_version
+                if state == "unchanged":
+                    diff["unchanged"] += 1
+                    f["digest_status"] = "ready"
+                    ready_files += 1
+                else:
+                    if str(f.get("digest_hash", "")):
+                        diff["changed"] += 1
+                    else:
+                        diff["new"] += 1
+                    ready_files += 1
+            except Exception as exc:
+                f["digest_status"] = "error"
+                f["error"] = str(exc)
+                f["digest_ref"] = ""
+                f["digest_hash"] = ""
+                had_file_error = True
+        if self._context_preprocess_enabled:
+            try:
+                if force_aggregate or diff["changed"] > 0 or diff["new"] > 0 or diff["deleted"] > 0:
+                    context_set["aggregate_digest_status"] = "parsing"
+                    self._compute_aggregate_digest(session_id, context_set)
+                if had_file_error:
+                    if ready_files > 0:
+                        context_set["aggregate_error"] = (
+                            "One or more files failed preprocessing; aggregate built from successfully parsed files."
+                        )
+                    else:
+                        context_set["aggregate_digest_status"] = "error"
+                        context_set["aggregate_error"] = "All files failed preprocessing."
+            except Exception as exc:
+                context_set["aggregate_digest_status"] = "error"
+                context_set["aggregate_error"] = str(exc)
+        else:
+            context_set["aggregate_digest_status"] = "stale"
+            context_set["aggregate_error"] = "Context preprocessing disabled."
+        return diff
+
+    def upload_context_files(
+        self,
+        session_id: str,
+        uploads: List[Dict[str, Any]],
+        expected_revision: Optional[int],
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        scope = f"context_upload:{sid}"
+        idem = self.idempotency_begin(
+            scope,
+            idempotency_key,
+            {
+                "count": len(uploads),
+                "expected_revision": expected_revision,
+                "files": [
+                    {
+                        "filename": str(u.get("filename", "")),
+                        "size_bytes": int(u.get("size_bytes", 0) or 0),
+                    }
+                    for u in uploads
+                ],
+            },
+            ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC,
+        )
+        idem_state = str(idem.get("state", "new"))
+        if idem_state == "replay":
+            payload = idem.get("payload")
+            return payload if isinstance(payload, dict) else None
+        if idem_state in {"in_progress", "mismatch"}:
+            return {
+                "error": "Context upload request conflict.",
+                "error_code": "busy",
+            }
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            context_set = self._load_context_set_locked(sid)
+            cur_rev = int(context_set.get("revision", 1) or 1)
+            if expected_revision is not None and int(expected_revision) != cur_rev:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return {
+                    "error": "Context revision conflict. Refresh context and retry.",
+                    "error_code": "conflict_revision",
+                    "current_revision": cur_rev,
+                }
+            diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0}
+            existing_files = [
+                f for f in context_set.get("files", []) if isinstance(f, dict)
+            ]
+            for u in uploads:
+                data = u.get("bytes", b"")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                filename = str(u.get("filename", "") or "context.txt").strip() or "context.txt"
+                mime_type = str(u.get("content_type", "") or "").strip()
+                if not mime_type:
+                    mime_type = mimetypes.guess_type(filename)[0] or "text/plain"
+                content_hash = self._sha256_bytes(bytes(data))
+                duplicate = next(
+                    (
+                        f
+                        for f in existing_files
+                        if str(f.get("filename", "") or "") == filename
+                        and str(f.get("content_hash", "") or "") == content_hash
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    diff["unchanged"] += 1
+                    continue
+                file_id = str(uuid.uuid4())
+                path = self._context_file_path(sid, file_id, filename)
+                Path(path).write_bytes(bytes(data))
+                context_set.setdefault("files", []).append(
+                    {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "size_bytes": len(data),
+                        "uploaded_at": _now().isoformat(),
+                        "content_hash": content_hash,
+                        "extracted_text_hash": "",
+                        "chunking_version": "",
+                        "spans_hash": "",
+                        "prompt_version": "",
+                        "digest_status": "stale",
+                        "digest_hash": "",
+                        "digest_ref": "",
+                        "error": "",
+                        "path": str(path),
+                    }
+                )
+                existing_files.append(context_set["files"][-1])
+                diff["new"] += 1
+            context_set["aggregate_digest_status"] = "stale"
+            recompute_diff = self._run_context_recompute_locked(sid, context_set, force_aggregate=True)
+            diff["changed"] += recompute_diff["changed"]
+            diff["unchanged"] += recompute_diff["unchanged"]
+            context_set["revision"] = cur_rev + 1
+            context_set["updated_at"] = _now().isoformat()
+            context_set["last_diff"] = diff
+            self._save_context_set_locked(context_set)
+        self._publish_context_event(sid, "context_updated", {"revision": context_set["revision"], "diff": diff})
+        out = {"context_set": context_set, "diff": diff}
+        self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
+        return out
+
+    def replace_context_file(
+        self,
+        session_id: str,
+        file_id: str,
+        upload: Dict[str, Any],
+        expected_revision: Optional[int],
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not sid or not fid:
+            return None
+        scope = f"context_replace:{sid}:{fid}"
+        idem = self.idempotency_begin(
+            scope,
+            idempotency_key,
+            {
+                "filename": str(upload.get("filename", "")),
+                "size_bytes": int(upload.get("size_bytes", 0) or 0),
+                "expected_revision": expected_revision,
+            },
+            ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC,
+        )
+        idem_state = str(idem.get("state", "new"))
+        if idem_state == "replay":
+            payload = idem.get("payload")
+            return payload if isinstance(payload, dict) else None
+        if idem_state in {"in_progress", "mismatch"}:
+            return {"error": "Context replace request conflict.", "error_code": "busy"}
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            context_set = self._load_context_set_locked(sid)
+            cur_rev = int(context_set.get("revision", 1) or 1)
+            if expected_revision is not None and int(expected_revision) != cur_rev:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return {
+                    "error": "Context revision conflict. Refresh context and retry.",
+                    "error_code": "conflict_revision",
+                    "current_revision": cur_rev,
+                }
+            target = None
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    target = f
+                    break
+            if target is None:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            data = upload.get("bytes", b"")
+            if not isinstance(data, (bytes, bytearray)):
+                data = b""
+            filename = str(upload.get("filename", target.get("filename", "context.txt")) or target.get("filename", "context.txt"))
+            mime_type = str(upload.get("content_type", target.get("mime_type", "")) or target.get("mime_type", "")) or (mimetypes.guess_type(filename)[0] or "text/plain")
+            new_hash = self._sha256_bytes(bytes(data))
+            diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0}
+            if str(target.get("content_hash", "")) == new_hash:
+                diff["unchanged"] = 1
+            path = self._context_file_path(sid, fid, filename)
+            Path(path).write_bytes(bytes(data))
+            target.update(
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size_bytes": len(data),
+                    "uploaded_at": _now().isoformat(),
+                    "content_hash": new_hash,
+                    "digest_status": "stale",
+                    "error": "",
+                    "path": str(path),
+                }
+            )
+            if diff["unchanged"] == 0:
+                diff["changed"] = 1
+            context_set["aggregate_digest_status"] = "stale"
+            recompute_diff = self._run_context_recompute_locked(sid, context_set, force_aggregate=True)
+            diff["changed"] += recompute_diff["changed"]
+            diff["unchanged"] += recompute_diff["unchanged"]
+            context_set["revision"] = cur_rev + 1
+            context_set["updated_at"] = _now().isoformat()
+            context_set["last_diff"] = diff
+            self._save_context_set_locked(context_set)
+        self._publish_context_event(sid, "context_updated", {"revision": context_set["revision"], "diff": diff})
+        out = {"context_set": context_set, "diff": diff}
+        self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
+        return out
+
+    def delete_context_file(
+        self,
+        session_id: str,
+        file_id: str,
+        expected_revision: Optional[int],
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        sid = str(session_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not sid or not fid:
+            return None
+        scope = f"context_delete:{sid}:{fid}"
+        idem = self.idempotency_begin(
+            scope,
+            idempotency_key,
+            {"expected_revision": expected_revision},
+            ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC,
+        )
+        idem_state = str(idem.get("state", "new"))
+        if idem_state == "replay":
+            payload = idem.get("payload")
+            return payload if isinstance(payload, dict) else None
+        if idem_state in {"in_progress", "mismatch"}:
+            return {"error": "Context delete request conflict.", "error_code": "busy"}
+        session_lock = self._session_lock_for(sid)
+        with session_lock:
+            if not self._session_exists_session_locked(sid):
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            context_set = self._load_context_set_locked(sid)
+            cur_rev = int(context_set.get("revision", 1) or 1)
+            if expected_revision is not None and int(expected_revision) != cur_rev:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return {
+                    "error": "Context revision conflict. Refresh context and retry.",
+                    "error_code": "conflict_revision",
+                    "current_revision": cur_rev,
+                }
+            files = [f for f in context_set.get("files", []) if isinstance(f, dict)]
+            kept: List[Dict[str, Any]] = []
+            removed = None
+            for f in files:
+                if str(f.get("file_id", "")) == fid:
+                    removed = f
+                    continue
+                kept.append(f)
+            if removed is None:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 1}
+            p = str(removed.get("path", "") or "")
+            if p and Path(p).exists():
+                try:
+                    Path(p).unlink()
+                except Exception:
+                    pass
+            context_set["files"] = kept
+            context_set["aggregate_digest_status"] = "stale"
+            self._run_context_recompute_locked(sid, context_set, force_aggregate=True)
+            context_set["revision"] = cur_rev + 1
+            context_set["updated_at"] = _now().isoformat()
+            context_set["last_diff"] = diff
+            self._save_context_set_locked(context_set)
+        self._publish_context_event(sid, "context_updated", {"revision": context_set["revision"], "diff": diff})
+        out = {"context_set": context_set, "diff": diff}
+        self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
+        return out
+
+    # Workspace-staged context (pre-run, not bound to a session until start).
+    def get_workspace_context_set(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        if not wid:
+            return None
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            return copy.deepcopy(context_set)
+
+    def get_workspace_context_file(self, workspace_id: str, file_id: str) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    return {
+                        "file": copy.deepcopy(f),
+                        "download_url": f"/api/workspaces/{wid}/context/files/{fid}/download",
+                    }
+        return None
+
+    def get_workspace_context_file_bytes(
+        self, workspace_id: str, file_id: str
+    ) -> Optional[tuple[bytes, str, str]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    p = str(f.get("path", "") or "")
+                    if not p or not Path(p).exists():
+                        return None
+                    filename = str(f.get("filename", "") or f"{fid}.txt")
+                    mime_type = str(f.get("mime_type", "") or "application/octet-stream")
+                    return Path(p).read_bytes(), filename, mime_type
+        return None
+
+    def get_workspace_context_file_digest(
+        self, workspace_id: str, file_id: str
+    ) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    ref = str(f.get("digest_ref", "") or "")
+                    if ref and Path(ref).exists():
+                        return json.loads(Path(ref).read_text(encoding="utf-8"))
+                    return None
+        return None
+
+    def get_workspace_context_aggregate_digest(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        if not wid:
+            return None
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            ref = str(context_set.get("aggregate_digest_ref", "") or "")
+            if not ref or not Path(ref).exists():
+                return None
+            return json.loads(Path(ref).read_text(encoding="utf-8"))
+
+    def upload_workspace_context_files(
+        self,
+        workspace_id: str,
+        uploads: List[Dict[str, Any]],
+        expected_revision: Optional[int],
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        if not wid:
+            return None
+        scope = f"context_upload_ws:{wid}"
+        idem = self.idempotency_begin(
+            scope,
+            idempotency_key,
+            {
+                "count": len(uploads),
+                "expected_revision": expected_revision,
+                "files": [
+                    {
+                        "filename": str(u.get("filename", "")),
+                        "size_bytes": int(u.get("size_bytes", 0) or 0),
+                    }
+                    for u in uploads
+                ],
+            },
+            ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC,
+        )
+        idem_state = str(idem.get("state", "new"))
+        if idem_state == "replay":
+            payload = idem.get("payload")
+            return payload if isinstance(payload, dict) else None
+        if idem_state in {"in_progress", "mismatch"}:
+            return {"error": "Context upload request conflict.", "error_code": "busy"}
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            cur_rev = int(context_set.get("revision", 1) or 1)
+            if expected_revision is not None and int(expected_revision) != cur_rev:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return {
+                    "error": "Context revision conflict. Refresh context and retry.",
+                    "error_code": "conflict_revision",
+                    "current_revision": cur_rev,
+                }
+            diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0}
+            existing_files = [f for f in context_set.get("files", []) if isinstance(f, dict)]
+            for u in uploads:
+                data = u.get("bytes", b"")
+                if not isinstance(data, (bytes, bytearray)):
+                    continue
+                filename = str(u.get("filename", "") or "context.txt").strip() or "context.txt"
+                mime_type = str(u.get("content_type", "") or "").strip()
+                if not mime_type:
+                    mime_type = mimetypes.guess_type(filename)[0] or "text/plain"
+                content_hash = self._sha256_bytes(bytes(data))
+                duplicate = next(
+                    (
+                        f
+                        for f in existing_files
+                        if str(f.get("filename", "") or "") == filename
+                        and str(f.get("content_hash", "") or "") == content_hash
+                    ),
+                    None,
+                )
+                if duplicate is not None:
+                    diff["unchanged"] += 1
+                    continue
+                file_id = str(uuid.uuid4())
+                path = self._context_file_path_for_key(ctx_key, file_id, filename)
+                Path(path).write_bytes(bytes(data))
+                context_set.setdefault("files", []).append(
+                    {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "size_bytes": len(data),
+                        "uploaded_at": _now().isoformat(),
+                        "content_hash": content_hash,
+                        "extracted_text_hash": "",
+                        "chunking_version": "",
+                        "spans_hash": "",
+                        "prompt_version": "",
+                        "digest_status": "stale",
+                        "digest_hash": "",
+                        "digest_ref": "",
+                        "error": "",
+                        "path": str(path),
+                    }
+                )
+                existing_files.append(context_set["files"][-1])
+                diff["new"] += 1
+            context_set["aggregate_digest_status"] = "stale"
+            recompute_diff = self._run_context_recompute_locked(ctx_key, context_set, force_aggregate=True)
+            diff["changed"] += recompute_diff["changed"]
+            diff["unchanged"] += recompute_diff["unchanged"]
+            context_set["revision"] = cur_rev + 1
+            context_set["updated_at"] = _now().isoformat()
+            context_set["last_diff"] = diff
+            self._save_context_set_for_key_locked(ctx_key, context_set)
+        out = {"context_set": context_set, "diff": diff}
+        self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
+        return out
+
+    def replace_workspace_context_file(
+        self,
+        workspace_id: str,
+        file_id: str,
+        upload: Dict[str, Any],
+        expected_revision: Optional[int],
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        scope = f"context_replace_ws:{wid}:{fid}"
+        idem = self.idempotency_begin(
+            scope,
+            idempotency_key,
+            {
+                "filename": str(upload.get("filename", "")),
+                "size_bytes": int(upload.get("size_bytes", 0) or 0),
+                "expected_revision": expected_revision,
+            },
+            ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC,
+        )
+        idem_state = str(idem.get("state", "new"))
+        if idem_state == "replay":
+            payload = idem.get("payload")
+            return payload if isinstance(payload, dict) else None
+        if idem_state in {"in_progress", "mismatch"}:
+            return {"error": "Context replace request conflict.", "error_code": "busy"}
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            cur_rev = int(context_set.get("revision", 1) or 1)
+            if expected_revision is not None and int(expected_revision) != cur_rev:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return {
+                    "error": "Context revision conflict. Refresh context and retry.",
+                    "error_code": "conflict_revision",
+                    "current_revision": cur_rev,
+                }
+            target = None
+            for f in context_set.get("files", []):
+                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                    target = f
+                    break
+            if target is None:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            data = upload.get("bytes", b"")
+            if not isinstance(data, (bytes, bytearray)):
+                data = b""
+            filename = str(upload.get("filename", target.get("filename", "context.txt")) or target.get("filename", "context.txt"))
+            mime_type = str(upload.get("content_type", target.get("mime_type", "")) or target.get("mime_type", "")) or (mimetypes.guess_type(filename)[0] or "text/plain")
+            new_hash = self._sha256_bytes(bytes(data))
+            diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 0}
+            if str(target.get("content_hash", "")) == new_hash:
+                diff["unchanged"] = 1
+            path = self._context_file_path_for_key(ctx_key, fid, filename)
+            Path(path).write_bytes(bytes(data))
+            target.update(
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "size_bytes": len(data),
+                    "uploaded_at": _now().isoformat(),
+                    "content_hash": new_hash,
+                    "digest_status": "stale",
+                    "error": "",
+                    "path": str(path),
+                }
+            )
+            if diff["unchanged"] == 0:
+                diff["changed"] = 1
+            context_set["aggregate_digest_status"] = "stale"
+            recompute_diff = self._run_context_recompute_locked(ctx_key, context_set, force_aggregate=True)
+            diff["changed"] += recompute_diff["changed"]
+            diff["unchanged"] += recompute_diff["unchanged"]
+            context_set["revision"] = cur_rev + 1
+            context_set["updated_at"] = _now().isoformat()
+            context_set["last_diff"] = diff
+            self._save_context_set_for_key_locked(ctx_key, context_set)
+        out = {"context_set": context_set, "diff": diff}
+        self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
+        return out
+
+    def delete_workspace_context_file(
+        self,
+        workspace_id: str,
+        file_id: str,
+        expected_revision: Optional[int],
+        idempotency_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        scope = f"context_delete_ws:{wid}:{fid}"
+        idem = self.idempotency_begin(
+            scope,
+            idempotency_key,
+            {"expected_revision": expected_revision},
+            ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC,
+        )
+        idem_state = str(idem.get("state", "new"))
+        if idem_state == "replay":
+            payload = idem.get("payload")
+            return payload if isinstance(payload, dict) else None
+        if idem_state in {"in_progress", "mismatch"}:
+            return {"error": "Context delete request conflict.", "error_code": "busy"}
+        ctx_key = self._workspace_context_key(wid)
+        session_lock = self._session_lock_for(ctx_key)
+        with session_lock:
+            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            cur_rev = int(context_set.get("revision", 1) or 1)
+            if expected_revision is not None and int(expected_revision) != cur_rev:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return {
+                    "error": "Context revision conflict. Refresh context and retry.",
+                    "error_code": "conflict_revision",
+                    "current_revision": cur_rev,
+                }
+            files = [f for f in context_set.get("files", []) if isinstance(f, dict)]
+            kept: List[Dict[str, Any]] = []
+            removed = None
+            for f in files:
+                if str(f.get("file_id", "")) == fid:
+                    removed = f
+                    continue
+                kept.append(f)
+            if removed is None:
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            diff = {"new": 0, "changed": 0, "unchanged": 0, "deleted": 1}
+            p = str(removed.get("path", "") or "")
+            if p and Path(p).exists():
+                try:
+                    Path(p).unlink()
+                except Exception:
+                    pass
+            context_set["files"] = kept
+            context_set["aggregate_digest_status"] = "stale"
+            self._run_context_recompute_locked(ctx_key, context_set, force_aggregate=True)
+            context_set["revision"] = cur_rev + 1
+            context_set["updated_at"] = _now().isoformat()
+            context_set["last_diff"] = diff
+            self._save_context_set_for_key_locked(ctx_key, context_set)
+        out = {"context_set": context_set, "diff": diff}
+        self.idempotency_complete(scope, idempotency_key, out, ttl_sec=self._IDEMPOTENCY_TTL_REPORT_SEC)
+        return out
+
+    def bind_workspace_context_to_session(self, workspace_id: str, session_id: str) -> bool:
+        wid = str(workspace_id or "").strip()
+        sid = str(session_id or "").strip()
+        if not wid or not sid:
+            return False
+        ws_key = self._workspace_context_key(wid)
+        ws_lock = self._session_lock_for(ws_key)
+        s_lock = self._session_lock_for(sid)
+        # Acquire in deterministic order to avoid deadlocks.
+        first, second = (ws_lock, s_lock) if ws_key <= sid else (s_lock, ws_lock)
+        with first:
+            with second:
+                src = self._load_context_set_for_key_locked(ws_key, "workspace", wid)
+                dst = self._context_default_set_for_key(sid, "session", sid)
+                src_files = [f for f in src.get("files", []) if isinstance(f, dict)]
+                for f in src_files:
+                    old_path = str(f.get("path", "") or "")
+                    if not old_path or not Path(old_path).exists():
+                        continue
+                    data = Path(old_path).read_bytes()
+                    file_id = str(f.get("file_id", "") or str(uuid.uuid4()))
+                    filename = str(f.get("filename", "") or f"{file_id}.txt")
+                    mime_type = str(f.get("mime_type", "") or "text/plain")
+                    new_path = self._context_file_path_for_key(sid, file_id, filename)
+                    Path(new_path).write_bytes(data)
+                    dst.setdefault("files", []).append(
+                        {
+                            "file_id": file_id,
+                            "filename": filename,
+                            "mime_type": mime_type,
+                            "size_bytes": int(f.get("size_bytes", len(data)) or len(data)),
+                            "uploaded_at": str(f.get("uploaded_at", _now().isoformat())),
+                            "content_hash": self._sha256_bytes(data),
+                            "extracted_text_hash": "",
+                            "chunking_version": "",
+                            "spans_hash": "",
+                            "prompt_version": "",
+                            "digest_status": "stale",
+                            "digest_hash": "",
+                            "digest_ref": "",
+                            "error": "",
+                            "path": str(new_path),
+                        }
+                    )
+                dst["aggregate_digest_status"] = "stale"
+                self._run_context_recompute_locked(sid, dst, force_aggregate=True)
+                dst["revision"] = 1
+                dst["updated_at"] = _now().isoformat()
+                self._save_context_set_for_key_locked(sid, dst)
+                return True

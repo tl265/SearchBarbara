@@ -13,6 +13,13 @@ const errorBanner = document.getElementById("errorBanner");
 const sessionListEl = document.getElementById("sessionList");
 const newSessionBtn = document.getElementById("newSessionBtn");
 const refreshSessionsBtn = document.getElementById("refreshSessionsBtn");
+const contextMetaEl = document.getElementById("contextMeta");
+const contextUploadInput = document.getElementById("contextUploadInput");
+const contextUploadBtn = document.getElementById("contextUploadBtn");
+const contextDiffBannerEl = document.getElementById("contextDiffBanner");
+const contextFilesEl = document.getElementById("contextFiles");
+const contextAggregateDigestEl = document.getElementById("contextAggregateDigest");
+const contextFileDigestEl = document.getElementById("contextFileDigest");
 
 const runStatusEl = document.getElementById("runStatus");
 const researchStatusEl = document.getElementById("researchStatus");
@@ -53,6 +60,7 @@ const SESSION_SYNC_TAB_ID = (() => {
 })();
 
 let currentRunId = null;
+let currentWorkspaceId = "";
 let currentSnapshot = null;
 let es = null;
 let activeSessionSwitchToken = 0;
@@ -90,6 +98,14 @@ const MAX_NODE_FONT_SCALE = 1.25;
 const AUTO_FIT_SAFETY_PX = Math.max(0, Math.floor(Number(APP_CONFIG.auto_fit_safety_px ?? 10)));
 const UI_DEBUG = !!APP_CONFIG.ui_debug;
 let lastDebugReportPhaseKey = "";
+let contextEs = null;
+let currentContextSet = null;
+let selectedContextFileId = "";
+let contextLoading = false;
+let contextMutationInFlight = false;
+let pendingUploadFiles = [];
+let contextInputLocked = false;
+let errorBannerTimer = null;
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
 }
@@ -132,7 +148,12 @@ function resetWorkspaceForNewSession() {
     es.close();
     es = null;
   }
+  if (contextEs) {
+    contextEs.close();
+    contextEs = null;
+  }
   currentRunId = null;
+  currentWorkspaceId = ensureWorkspaceId();
   currentSnapshot = null;
   abortRequested = false;
   reportGeneratingRunIds.clear();
@@ -158,6 +179,8 @@ function resetWorkspaceForNewSession() {
   resultsPerQueryEl.value = String(DEFAULT_RESULTS_PER_QUERY);
   setTaskBoxLocked(false);
   setRunConfigLocked(false);
+  setContextEnabled(true);
+  clearContextPane("No context files uploaded.");
   setRunIdInUrl("");
   renderCanvas(null);
   showError("");
@@ -180,9 +203,39 @@ function resetWorkspaceForNewSession() {
   currentSnapshot = null;
 }
 
+function isDraftSnapshot(snap) {
+  const tree = snap && typeof snap.tree === "object" ? snap.tree : {};
+  return !!tree.is_draft;
+}
+
 function isReportGeneratingForRun(runId) {
   const rid = String(runId || "").trim();
   return !!rid && reportGeneratingRunIds.has(rid);
+}
+
+function newWorkspaceId() {
+  try {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return `ws_${window.crypto.randomUUID()}`;
+    }
+  } catch (_err) {
+    // no-op
+  }
+  return `ws_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function ensureWorkspaceId() {
+  const ws = String(currentWorkspaceId || "").trim();
+  if (ws) return ws;
+  currentWorkspaceId = newWorkspaceId();
+  return currentWorkspaceId;
+}
+
+function contextBasePath() {
+  const sid = String(currentRunId || "").trim();
+  if (sid) return `/api/sessions/${encodeURIComponent(sid)}/context`;
+  const wid = ensureWorkspaceId();
+  return `/api/workspaces/${encodeURIComponent(wid)}/context`;
 }
 
 function currentExpectedVersion() {
@@ -199,6 +252,8 @@ function readRunIdFromUrl() {
 function setTaskBoxLocked(locked) {
   taskEl.disabled = !!locked;
   taskEl.classList.toggle("locked", !!locked);
+  contextInputLocked = !!locked;
+  refreshContextUploadButtonState();
 }
 
 function setRunConfigLocked(locked) {
@@ -216,6 +271,10 @@ function fmtTime(iso) {
 }
 
 function showError(msg) {
+  if (errorBannerTimer) {
+    clearTimeout(errorBannerTimer);
+    errorBannerTimer = null;
+  }
   if (!msg) {
     errorBanner.classList.add("hidden");
     errorBanner.textContent = "";
@@ -223,6 +282,15 @@ function showError(msg) {
   }
   errorBanner.textContent = msg;
   errorBanner.classList.remove("hidden");
+}
+
+function showTransientError(msg, ms = 2000) {
+  showError(msg);
+  errorBannerTimer = setTimeout(() => {
+    if (errorBanner.textContent === String(msg || "")) {
+      showError("");
+    }
+  }, Math.max(200, Number(ms) || 2000));
 }
 
 async function responseDetail(rsp, fallback) {
@@ -244,6 +312,218 @@ async function responseDetail(rsp, fallback) {
     // no-op
   }
   return detail;
+}
+
+function contextStateClass(v) {
+  const s = String(v || "").toLowerCase();
+  if (s === "ready" || s === "completed" || s === "partial_ready") return "ready";
+  if (s === "running" || s === "parsing" || s === "generating") return "parsing";
+  if (s === "error" || s === "failed") return "error";
+  return "stale";
+}
+
+function contextStatusLabel(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "stale";
+  return s.replaceAll("_", " ");
+}
+
+function fileSizeLabel(n) {
+  const bytes = Number(n || 0);
+  if (!Number.isFinite(bytes) || bytes < 0) return "-";
+  if (bytes < 1024) return `${Math.floor(bytes)} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function setContextEnabled(enabled) {
+  void enabled;
+}
+
+function clearContextPane(msg = "No context files uploaded.") {
+  currentContextSet = null;
+  selectedContextFileId = "";
+  contextMetaEl.textContent = msg;
+  contextDiffBannerEl.textContent = "";
+  contextFilesEl.innerHTML = `<div class="muted">No files.</div>`;
+  contextAggregateDigestEl.textContent = "";
+  if (contextFileDigestEl) {
+    contextFileDigestEl.textContent = "";
+  }
+}
+
+function setContextBusy(busy) {
+  const on = !!busy;
+  contextMutationInFlight = on;
+  refreshContextUploadButtonState();
+}
+
+function refreshContextUploadButtonState() {
+  if (!contextUploadBtn) return;
+  const hasFiles = !!(contextUploadInput && contextUploadInput.files && contextUploadInput.files.length);
+  const disabled = !!contextInputLocked || !!contextMutationInFlight;
+  contextUploadBtn.disabled = disabled || !hasFiles;
+  contextUploadBtn.textContent = contextMutationInFlight ? "Uploading..." : "Upload Files";
+  if (contextUploadInput) {
+    contextUploadInput.disabled = disabled;
+  }
+}
+
+function renderContextPane() {
+  const set = currentContextSet;
+  if (!set || typeof set !== "object") {
+    clearContextPane();
+    return;
+  }
+  const rev = Number(set.revision || 1);
+  const files = Array.isArray(set.files) ? set.files : [];
+  const dedupFiles = [];
+  const seenFileKeys = new Set();
+  for (const f of files) {
+    if (!f || typeof f !== "object") continue;
+    const key = `${String(f.filename || "").trim().toLowerCase()}::${String(f.content_hash || "").trim()}`;
+    if (seenFileKeys.has(key)) continue;
+    seenFileKeys.add(key);
+    dedupFiles.push(f);
+  }
+  const aggStatus = contextStatusLabel(set.aggregate_digest_status || "stale");
+  contextMetaEl.textContent = `Revision ${rev} · Aggregate ${aggStatus}`;
+  contextDiffBannerEl.textContent = "";
+
+  const pendingRows = Array.isArray(pendingUploadFiles) ? pendingUploadFiles : [];
+  if (!dedupFiles.length && !pendingRows.length) {
+    contextFilesEl.innerHTML = `<div class="muted">No files uploaded.</div>`;
+  } else {
+    const existingHtml = dedupFiles.map((f) => {
+      const fid = String(f.file_id || "");
+      const status = contextStatusLabel(f.digest_status || "stale");
+      const chipClass = contextStateClass(status);
+      return `<div class="context-file-row" data-file-id="${esc(fid)}">
+        <div class="context-file-main">
+          <div class="context-file-name">${esc(f.filename || fid)}</div>
+          <span class="context-chip ${esc(chipClass)}">${esc(status)}</span>
+        </div>
+        <div class="context-file-meta">${esc(fileSizeLabel(f.size_bytes))} · ${esc(fmtTime(f.uploaded_at))}</div>
+        ${String(f.error || "").trim() ? `<div class="context-file-meta" style="color:#b91c1c;">parse error: ${esc(String(f.error || ""))}</div>` : ""}
+        <div class="context-file-actions">
+          <button type="button" data-action="delete" data-file-id="${esc(fid)}">Delete</button>
+        </div>
+      </div>`;
+    }).join("");
+    const pendingHtml = pendingRows.map((name, i) => {
+      const safe = esc(String(name || `upload_${i + 1}`));
+      return `<div class="context-file-row">
+        <div class="context-file-main">
+          <div class="context-file-name">${safe}</div>
+          <span class="context-chip parsing">uploading</span>
+        </div>
+        <div class="context-file-meta">pending parse...</div>
+      </div>`;
+    }).join("");
+    contextFilesEl.innerHTML = existingHtml + pendingHtml;
+  }
+}
+
+async function fetchContextAggregateDigest() {
+  const set = currentContextSet && typeof currentContextSet === "object" ? currentContextSet : {};
+  const files = Array.isArray(set.files) ? set.files.filter((f) => f && typeof f === "object") : [];
+  const base = contextBasePath();
+  const singleFileId = files.length === 1 ? String(files[0].file_id || "").trim() : "";
+
+  const renderError = (statusCode, label) => {
+    const status = String(set.aggregate_digest_status || "").trim();
+    const err = String(set.aggregate_error || "").trim();
+    contextAggregateDigestEl.textContent = JSON.stringify(
+      {
+        status: status || "missing",
+        error: err || `${label} not ready (${statusCode}).`,
+      },
+      null,
+      2
+    );
+  };
+
+  // Single-file UX: show the per-file digest directly.
+  if (singleFileId) {
+    let rsp = await fetch(`${base}/files/${encodeURIComponent(singleFileId)}/digest`);
+    // Fallback once to aggregate digest on transient or availability mismatch.
+    if (!rsp.ok) {
+      rsp = await fetch(`${base}/digest`);
+    }
+    if (!rsp.ok) {
+      renderError(rsp.status, "Digest");
+      return;
+    }
+    const data = await rsp.json();
+    const digest = data && typeof data === "object" ? data.digest : null;
+    contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+    return;
+  }
+
+  const rsp = await fetch(`${base}/digest`);
+  if (!rsp.ok) {
+    renderError(rsp.status, "Aggregate digest");
+    return;
+  }
+  const data = await rsp.json();
+  const digest = data && typeof data === "object" ? data.digest : null;
+  contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+}
+
+async function fetchContextFileDigest(fileId) {
+  const fid = String(fileId || "").trim();
+  if (!fid) return;
+  const rsp = await fetch(`${contextBasePath()}/files/${encodeURIComponent(fid)}/digest`);
+  if (!contextFileDigestEl) {
+    return;
+  }
+  if (!rsp.ok) {
+    contextFileDigestEl.textContent = "";
+    return;
+  }
+  const data = await rsp.json();
+  const digest = data && typeof data === "object" ? data.digest : null;
+  contextFileDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+}
+
+async function fetchContextSet() {
+  if (contextLoading) return;
+  contextLoading = true;
+  try {
+    const rsp = await fetch(contextBasePath());
+    if (!rsp.ok) {
+      throw new Error(`Context load failed: ${rsp.status}`);
+    }
+    const data = await rsp.json();
+    currentContextSet = data && data.context_set ? data.context_set : null;
+    renderContextPane();
+    await fetchContextAggregateDigest();
+    if (selectedContextFileId && contextFileDigestEl) {
+      await fetchContextFileDigest(selectedContextFileId);
+    } else if (contextFileDigestEl) {
+      contextFileDigestEl.textContent = "";
+    }
+  } catch (_err) {
+    clearContextPane("Context unavailable.");
+  } finally {
+    contextLoading = false;
+  }
+}
+
+function connectContextEvents(runId) {
+  if (contextEs) {
+    contextEs.close();
+    contextEs = null;
+  }
+  const rid = String(runId || "").trim();
+  if (!rid) return;
+  contextEs = new EventSource(`/api/sessions/${encodeURIComponent(rid)}/context/stream`);
+  const onContextEvt = async () => {
+    if (String(currentRunId || "") !== rid) return;
+    await fetchContextSet();
+  };
+  contextEs.onmessage = onContextEvt;
+  contextEs.addEventListener("context_updated", onContextEvt);
 }
 
 function scheduleSessionsRefresh(_reason) {
@@ -844,6 +1124,9 @@ function eventNarration(ev) {
   const et = String(ev.event_type || "");
   const p = (ev.payload && typeof ev.payload === "object") ? ev.payload : {};
   if (et === "run_started") return "Research started.";
+  if (et === "context_binding_started") return "Binding uploaded context files...";
+  if (et === "context_binding_completed") return "Context binding completed. Starting research...";
+  if (et === "context_binding_failed") return `Context binding failed: ${p.error || "unknown error"}`;
   if (et === "sub_question_started") return `Exploring task: ${p.sub_question || "(unknown)"}`;
   if (et === "queries_generated") return `Prepared ${Number(p.count || 0)} query variants for this task.`;
   if (et === "query_diagnostic") {
@@ -1377,6 +1660,7 @@ function pickAutoFollowTargetNode() {
 function applySnapshot(snap) {
   currentSnapshot = snap;
   const sid = String(snap.session_id || snap.run_id || "").trim();
+  setContextEnabled(!!sid);
   if (sid && Array.isArray(sessions)) {
     const idx = sessions.findIndex((s) => String((s && s.session_id) || "") === sid);
     if (idx >= 0) {
@@ -1399,8 +1683,9 @@ function applySnapshot(snap) {
   const title = String(snap.title || snap.task || "").trim();
   runMeta.textContent = `${title ? `${title} · ` : ""}Run ID: ${snap.run_id}`;
   taskEl.value = String(snap.task || "");
-  setTaskBoxLocked(!!sid);
-  setRunConfigLocked(!!sid);
+  const isDraft = isDraftSnapshot(snap);
+  setTaskBoxLocked(!!sid && !isDraft);
+  setRunConfigLocked(!!sid && !isDraft);
   if (Number.isFinite(Number(snap.max_depth)) && Number(snap.max_depth) >= 1) {
     maxDepthEl.value = String(Math.floor(Number(snap.max_depth)));
   }
@@ -1465,7 +1750,7 @@ function applySnapshot(snap) {
   const reportState = String(snap.report_state || "").toLowerCase();
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
   const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
-  const isNewSessionWorkspace = !currentRunId;
+  const isNewSessionWorkspace = !currentRunId || isDraft;
   runBtn.textContent = "Start Research";
   runBtn.classList.add("primary");
   runBtn.disabled = !isNewSessionWorkspace || reportBusy;
@@ -1531,6 +1816,8 @@ async function openSession(runId, opts = {}) {
   currentRunId = sid;
   abortRequested = false;
   await fetchSnapshot(sid);
+  setContextEnabled(true);
+  await fetchContextSet();
   if (switchToken !== activeSessionSwitchToken || currentRunId !== sid) {
     return;
   }
@@ -1540,6 +1827,7 @@ async function openSession(runId, opts = {}) {
   // Keep SSE attached for any opened session so manual report generation
   // and version-selection events are visible even when research is not running.
   connectEvents(sid);
+  connectContextEvents(sid);
 }
 
 function connectEvents(runId) {
@@ -1563,7 +1851,8 @@ function connectEvents(runId) {
   };
 
   const events = [
-    "run_started", "plan_created", "round_started", "sub_question_started", "queries_generated",
+    "run_started", "context_binding_started", "context_binding_completed", "context_binding_failed",
+    "plan_created", "round_started", "sub_question_started", "queries_generated",
     "query_started", "query_diagnostic", "query_skipped_cached", "query_rerun_allowed",
     "query_broadened", "query_blocked_diminishing_returns", "search_completed", "synthesis_completed",
     "node_sufficiency_started", "node_sufficiency_completed", "node_decomposition_started", "node_decomposed", "node_completed", "node_unresolved",
@@ -1609,13 +1898,15 @@ async function startRun(idempotencyKey) {
   thoughtStreamEl.innerHTML = "";
 
   try {
-    const rsp = await fetch("/api/runs", {
+    const endpoint = "/api/runs/start_from_workspace";
+    const rsp = await fetch(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
         ...(idempotencyKey ? { "Idempotency-Key": idempotencyKey } : {}),
       },
       body: JSON.stringify({
+        workspace_id: ensureWorkspaceId(),
         task,
         max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
         results_per_query: Number(resultsPerQueryEl.value || DEFAULT_RESULTS_PER_QUERY),
@@ -1625,10 +1916,13 @@ async function startRun(idempotencyKey) {
       throw new Error(`Run creation failed: ${rsp.status}`);
     }
     const data = await rsp.json();
-    currentRunId = data.run_id;
+    currentRunId = String(data.run_id || currentRunId || "");
     setRunIdInUrl(currentRunId);
     await fetchSnapshot(currentRunId);
+    setContextEnabled(true);
+    await fetchContextSet();
     connectEvents(currentRunId);
+    connectContextEvents(currentRunId);
     await fetchSessions();
     emitSessionMutation("create", currentRunId);
   } catch (err) {
@@ -1704,6 +1998,139 @@ async function selectReportVersion(versionIndex) {
     throw new Error(`Select report version failed: ${rsp.status}`);
   }
   await fetchSnapshot(currentRunId);
+}
+
+async function uploadContextFiles(files) {
+  if (contextMutationInFlight) {
+    throw new Error("Context update already in progress. Please wait.");
+  }
+  const list = Array.from(files || []).filter((f) => f instanceof File);
+  if (!list.length) {
+    throw new Error("Please select one or more files to upload.");
+  }
+  const uploadedNames = list.map((f) => String(f.name || "context.txt"));
+  pendingUploadFiles = uploadedNames;
+  renderContextPane();
+  contextAggregateDigestEl.textContent = `Parsing uploaded files, please wait...\n- ${uploadedNames.join("\n- ")}`;
+  setContextBusy(true);
+  const fd = new FormData();
+  for (const f of list) {
+    fd.append("files", f, f.name || "context.txt");
+  }
+  try {
+    const send = async () => {
+      const headers = { "Idempotency-Key": newIdempotencyKey("ctx_upload") };
+      const rev = Number(currentContextSet && currentContextSet.revision);
+      if (Number.isFinite(rev) && rev >= 1) {
+        headers["If-Match"] = String(Math.floor(rev));
+      }
+      return fetch(`${contextBasePath()}/files`, {
+        method: "POST",
+        headers,
+        body: fd,
+      });
+    };
+    let rsp = await send();
+    if (rsp.status === 409) {
+      await fetchContextSet();
+      rsp = await send();
+    }
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Context upload failed: ${rsp.status}`));
+    }
+    const data = await rsp.json();
+    currentContextSet = data && data.context_set ? data.context_set : currentContextSet;
+    pendingUploadFiles = [];
+    renderContextPane();
+    await fetchContextAggregateDigest();
+  } finally {
+    pendingUploadFiles = [];
+    setContextBusy(false);
+  }
+}
+
+async function replaceContextFile(fileId, fileObj) {
+  if (contextMutationInFlight) {
+    throw new Error("Context update already in progress. Please wait.");
+  }
+  const fid = String(fileId || "").trim();
+  if (!fid || !(fileObj instanceof File)) return;
+  setContextBusy(true);
+  const fd = new FormData();
+  fd.append("file", fileObj, fileObj.name || "context.txt");
+  try {
+    const send = async () => {
+      const headers = { "Idempotency-Key": newIdempotencyKey("ctx_replace") };
+      const rev = Number(currentContextSet && currentContextSet.revision);
+      if (Number.isFinite(rev) && rev >= 1) {
+        headers["If-Match"] = String(Math.floor(rev));
+      }
+      return fetch(`${contextBasePath()}/files/${encodeURIComponent(fid)}`, {
+        method: "PUT",
+        headers,
+        body: fd,
+      });
+    };
+    let rsp = await send();
+    if (rsp.status === 409) {
+      await fetchContextSet();
+      rsp = await send();
+    }
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Context replace failed: ${rsp.status}`));
+    }
+    const data = await rsp.json();
+    currentContextSet = data && data.context_set ? data.context_set : currentContextSet;
+    renderContextPane();
+    await fetchContextAggregateDigest();
+    if (selectedContextFileId === fid) {
+      await fetchContextFileDigest(fid);
+    }
+  } finally {
+    setContextBusy(false);
+  }
+}
+
+async function deleteContextFile(fileId) {
+  if (contextMutationInFlight) {
+    throw new Error("Context update already in progress. Please wait.");
+  }
+  const fid = String(fileId || "").trim();
+  if (!fid) return;
+  setContextBusy(true);
+  try {
+    const send = async () => {
+      const headers = { "Idempotency-Key": newIdempotencyKey("ctx_delete") };
+      const rev = Number(currentContextSet && currentContextSet.revision);
+      if (Number.isFinite(rev) && rev >= 1) {
+        headers["If-Match"] = String(Math.floor(rev));
+      }
+      return fetch(`${contextBasePath()}/files/${encodeURIComponent(fid)}`, {
+        method: "DELETE",
+        headers,
+      });
+    };
+    let rsp = await send();
+    if (rsp.status === 409) {
+      await fetchContextSet();
+      rsp = await send();
+    }
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Context delete failed: ${rsp.status}`));
+    }
+    const data = await rsp.json();
+    currentContextSet = data && data.context_set ? data.context_set : currentContextSet;
+    if (selectedContextFileId === fid) {
+      selectedContextFileId = "";
+      if (contextFileDigestEl) {
+        contextFileDigestEl.textContent = "";
+      }
+    }
+    renderContextPane();
+    await fetchContextAggregateDigest();
+  } finally {
+    setContextBusy(false);
+  }
 }
 
 runBtn.addEventListener("click", async () => {
@@ -1847,6 +2274,7 @@ async function bootstrapFromUrl() {
     const selected = runId ? String(runId) : "";
     if (!selected) {
       resetWorkspaceForNewSession();
+      await fetchContextSet();
       return;
     }
     await openSession(selected, { updateUrl: true });
@@ -1856,6 +2284,8 @@ async function bootstrapFromUrl() {
   }
 }
 
+setContextEnabled(false);
+clearContextPane("No context files uploaded.");
 bootstrapFromUrl();
 initSessionSyncListeners();
 
@@ -1942,9 +2372,15 @@ if (sessionListEl) {
             es.close();
             es = null;
           }
+          if (contextEs) {
+            contextEs.close();
+            contextEs = null;
+          }
           setRunIdInUrl("");
           renderCanvas(null);
           runMeta.textContent = "";
+          setContextEnabled(false);
+          clearContextPane("No context files uploaded.");
         }
         await fetchSessions();
         emitSessionMutation("delete", sid);
@@ -1967,8 +2403,88 @@ if (refreshSessionsBtn) {
 }
 
 if (newSessionBtn) {
-  newSessionBtn.addEventListener("click", () => {
+  newSessionBtn.addEventListener("click", async () => {
     resetWorkspaceForNewSession();
-    renderSessions();
+    try {
+      await fetchContextSet();
+      await fetchSessions();
+    } catch (err) {
+      showError(err.message || String(err));
+      renderSessions();
+    }
+  });
+}
+
+if (contextUploadBtn) {
+  contextUploadBtn.addEventListener("click", async () => {
+    try {
+      await uploadContextFiles(contextUploadInput && contextUploadInput.files ? contextUploadInput.files : []);
+      if (contextUploadInput) {
+        contextUploadInput.value = "";
+        refreshContextUploadButtonState();
+      }
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      if (msg === "Context update already in progress. Please wait.") {
+        showTransientError(msg, 2000);
+      } else {
+        showError(msg);
+      }
+    }
+  });
+}
+
+if (contextUploadInput) {
+  contextUploadInput.addEventListener("change", () => {
+    refreshContextUploadButtonState();
+  });
+}
+
+if (contextFilesEl) {
+  contextFilesEl.addEventListener("click", async (evt) => {
+    const target = evt.target;
+    if (!(target instanceof HTMLElement)) return;
+    const action = String(target.getAttribute("data-action") || "");
+    const fid = String(target.getAttribute("data-file-id") || "");
+    if (!action || !fid) return;
+    try {
+      if (action === "download") {
+        window.location.href = `${contextBasePath()}/files/${encodeURIComponent(fid)}/download`;
+        return;
+      }
+      if (action === "delete") {
+        const ok = window.confirm("Delete this context file?");
+        if (!ok) return;
+        await deleteContextFile(fid);
+        return;
+      }
+      if (action === "replace") {
+        const picker = document.createElement("input");
+        picker.type = "file";
+        picker.multiple = false;
+        picker.onchange = async () => {
+          const f = picker.files && picker.files[0] ? picker.files[0] : null;
+          if (!f) return;
+          try {
+            await replaceContextFile(fid, f);
+          } catch (err) {
+            const msg = err && err.message ? err.message : String(err);
+            if (msg === "Context update already in progress. Please wait.") {
+              showTransientError(msg, 2000);
+            } else {
+              showError(msg);
+            }
+          }
+        };
+        picker.click();
+      }
+    } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      if (msg === "Context update already in progress. Please wait.") {
+        showTransientError(msg, 2000);
+      } else {
+        showError(msg);
+      }
+    }
   });
 }

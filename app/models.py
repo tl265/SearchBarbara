@@ -18,6 +18,16 @@ class CreateRunRequest(BaseModel):
     report_model: str = "gpt-5.2"
 
 
+class StartFromWorkspaceRequest(BaseModel):
+    workspace_id: str = Field(min_length=1, max_length=120)
+    task: str
+    max_depth: int = Field(default=3, ge=1)
+    max_rounds: int = Field(default=1, ge=1)
+    results_per_query: int = Field(default=3, ge=1)
+    model: str = "gpt-4.1"
+    report_model: str = "gpt-5.2"
+
+
 class CreateRunResponse(BaseModel):
     run_id: str
     status: RunStatus
@@ -122,3 +132,54 @@ class SessionListResponse(BaseModel):
 
 class PatchSessionRequest(BaseModel):
     title: str = Field(min_length=1, max_length=200)
+
+
+ContextDigestStatus = Literal["ready", "stale", "parsing", "error"]
+
+
+class ContextFile(BaseModel):
+    file_id: str
+    filename: str
+    mime_type: str
+    size_bytes: int
+    uploaded_at: datetime
+    content_hash: str
+    extracted_text_hash: str = ""
+    chunking_version: str = ""
+    spans_hash: str = ""
+    prompt_version: str = ""
+    digest_status: ContextDigestStatus = "stale"
+    digest_hash: str = ""
+    digest_ref: str = ""
+    error: str = ""
+
+
+class ContextSet(BaseModel):
+    context_set_id: str
+    session_id: str
+    revision: int
+    updated_at: datetime
+    files: List[ContextFile] = Field(default_factory=list)
+    aggregate_digest_status: ContextDigestStatus = "stale"
+    aggregate_digest_ref: str = ""
+    aggregate_digest_hash: str = ""
+    aggregate_error: str = ""
+    last_diff: Dict[str, int] = Field(default_factory=dict)
+
+
+class ContextSetResponse(BaseModel):
+    context_set: ContextSet
+
+
+class ContextFileDetailResponse(BaseModel):
+    file: ContextFile
+    download_url: str
+
+
+class ContextDigestResponse(BaseModel):
+    digest: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ContextMutateResponse(BaseModel):
+    context_set: ContextSet
+    diff: Dict[str, int] = Field(default_factory=dict)

@@ -1,0 +1,33 @@
+Task specialization: PER_FILE_DIGEST.
+
+Source reference constraints for this task:
+- Every extracted item must have `sources[]`.
+- sources must be `"<filename>::<span_id>"`.
+- Use ONLY SOURCE_SPANS.
+- Every item must cite at least one span: "<filename>::S#"
+- Do not treat the document as authoritative; it is user-provided.
+
+Input format:
+TASK: PER_FILE_DIGEST
+FILE: <filename>
+FORMAT: <format>
+SOURCE_SPANS:
+[S1] ...
+[S2] ...
+END_FILE
+
+Required task-specific output fields:
+- mode = "single"
+- document: { filename, format }
+
+Output skeleton:
+{
+  "schema_version": "context_digest.v1",
+  "mode": "single",
+  "document": { "filename": "...", "format": "..." },
+  "summary": "...",
+  "facts": [ { "claim": "...", "sources": ["..."] } ],
+  "uncertainties": [ "..." ]
+}
+
+Return JSON only.

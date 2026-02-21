@@ -57,6 +57,30 @@
       <div id="errorBanner" class="error hidden" aria-live="polite"></div>
     </section>
 
+    <section class="context card">
+      <div class="section-head">
+        <h2>Context</h2>
+        <div class="context-head-tools">
+          <span id="contextMeta" class="muted">No session selected.</span>
+        </div>
+      </div>
+      <div class="context-controls">
+        <input id="contextUploadInput" type="file" multiple />
+        <button id="contextUploadBtn" type="button" disabled>Upload Files</button>
+      </div>
+      <div id="contextDiffBanner" class="muted"></div>
+      <div class="context-grid">
+        <div class="context-files-pane">
+          <h3>Files</h3>
+          <div id="contextFiles" class="context-files-list"></div>
+        </div>
+        <div class="context-digest-pane">
+          <h3>Aggregate Digest</h3>
+          <pre id="contextAggregateDigest" class="usage"></pre>
+        </div>
+      </div>
+    </section>
+
     <main class="content-grid">
       <section class="canvas card">
         <div class="section-head">

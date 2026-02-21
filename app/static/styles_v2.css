@@ -70,6 +70,7 @@ h1 { margin: 0; font-size: 1.4rem; }
 
 .prompt-dock { margin-bottom: 10px; }
 .session-dock { margin-bottom: 10px; }
+.context { margin-bottom: 10px; }
 .dock-label { display: block; font-weight: 600; margin-bottom: 6px; }
 textarea, input {
   width: 100%;
@@ -116,6 +117,83 @@ button:disabled {
   gap: 8px;
 }
 .advanced-grid label { font-size: 0.9rem; }
+
+.context-head-tools {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.context-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px 0;
+}
+.context-grid {
+  display: grid;
+  grid-template-columns: minmax(280px, 0.8fr) minmax(360px, 1.2fr);
+  gap: 10px;
+}
+.context-files-pane,
+.context-digest-pane {
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 8px;
+  background: #fbfdff;
+}
+.context-files-list {
+  max-height: 260px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.context-file-row {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px;
+  background: #fff;
+}
+.context-file-main {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+.context-file-name {
+  font-weight: 600;
+  font-size: 0.9rem;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.context-file-meta {
+  font-size: 0.8rem;
+  color: var(--muted);
+}
+.context-file-actions {
+  margin-top: 6px;
+  display: inline-flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.context-chip {
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+}
+.context-chip.ready { border-color: #16a34a; color: #166534; background: #dcfce7; }
+.context-chip.parsing { border-color: #0284c7; color: #0c4a6e; background: #e0f2fe; }
+.context-chip.stale { border-color: #64748b; color: #334155; background: #e2e8f0; }
+.context-chip.error { border-color: #dc2626; color: #7f1d1d; background: #fee2e2; }
+
+@media (max-width: 980px) {
+  .context-grid {
+    grid-template-columns: 1fr;
+  }
+}
 
 .session-list {
   display: flex;

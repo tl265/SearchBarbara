@@ -3,17 +3,22 @@ from queue import Empty, Queue
 from typing import Any, Dict, Iterator, List
 import json
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
+from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from app.models import (
+    ContextDigestResponse,
+    ContextFileDetailResponse,
+    ContextMutateResponse,
+    ContextSetResponse,
     CreateRunRequest,
     CreateRunResponse,
     PatchSessionRequest,
     RunSnapshotResponse,
+    StartFromWorkspaceRequest,
     SessionListResponse,
 )
 from app.run_manager import RunManager
@@ -43,6 +48,13 @@ def _load_web_config() -> Dict[str, Any]:
         "min_canvas_zoom": 0.45,
         "auto_fit_safety_px": 10,
         "heartbeat_interval_sec": 8,
+        "context_preprocess_enabled": True,
+        "context_preprocess_model": "gpt-4.1",
+        "context_preprocess_prompt_path_common": "prompts/context_preprocess_common.system.txt",
+        "context_preprocess_prompt_path_per_file": "prompts/context_preprocess_per_file.system.txt",
+        "context_preprocess_prompt_path_aggregate": "prompts/context_preprocess_aggregate.system.txt",
+        "context_preprocess_prompt_version": "v1.4",
+        "context_chunking_version": "context_chunk.v1",
     }
     if not WEB_CONFIG_PATH.exists():
         return default
@@ -117,6 +129,58 @@ def _load_web_config() -> Dict[str, Any]:
         )
     except (TypeError, ValueError):
         heartbeat_interval_sec = default["heartbeat_interval_sec"]
+    context_preprocess_enabled = bool(
+        raw.get(
+            "context_preprocess_enabled", default["context_preprocess_enabled"]
+        )
+    )
+    context_preprocess_model = str(
+        raw.get(
+            "context_preprocess_model", default["context_preprocess_model"]
+        )
+        or default["context_preprocess_model"]
+    )
+    context_preprocess_prompt_path_common = str(
+        raw.get(
+            "context_preprocess_prompt_path_common",
+            default["context_preprocess_prompt_path_common"],
+        )
+        or default["context_preprocess_prompt_path_common"]
+    )
+    legacy_context_preprocess_prompt_path = str(
+        raw.get(
+            "context_preprocess_prompt_path",
+            "prompts/context_preprocess.system.txt",
+        )
+        or "prompts/context_preprocess.system.txt"
+    )
+    context_preprocess_prompt_path_per_file = str(
+        raw.get(
+            "context_preprocess_prompt_path_per_file",
+            legacy_context_preprocess_prompt_path
+            or default["context_preprocess_prompt_path_per_file"],
+        )
+        or default["context_preprocess_prompt_path_per_file"]
+    )
+    context_preprocess_prompt_path_aggregate = str(
+        raw.get(
+            "context_preprocess_prompt_path_aggregate",
+            legacy_context_preprocess_prompt_path
+            or default["context_preprocess_prompt_path_aggregate"],
+        )
+        or default["context_preprocess_prompt_path_aggregate"]
+    )
+    context_preprocess_prompt_version = str(
+        raw.get(
+            "context_preprocess_prompt_version",
+            default["context_preprocess_prompt_version"],
+        )
+        or default["context_preprocess_prompt_version"]
+    )
+    context_chunking_version = str(
+        raw.get("context_chunking_version", default["context_chunking_version"])
+        or default["context_chunking_version"]
+    )
     return {
         "max_rounds": max(1, max_rounds),
         "max_depth_min": max_depth_min,
@@ -134,12 +198,49 @@ def _load_web_config() -> Dict[str, Any]:
         "min_canvas_zoom": min(max(min_canvas_zoom, 0.1), 0.95),
         "auto_fit_safety_px": max(0, min(auto_fit_safety_px, 200)),
         "heartbeat_interval_sec": min(max(heartbeat_interval_sec, 1.0), 120.0),
+        "context_preprocess_enabled": context_preprocess_enabled,
+        "context_preprocess_model": context_preprocess_model,
+        "context_preprocess_prompt_path_common": context_preprocess_prompt_path_common,
+        "context_preprocess_prompt_path_per_file": context_preprocess_prompt_path_per_file,
+        "context_preprocess_prompt_path_aggregate": context_preprocess_prompt_path_aggregate,
+        "context_preprocess_prompt_version": context_preprocess_prompt_version,
+        "context_chunking_version": context_chunking_version,
     }
 
 
 WEB_CONFIG = _load_web_config()
 run_manager = RunManager(
-    heartbeat_interval_sec=float(WEB_CONFIG.get("heartbeat_interval_sec", 8))
+    heartbeat_interval_sec=float(WEB_CONFIG.get("heartbeat_interval_sec", 8)),
+    context_preprocess_enabled=bool(
+        WEB_CONFIG.get("context_preprocess_enabled", True)
+    ),
+    context_preprocess_model=str(
+        WEB_CONFIG.get("context_preprocess_model", "gpt-4.1")
+    ),
+    context_preprocess_prompt_path_common=str(
+        WEB_CONFIG.get(
+            "context_preprocess_prompt_path_common",
+            "prompts/context_preprocess_common.system.txt",
+        )
+    ),
+    context_preprocess_prompt_path_per_file=str(
+        WEB_CONFIG.get(
+            "context_preprocess_prompt_path_per_file",
+            "prompts/context_preprocess_per_file.system.txt",
+        )
+    ),
+    context_preprocess_prompt_path_aggregate=str(
+        WEB_CONFIG.get(
+            "context_preprocess_prompt_path_aggregate",
+            "prompts/context_preprocess_aggregate.system.txt",
+        )
+    ),
+    context_preprocess_prompt_version=str(
+        WEB_CONFIG.get("context_preprocess_prompt_version", "v1.4")
+    ),
+    context_chunking_version=str(
+        WEB_CONFIG.get("context_chunking_version", "context_chunk.v1")
+    ),
 )
 
 
@@ -312,6 +413,23 @@ def _idempotency_key_from_request(request: Request) -> str:
     return raw[:200]
 
 
+def _parse_if_match_revision(if_match: str | None) -> int | None:
+    raw = str(if_match or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("W/"):
+        raw = raw[2:].strip()
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        raw = raw[1:-1].strip()
+    try:
+        val = int(raw)
+        if val >= 1:
+            return val
+    except Exception:
+        pass
+    raise HTTPException(status_code=400, detail="Invalid If-Match revision")
+
+
 def _raise_on_idempotency_state(state: str) -> None:
     if state == "in_progress":
         raise HTTPException(
@@ -382,6 +500,152 @@ def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         raise
     response = CreateRunResponse(run_id=run_id, status="queued")
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response.model_dump(),
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    return response
+
+
+@app.post("/api/runs/start_from_workspace", response_model=CreateRunResponse)
+def create_run_from_workspace(
+    req: StartFromWorkspaceRequest, request: Request
+) -> CreateRunResponse:
+    max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
+    max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
+    rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
+    rpq_max = int(WEB_CONFIG.get("results_per_query_max", 30))
+    if not (max_depth_min <= req.max_depth <= max_depth_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"max_depth must be between {max_depth_min} and {max_depth_max}",
+        )
+    if not (rpq_min <= req.results_per_query <= rpq_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
+        )
+    workspace_id = str(req.workspace_id or "").strip()
+    if not workspace_id:
+        raise HTTPException(status_code=422, detail="workspace_id is required")
+    model = str(WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"start_from_workspace:{workspace_id}"
+    idem_payload = {
+        "workspace_id": workspace_id,
+        "task": req.task,
+        "max_depth": int(req.max_depth),
+        "results_per_query": int(req.results_per_query),
+        "model": model,
+        "report_model": report_model,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload") if isinstance(idem.get("payload"), dict) else {}
+        return CreateRunResponse.model_validate(payload)
+    _raise_on_idempotency_state(idem_state)
+    try:
+        run_id = run_manager.create_run_from_workspace(
+            workspace_id=workspace_id,
+            task=req.task,
+            max_depth=req.max_depth,
+            max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+            results_per_query=req.results_per_query,
+            model=model,
+            report_model=report_model,
+        )
+    except Exception:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise
+    response = CreateRunResponse(run_id=run_id, status="queued")
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response.model_dump(),
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    return response
+
+
+@app.post("/api/sessions/draft", response_model=CreateRunResponse)
+def create_draft_session() -> CreateRunResponse:
+    run_id = run_manager.create_draft_session(
+        max_depth=int(WEB_CONFIG.get("default_max_depth", 3)),
+        max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+        results_per_query=int(WEB_CONFIG.get("default_results_per_query", 3)),
+        model=str(WEB_CONFIG.get("model", "gpt-4.1")),
+        report_model=str(WEB_CONFIG.get("report_model", "gpt-5.2")),
+    )
+    return CreateRunResponse(run_id=run_id, status="queued")
+
+
+@app.post("/api/sessions/{session_id}/start", response_model=CreateRunResponse)
+def start_draft_session_run(
+    session_id: str,
+    req: CreateRunRequest,
+    request: Request,
+) -> CreateRunResponse:
+    max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
+    max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
+    rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
+    rpq_max = int(WEB_CONFIG.get("results_per_query_max", 30))
+    if not (max_depth_min <= req.max_depth <= max_depth_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"max_depth must be between {max_depth_min} and {max_depth_max}",
+        )
+    if not (rpq_min <= req.results_per_query <= rpq_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
+        )
+    model = str(WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"start_draft:{session_id}"
+    idem_payload = {
+        "task": req.task,
+        "max_depth": int(req.max_depth),
+        "results_per_query": int(req.results_per_query),
+        "model": model,
+        "report_model": report_model,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload") if isinstance(idem.get("payload"), dict) else {}
+        return CreateRunResponse.model_validate(payload)
+    _raise_on_idempotency_state(idem_state)
+    out = run_manager.start_draft_session_run(
+        run_id=session_id,
+        task=req.task,
+        max_depth=req.max_depth,
+        max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+        results_per_query=req.results_per_query,
+        model=model,
+        report_model=report_model,
+    )
+    if out is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=404, detail="Session not found")
+    if isinstance(out, dict) and str(out.get("error_code", "")).startswith("conflict_"):
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=409, detail=str(out.get("error", "Session conflict")))
+    response = CreateRunResponse(run_id=session_id, status="queued")
     run_manager.idempotency_complete(
         idem_scope,
         idem_key,
@@ -482,6 +746,359 @@ def get_session(session_id: str) -> RunSnapshotResponse:
         current_report_version_index=state.current_report_version_index,
         error=state.error,
         token_usage=state.token_usage,
+    )
+
+
+@app.get("/api/sessions/{session_id}/context", response_model=ContextSetResponse)
+def get_session_context(session_id: str) -> ContextSetResponse:
+    context_set = run_manager.get_context_set(session_id)
+    if context_set is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return ContextSetResponse.model_validate({"context_set": context_set})
+
+
+@app.get("/api/workspaces/{workspace_id}/context", response_model=ContextSetResponse)
+def get_workspace_context(workspace_id: str) -> ContextSetResponse:
+    context_set = run_manager.get_workspace_context_set(workspace_id)
+    if context_set is None:
+        raise HTTPException(status_code=404, detail="Workspace context not found")
+    return ContextSetResponse.model_validate({"context_set": context_set})
+
+
+@app.get(
+    "/api/sessions/{session_id}/context/files/{file_id}",
+    response_model=ContextFileDetailResponse,
+)
+def get_context_file_detail(session_id: str, file_id: str) -> ContextFileDetailResponse:
+    out = run_manager.get_context_file(session_id, file_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    return ContextFileDetailResponse.model_validate(out)
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}",
+    response_model=ContextFileDetailResponse,
+)
+def get_workspace_context_file_detail(
+    workspace_id: str, file_id: str
+) -> ContextFileDetailResponse:
+    out = run_manager.get_workspace_context_file(workspace_id, file_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    return ContextFileDetailResponse.model_validate(out)
+
+
+@app.get("/api/sessions/{session_id}/context/files/{file_id}/download")
+def download_context_file(session_id: str, file_id: str) -> Response:
+    out = run_manager.get_context_file(session_id, file_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    blob = run_manager.get_context_file_bytes(session_id, file_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Context file bytes not found")
+    data, filename, mime_type = blob
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return Response(
+        content=data,
+        media_type=mime_type or "application/octet-stream",
+        headers=headers,
+    )
+
+
+@app.get("/api/workspaces/{workspace_id}/context/files/{file_id}/download")
+def download_workspace_context_file(workspace_id: str, file_id: str) -> Response:
+    out = run_manager.get_workspace_context_file(workspace_id, file_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    blob = run_manager.get_workspace_context_file_bytes(workspace_id, file_id)
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Context file bytes not found")
+    data, filename, mime_type = blob
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return Response(
+        content=data,
+        media_type=mime_type or "application/octet-stream",
+        headers=headers,
+    )
+
+
+@app.get(
+    "/api/sessions/{session_id}/context/files/{file_id}/digest",
+    response_model=ContextDigestResponse,
+)
+def get_context_file_digest(session_id: str, file_id: str) -> ContextDigestResponse:
+    digest = run_manager.get_context_file_digest(session_id, file_id)
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Context file digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}/digest",
+    response_model=ContextDigestResponse,
+)
+def get_workspace_context_file_digest(
+    workspace_id: str, file_id: str
+) -> ContextDigestResponse:
+    digest = run_manager.get_workspace_context_file_digest(workspace_id, file_id)
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Context file digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.get("/api/sessions/{session_id}/context/digest", response_model=ContextDigestResponse)
+def get_context_aggregate_digest(session_id: str) -> ContextDigestResponse:
+    digest = run_manager.get_context_aggregate_digest(session_id)
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Aggregate context digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/context/digest",
+    response_model=ContextDigestResponse,
+)
+def get_workspace_context_aggregate_digest(workspace_id: str) -> ContextDigestResponse:
+    digest = run_manager.get_workspace_context_aggregate_digest(workspace_id)
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Aggregate context digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.post("/api/sessions/{session_id}/context/files", response_model=ContextMutateResponse)
+async def upload_context_files(
+    session_id: str,
+    request: Request,
+    files: List[UploadFile] = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    uploads: List[Dict[str, Any]] = []
+    for f in files:
+        data = await f.read()
+        uploads.append(
+            {
+                "filename": f.filename or "",
+                "content_type": f.content_type or "",
+                "size_bytes": len(data),
+                "bytes": data,
+            }
+        )
+    result = run_manager.upload_context_files(
+        session_id=session_id,
+        uploads=uploads,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.post("/api/workspaces/{workspace_id}/context/files", response_model=ContextMutateResponse)
+async def upload_workspace_context_files(
+    workspace_id: str,
+    request: Request,
+    files: List[UploadFile] = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    uploads: List[Dict[str, Any]] = []
+    for f in files:
+        data = await f.read()
+        uploads.append(
+            {
+                "filename": f.filename or "",
+                "content_type": f.content_type or "",
+                "size_bytes": len(data),
+                "bytes": data,
+            }
+        )
+    result = run_manager.upload_workspace_context_files(
+        workspace_id=workspace_id,
+        uploads=uploads,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.put(
+    "/api/sessions/{session_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+async def replace_context_file(
+    session_id: str,
+    file_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    data = await file.read()
+    upload = {
+        "filename": file.filename or "",
+        "content_type": file.content_type or "",
+        "size_bytes": len(data),
+        "bytes": data,
+    }
+    result = run_manager.replace_context_file(
+        session_id=session_id,
+        file_id=file_id,
+        upload=upload,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.put(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+async def replace_workspace_context_file(
+    workspace_id: str,
+    file_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    data = await file.read()
+    upload = {
+        "filename": file.filename or "",
+        "content_type": file.content_type or "",
+        "size_bytes": len(data),
+        "bytes": data,
+    }
+    result = run_manager.replace_workspace_context_file(
+        workspace_id=workspace_id,
+        file_id=file_id,
+        upload=upload,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.delete(
+    "/api/sessions/{session_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+def delete_context_file(
+    session_id: str,
+    file_id: str,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    result = run_manager.delete_context_file(
+        session_id=session_id,
+        file_id=file_id,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.delete(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+def delete_workspace_context_file(
+    workspace_id: str,
+    file_id: str,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    result = run_manager.delete_workspace_context_file(
+        workspace_id=workspace_id,
+        file_id=file_id,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+def _context_event_stream(session_id: str, q: Queue) -> Iterator[str]:
+    try:
+        while True:
+            try:
+                event = q.get(timeout=15)
+                yield format_sse(event)
+            except Empty:
+                yield ": keep-alive\n\n"
+    finally:
+        run_manager.unsubscribe_context(session_id, q)
+
+
+@app.get("/api/sessions/{session_id}/context/stream")
+def stream_context_events(session_id: str) -> StreamingResponse:
+    q = run_manager.subscribe_context(session_id)
+    if q is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return StreamingResponse(
+        _context_event_stream(session_id, q),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 

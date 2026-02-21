@@ -11,5 +11,12 @@
   "ui_debug": false,
   "min_canvas_zoom": 0.3,
   "auto_fit_safety_px": 40,
-  "heartbeat_interval_sec": 8
+  "heartbeat_interval_sec": 8,
+  "context_preprocess_enabled": true,
+  "context_preprocess_model": "gpt-4.1",
+  "context_preprocess_prompt_path_common": "prompts/context_preprocess_common.system.txt",
+  "context_preprocess_prompt_path_per_file": "prompts/context_preprocess_per_file.system.txt",
+  "context_preprocess_prompt_path_aggregate": "prompts/context_preprocess_aggregate.system.txt",
+  "context_preprocess_prompt_version": "v1.4",
+  "context_chunking_version": "context_chunk.v1"
 }
