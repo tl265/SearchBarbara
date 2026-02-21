@@ -332,6 +332,7 @@ function contextStatusLabel(v) {
   const s = String(v || "").trim().toLowerCase();
   if (!s) return "uploaded";
   if (s === "stale") return "uploaded";
+  if (s === "parsing") return "reading, please wait...";
   if (s === "ready" || s === "completed" || s === "partial_ready") return "parsed";
   return s.replaceAll("_", " ");
 }
@@ -2470,21 +2471,7 @@ if (sessionListEl) {
         }
         if (!rsp.ok) throw new Error(`Delete failed: ${rsp.status}`);
         if (currentRunId === sid) {
-          currentRunId = null;
-          currentSnapshot = null;
-          if (es) {
-            es.close();
-            es = null;
-          }
-          if (contextEs) {
-            contextEs.close();
-            contextEs = null;
-          }
-          setRunIdInUrl("");
-          renderCanvas(null);
-          runMeta.textContent = "";
-          setContextEnabled(false);
-          clearContextPane("No context files uploaded.");
+          resetWorkspaceForNewSession();
         }
         await fetchSessions();
         emitSessionMutation("delete", sid);

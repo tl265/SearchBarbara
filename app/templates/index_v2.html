@@ -51,34 +51,33 @@
           <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
           <label>Results/query <input id="resultsPerQuery" type="number" value="{{ default_results_per_query }}" min="{{ results_per_query_min }}" max="{{ results_per_query_max }}"></label>
         </div>
+        <section class="context context-in-advanced">
+          <div class="section-head">
+            <h2>Context</h2>
+            <div class="context-head-tools">
+              <span id="contextMeta" class="muted">No session selected.</span>
+            </div>
+          </div>
+          <div class="context-controls">
+            <input id="contextUploadInput" type="file" multiple />
+            <button id="contextUploadBtn" type="button" disabled>Upload Files</button>
+          </div>
+          <div id="contextDiffBanner" class="muted"></div>
+          <div class="context-grid">
+            <div class="context-files-pane">
+              <h3>Files</h3>
+              <div id="contextFiles" class="context-files-list"></div>
+            </div>
+            <div class="context-digest-pane">
+              <h3>Aggregate Digest</h3>
+              <pre id="contextAggregateDigest" class="usage"></pre>
+            </div>
+          </div>
+        </section>
       </details>
       <div id="runMeta" class="muted"></div>
       <div id="stopReason" class="stop-reason"></div>
       <div id="errorBanner" class="error hidden" aria-live="polite"></div>
-    </section>
-
-    <section class="context card">
-      <div class="section-head">
-        <h2>Context</h2>
-        <div class="context-head-tools">
-          <span id="contextMeta" class="muted">No session selected.</span>
-        </div>
-      </div>
-      <div class="context-controls">
-        <input id="contextUploadInput" type="file" multiple />
-        <button id="contextUploadBtn" type="button" disabled>Upload Files</button>
-      </div>
-      <div id="contextDiffBanner" class="muted"></div>
-      <div class="context-grid">
-        <div class="context-files-pane">
-          <h3>Files</h3>
-          <div id="contextFiles" class="context-files-list"></div>
-        </div>
-        <div class="context-digest-pane">
-          <h3>Aggregate Digest</h3>
-          <pre id="contextAggregateDigest" class="usage"></pre>
-        </div>
-      </div>
     </section>
 
     <main class="content-grid">

@@ -71,6 +71,10 @@ h1 { margin: 0; font-size: 1.4rem; }
 .prompt-dock { margin-bottom: 10px; }
 .session-dock { margin-bottom: 10px; }
 .context { margin-bottom: 10px; }
+.context-in-advanced {
+  margin-top: 12px;
+  margin-bottom: 0;
+}
 .dock-label { display: block; font-weight: 600; margin-bottom: 6px; }
 textarea, input {
   width: 100%;
