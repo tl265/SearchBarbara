@@ -41,6 +41,7 @@ class RunManager:
     def __init__(
         self,
         heartbeat_interval_sec: float = _DEFAULT_HEARTBEAT_INTERVAL_SEC,
+        auth_allow_legacy: bool = False,
         context_preprocess_enabled: bool = True,
         context_preprocess_model: str = "gpt-4.1",
         context_preprocess_prompt_path_common: str = "prompts/context_preprocess_common.system.txt",
@@ -79,6 +80,7 @@ class RunManager:
         self._lock_owner_thread_id: int = 0
         self._lock_owner_acquired_at: float = 0.0
         self._heartbeat_interval_sec = max(1.0, float(heartbeat_interval_sec))
+        self._auth_allow_legacy = bool(auth_allow_legacy)
         self._context_preprocess_enabled = bool(context_preprocess_enabled)
         self._context_preprocess_model = str(context_preprocess_model or "gpt-4.1")
         self._context_preprocess_prompt_path_common = str(
@@ -125,6 +127,7 @@ class RunManager:
         results_per_query: int,
         model: str,
         report_model: str,
+        owner_id: Optional[str] = None,
     ) -> str:
         run_id = str(uuid.uuid4())
         return self._create_run_with_id(
@@ -135,6 +138,7 @@ class RunManager:
             results_per_query=results_per_query,
             model=model,
             report_model=report_model,
+            owner_id=owner_id,
             start_worker=True,
             is_draft=False,
         )
@@ -146,6 +150,7 @@ class RunManager:
         results_per_query: int,
         model: str,
         report_model: str,
+        owner_id: Optional[str] = None,
     ) -> str:
         run_id = str(uuid.uuid4())
         return self._create_run_with_id(
@@ -156,6 +161,7 @@ class RunManager:
             results_per_query=results_per_query,
             model=model,
             report_model=report_model,
+            owner_id=owner_id,
             start_worker=False,
             is_draft=True,
         )
@@ -169,6 +175,7 @@ class RunManager:
         results_per_query: int,
         model: str,
         report_model: str,
+        owner_id: Optional[str],
         start_worker: bool,
         is_draft: bool,
     ) -> str:
@@ -192,7 +199,7 @@ class RunManager:
         state = RunState(
             run_id=run_id,
             session_id=run_id,
-            owner_id=None,
+            owner_id=str(owner_id or "").strip() or None,
             title=self._default_title_from_task(task),
             status="queued",
             version=1,
@@ -232,6 +239,7 @@ class RunManager:
         results_per_query: int,
         model: str,
         report_model: str,
+        owner_id: Optional[str] = None,
     ) -> str:
         run_id = str(uuid.uuid4())
         self._create_run_with_id(
@@ -242,6 +250,7 @@ class RunManager:
             results_per_query=results_per_query,
             model=model,
             report_model=report_model,
+            owner_id=owner_id,
             start_worker=False,
             is_draft=False,
         )
@@ -252,6 +261,7 @@ class RunManager:
                 state = self._ensure_run_loaded_locked(run_id)
                 if state and isinstance(state.tree, dict):
                     state.tree["pending_workspace_id"] = wid
+                    state.tree["pending_workspace_owner_id"] = str(owner_id or "").strip()
                     state.tree["startup_phase"] = "queued_for_binding"
                     state.updated_at = _now()
                     self._refresh_lifecycle_fields_locked(state)
@@ -281,6 +291,7 @@ class RunManager:
         results_per_query: int,
         model: str,
         report_model: str,
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         rid = str(run_id or "").strip()
         if not rid:
@@ -290,6 +301,8 @@ class RunManager:
             with self._lock:
                 state = self._ensure_run_loaded_locked(rid)
                 if not state:
+                    return None
+                if not self._owner_matches(state.owner_id, owner_id):
                     return None
                 if state.execution_state in {"running", "paused"} or state.status == "running":
                     return {"error": "Session is already running.", "error_code": "conflict_running"}
@@ -440,6 +453,30 @@ class RunManager:
         rid = str(run_id or "").strip()
         with self._session_locks_guard:
             return self._session_locks.setdefault(rid, threading.RLock())
+
+    def _owner_matches(self, state_owner_id: Optional[str], request_owner_id: Optional[str]) -> bool:
+        req = str(request_owner_id or "").strip()
+        owner = str(state_owner_id or "").strip()
+        if not req:
+            return True
+        if not owner:
+            return bool(self._auth_allow_legacy)
+        return owner == req
+
+    def _filter_owned_items(
+        self, items: List[Dict[str, Any]], owner_id: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        req = str(owner_id or "").strip()
+        if not req:
+            return items
+        out: List[Dict[str, Any]] = []
+        for it in items:
+            own = str(it.get("owner_id", "") or "").strip()
+            if own == req:
+                out.append(it)
+            elif not own and self._auth_allow_legacy:
+                out.append(it)
+        return out
 
     def _derive_research_state_locked(self, state: RunState) -> str:
         es = str(state.execution_state or "").strip().lower()
@@ -689,7 +726,9 @@ class RunManager:
             else "free",
         }
 
-    def list_sessions(self, include_lock_debug: bool = False) -> List[SessionSummary]:
+    def list_sessions(
+        self, owner_id: Optional[str] = None, include_lock_debug: bool = False
+    ) -> List[SessionSummary]:
         items: List[Dict[str, Any]]
         from_disk_fallback = False
         acquired, acquired_at = self._lock_acquire("list_sessions", timeout=0.5)
@@ -717,6 +756,7 @@ class RunManager:
                     fixed["execution_state"] = "failed"
                 normalized.append(fixed)
             items = normalized
+        items = self._filter_owned_items(items, owner_id=owner_id)
         items.sort(
             key=lambda it: str(it.get("updated_at", "")),
             reverse=True,
@@ -1266,7 +1306,9 @@ class RunManager:
         state.report_file_path = report_file_path
         return version
 
-    def get_snapshot(self, run_id: str) -> Optional[RunState]:
+    def get_snapshot(
+        self, run_id: str, owner_id: Optional[str] = None
+    ) -> Optional[RunState]:
         session_lock = self._session_lock_for(run_id)
         t0 = time.perf_counter()
         acquired_session = session_lock.acquire(timeout=0.5)
@@ -1275,6 +1317,8 @@ class RunManager:
             try:
                 state = self._ensure_run_loaded_session_locked(run_id)
                 if state:
+                    if not self._owner_matches(state.owner_id, owner_id):
+                        return None
                     state.snapshot_source = "memory"
                     state.snapshot_fallback_reason = ""
                     state.snapshot_lock_wait_ms = wait_ms
@@ -1293,6 +1337,8 @@ class RunManager:
             with self._lock:
                 mem_state = self._runs.get(run_id)
                 if mem_state is not None:
+                    if not self._owner_matches(mem_state.owner_id, owner_id):
+                        return None
                     mem_state.snapshot_source = "memory"
                     mem_state.snapshot_fallback_reason = "session_lock_timeout"
                     mem_state.snapshot_lock_wait_ms = wait_ms
@@ -1321,6 +1367,8 @@ class RunManager:
             state_path = str(session_item.get("state_file_path", "")).strip()
         state = self._load_run_state_from_files(run_id, state_path, session_item)
         if state:
+            if not self._owner_matches(state.owner_id, owner_id):
+                return None
             self._recover_stale_report_generation_on_load_locked(state, run_id=run_id)
             state.snapshot_source = "disk_fallback"
             state.snapshot_fallback_reason = (
@@ -1335,11 +1383,13 @@ class RunManager:
             state.terminal_reason = self._derive_terminal_reason_locked(state)
         return state
 
-    def subscribe(self, run_id: str) -> Optional[Queue]:
+    def subscribe(self, run_id: str, owner_id: Optional[str] = None) -> Optional[Queue]:
         session_lock = self._session_lock_for(run_id)
         with session_lock:
             state = self._ensure_run_loaded_session_locked(run_id)
             if not state:
+                return None
+            if not self._owner_matches(state.owner_id, owner_id):
                 return None
             with self._lock:
                 q: Queue = Queue()
@@ -1356,10 +1406,14 @@ class RunManager:
                             break
                 return q
 
-    def unsubscribe(self, run_id: str, queue: Queue) -> None:
+    def unsubscribe(
+        self, run_id: str, queue: Queue, owner_id: Optional[str] = None
+    ) -> None:
         session_lock = self._session_lock_for(run_id)
         with session_lock:
-            self._ensure_run_loaded_session_locked(run_id)
+            state = self._ensure_run_loaded_session_locked(run_id)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
+                return
             with self._lock:
                 subs = self._subscribers.get(run_id, [])
                 if queue in subs:
@@ -1517,6 +1571,7 @@ class RunManager:
         existing["research_state"] = str(state.research_state or "")
         existing["report_state"] = str(state.report_state or "")
         existing["terminal_reason"] = str(state.terminal_reason or "")
+        existing["owner_id"] = str(state.owner_id or "") or None
         existing["task"] = state.task
         existing["model"] = state.model
         existing["decompose_model"] = state.report_model
@@ -1545,6 +1600,7 @@ class RunManager:
         trace["research_state"] = str(state.research_state or "")
         trace["report_state"] = str(state.report_state or "")
         trace["terminal_reason"] = str(state.terminal_reason or "")
+        trace["owner_id"] = str(state.owner_id or "") or None
         trace["model"] = state.model
         trace["decompose_model"] = state.report_model
         trace["report_model"] = state.report_model
@@ -1620,6 +1676,7 @@ class RunManager:
             if isinstance(tree, dict):
                 tree["startup_phase"] = "binding_completed"
                 tree.pop("pending_workspace_id", None)
+                tree.pop("pending_workspace_owner_id", None)
             return
         if et == "context_binding_failed":
             if isinstance(tree, dict):
@@ -2214,12 +2271,18 @@ class RunManager:
                 )
 
         pending_workspace_id = ""
+        pending_workspace_owner_id = ""
         with session_lock:
             with self._lock:
                 state_for_binding = self._ensure_run_loaded_locked(run_id)
                 if state_for_binding and isinstance(state_for_binding.tree, dict):
                     pending_workspace_id = str(
                         state_for_binding.tree.get("pending_workspace_id", "") or ""
+                    ).strip()
+                    pending_workspace_owner_id = str(
+                        state_for_binding.tree.get("pending_workspace_owner_id", "")
+                        or state_for_binding.owner_id
+                        or ""
                     ).strip()
 
         if pending_workspace_id:
@@ -2233,7 +2296,9 @@ class RunManager:
                 heartbeat_thread.join(timeout=1.0)
                 return
             try:
-                ws_set = self.get_workspace_context_set(pending_workspace_id) or {}
+                ws_set = self.get_workspace_context_set(
+                    pending_workspace_id, owner_id=pending_workspace_owner_id
+                ) or {}
                 ws_files = ws_set.get("files", []) if isinstance(ws_set, dict) else []
                 files_total = len(ws_files) if isinstance(ws_files, list) else 0
                 emit_worker_event(
@@ -2258,7 +2323,10 @@ class RunManager:
                     )
 
                 ok = self.bind_workspace_context_to_session(
-                    pending_workspace_id, run_id, progress_callback=_on_context_progress
+                    pending_workspace_id,
+                    run_id,
+                    owner_id=pending_workspace_owner_id,
+                    progress_callback=_on_context_progress,
                 )
                 if not ok:
                     raise RuntimeError(
@@ -2892,6 +2960,7 @@ class RunManager:
         research_state = ""
         report_state = ""
         terminal_reason = ""
+        loaded_owner_id = str(session_item.get("owner_id", "") or "").strip()
 
         try:
             ci = str(session_item.get("created_at", "") or "")
@@ -2910,6 +2979,7 @@ class RunManager:
             try:
                 raw = json.loads(Path(state_file_path).read_text(encoding="utf-8"))
                 if isinstance(raw, dict):
+                    loaded_owner_id = str(raw.get("owner_id", loaded_owner_id) or loaded_owner_id).strip()
                     raw_task = str(raw.get("task", "") or "").strip()
                     if raw_task:
                         task = raw_task
@@ -3073,7 +3143,7 @@ class RunManager:
         return RunState(
             run_id=session_id,
             session_id=session_id,
-            owner_id=session_item.get("owner_id"),
+            owner_id=loaded_owner_id or None,
             title=resolved_title,
             status=status,  # type: ignore[arg-type]
             version=max(1, int(version or 1)),
@@ -3114,9 +3184,29 @@ class RunManager:
     # ----------------------------
     # Context management subsystem
     # ----------------------------
-    def _workspace_context_key(self, workspace_id: str) -> str:
+    def _workspace_context_key(
+        self, workspace_id: str, owner_id: Optional[str] = None
+    ) -> str:
         wid = str(workspace_id or "").strip()
+        oid = str(owner_id or "").strip()
+        if oid:
+            safe_owner = hashlib.sha256(oid.encode("utf-8")).hexdigest()[:16]
+            return f"ws__{safe_owner}__{wid}"
         return f"ws__{wid}"
+
+    def _workspace_context_keys_for_access(
+        self, workspace_id: str, owner_id: Optional[str]
+    ) -> List[str]:
+        wid = str(workspace_id or "").strip()
+        if not wid:
+            return []
+        keys: List[str] = []
+        primary = self._workspace_context_key(wid, owner_id=owner_id)
+        keys.append(primary)
+        legacy = self._workspace_context_key(wid, owner_id=None)
+        if self._auth_allow_legacy and legacy != primary:
+            keys.append(legacy)
+        return keys
 
     def _context_set_path_for_key(self, context_key: str) -> Path:
         key = str(context_key or "").strip()
@@ -3607,20 +3697,30 @@ class RunManager:
         state = self._ensure_run_loaded_session_locked(session_id)
         return state is not None
 
-    def subscribe_context(self, session_id: str) -> Optional[Queue]:
+    def subscribe_context(
+        self, session_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Queue]:
         session_lock = self._session_lock_for(session_id)
         with session_lock:
             if not self._session_exists_session_locked(session_id):
+                return None
+            state = self._ensure_run_loaded_session_locked(session_id)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 return None
             with self._lock:
                 q: Queue = Queue()
                 self._context_subscribers.setdefault(session_id, []).append(q)
                 return q
 
-    def unsubscribe_context(self, session_id: str, queue: Queue) -> None:
+    def unsubscribe_context(
+        self, session_id: str, queue: Queue, owner_id: Optional[str] = None
+    ) -> None:
         session_lock = self._session_lock_for(session_id)
         with session_lock:
             if not self._session_exists_session_locked(session_id):
+                return
+            state = self._ensure_run_loaded_session_locked(session_id)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 return
             with self._lock:
                 subs = self._context_subscribers.get(session_id, [])
@@ -3643,7 +3743,9 @@ class RunManager:
             except Exception:
                 pass
 
-    def get_context_set(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_context_set(
+        self, session_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         if not sid:
             return None
@@ -3651,10 +3753,15 @@ class RunManager:
         with session_lock:
             if not self._session_exists_session_locked(sid):
                 return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
+                return None
             context_set = self._load_context_set_locked(sid)
             return copy.deepcopy(context_set)
 
-    def get_context_file(self, session_id: str, file_id: str) -> Optional[Dict[str, Any]]:
+    def get_context_file(
+        self, session_id: str, file_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         fid = str(file_id or "").strip()
         if not sid or not fid:
@@ -3662,6 +3769,9 @@ class RunManager:
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 return None
             context_set = self._load_context_set_locked(sid)
             for f in context_set.get("files", []):
@@ -3673,7 +3783,9 @@ class RunManager:
                     }
         return None
 
-    def get_context_file_bytes(self, session_id: str, file_id: str) -> Optional[tuple[bytes, str, str]]:
+    def get_context_file_bytes(
+        self, session_id: str, file_id: str, owner_id: Optional[str] = None
+    ) -> Optional[tuple[bytes, str, str]]:
         sid = str(session_id or "").strip()
         fid = str(file_id or "").strip()
         if not sid or not fid:
@@ -3681,6 +3793,9 @@ class RunManager:
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 return None
             context_set = self._load_context_set_locked(sid)
             for f in context_set.get("files", []):
@@ -3693,7 +3808,9 @@ class RunManager:
                     return Path(p).read_bytes(), filename, mime_type
         return None
 
-    def get_context_file_digest(self, session_id: str, file_id: str) -> Optional[Dict[str, Any]]:
+    def get_context_file_digest(
+        self, session_id: str, file_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         fid = str(file_id or "").strip()
         if not sid or not fid:
@@ -3701,6 +3818,9 @@ class RunManager:
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 return None
             context_set = self._load_context_set_locked(sid)
             for f in context_set.get("files", []):
@@ -3711,13 +3831,18 @@ class RunManager:
                     return None
         return None
 
-    def get_context_aggregate_digest(self, session_id: str) -> Optional[Dict[str, Any]]:
+    def get_context_aggregate_digest(
+        self, session_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         if not sid:
             return None
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 return None
             context_set = self._load_context_set_locked(sid)
             ref = str(context_set.get("aggregate_digest_ref", "") or "")
@@ -3850,6 +3975,7 @@ class RunManager:
         uploads: List[Dict[str, Any]],
         expected_revision: Optional[int],
         idempotency_key: str = "",
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         if not sid:
@@ -3883,6 +4009,10 @@ class RunManager:
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 self.idempotency_clear_in_progress(scope, idempotency_key)
                 return None
             context_set = self._load_context_set_locked(sid)
@@ -3963,6 +4093,7 @@ class RunManager:
         upload: Dict[str, Any],
         expected_revision: Optional[int],
         idempotency_key: str = "",
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         fid = str(file_id or "").strip()
@@ -3988,6 +4119,10 @@ class RunManager:
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 self.idempotency_clear_in_progress(scope, idempotency_key)
                 return None
             context_set = self._load_context_set_locked(sid)
@@ -4051,6 +4186,7 @@ class RunManager:
         file_id: str,
         expected_revision: Optional[int],
         idempotency_key: str = "",
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         sid = str(session_id or "").strip()
         fid = str(file_id or "").strip()
@@ -4072,6 +4208,10 @@ class RunManager:
         session_lock = self._session_lock_for(sid)
         with session_lock:
             if not self._session_exists_session_locked(sid):
+                self.idempotency_clear_in_progress(scope, idempotency_key)
+                return None
+            state = self._ensure_run_loaded_session_locked(sid)
+            if not state or not self._owner_matches(state.owner_id, owner_id):
                 self.idempotency_clear_in_progress(scope, idempotency_key)
                 return None
             context_set = self._load_context_set_locked(sid)
@@ -4114,85 +4254,117 @@ class RunManager:
         return out
 
     # Workspace-staged context (pre-run, not bound to a session until start).
-    def get_workspace_context_set(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+    def get_workspace_context_set(
+        self, workspace_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         wid = str(workspace_id or "").strip()
         if not wid:
             return None
-        ctx_key = self._workspace_context_key(wid)
+        oid = str(owner_id or "").strip()
+        for ctx_key in self._workspace_context_keys_for_access(wid, oid):
+            session_lock = self._session_lock_for(ctx_key)
+            with session_lock:
+                context_set = self._load_context_set_for_key_locked(
+                    ctx_key, "workspace", wid
+                )
+                if context_set.get("files"):
+                    return copy.deepcopy(context_set)
+                if ctx_key.endswith(f"__{wid}") and not oid:
+                    return copy.deepcopy(context_set)
+        ctx_key = self._workspace_context_key(wid, owner_id=oid)
         session_lock = self._session_lock_for(ctx_key)
         with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            context_set = self._load_context_set_for_key_locked(
+                ctx_key, "workspace", wid
+            )
             return copy.deepcopy(context_set)
 
-    def get_workspace_context_file(self, workspace_id: str, file_id: str) -> Optional[Dict[str, Any]]:
-        wid = str(workspace_id or "").strip()
-        fid = str(file_id or "").strip()
-        if not wid or not fid:
-            return None
-        ctx_key = self._workspace_context_key(wid)
-        session_lock = self._session_lock_for(ctx_key)
-        with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
-            for f in context_set.get("files", []):
-                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
-                    return {
-                        "file": copy.deepcopy(f),
-                        "download_url": f"/api/workspaces/{wid}/context/files/{fid}/download",
-                    }
-        return None
-
-    def get_workspace_context_file_bytes(
-        self, workspace_id: str, file_id: str
-    ) -> Optional[tuple[bytes, str, str]]:
-        wid = str(workspace_id or "").strip()
-        fid = str(file_id or "").strip()
-        if not wid or not fid:
-            return None
-        ctx_key = self._workspace_context_key(wid)
-        session_lock = self._session_lock_for(ctx_key)
-        with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
-            for f in context_set.get("files", []):
-                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
-                    p = str(f.get("path", "") or "")
-                    if not p or not Path(p).exists():
-                        return None
-                    filename = str(f.get("filename", "") or f"{fid}.txt")
-                    mime_type = str(f.get("mime_type", "") or "application/octet-stream")
-                    return Path(p).read_bytes(), filename, mime_type
-        return None
-
-    def get_workspace_context_file_digest(
-        self, workspace_id: str, file_id: str
+    def get_workspace_context_file(
+        self, workspace_id: str, file_id: str, owner_id: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         wid = str(workspace_id or "").strip()
         fid = str(file_id or "").strip()
         if not wid or not fid:
             return None
-        ctx_key = self._workspace_context_key(wid)
-        session_lock = self._session_lock_for(ctx_key)
-        with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
-            for f in context_set.get("files", []):
-                if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
-                    ref = str(f.get("digest_ref", "") or "")
-                    if ref and Path(ref).exists():
-                        return json.loads(Path(ref).read_text(encoding="utf-8"))
-                    return None
+        oid = str(owner_id or "").strip()
+        for ctx_key in self._workspace_context_keys_for_access(wid, oid):
+            session_lock = self._session_lock_for(ctx_key)
+            with session_lock:
+                context_set = self._load_context_set_for_key_locked(
+                    ctx_key, "workspace", wid
+                )
+                for f in context_set.get("files", []):
+                    if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                        return {
+                            "file": copy.deepcopy(f),
+                            "download_url": f"/api/workspaces/{wid}/context/files/{fid}/download",
+                        }
         return None
 
-    def get_workspace_context_aggregate_digest(self, workspace_id: str) -> Optional[Dict[str, Any]]:
+    def get_workspace_context_file_bytes(
+        self, workspace_id: str, file_id: str, owner_id: Optional[str] = None
+    ) -> Optional[tuple[bytes, str, str]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        oid = str(owner_id or "").strip()
+        for ctx_key in self._workspace_context_keys_for_access(wid, oid):
+            session_lock = self._session_lock_for(ctx_key)
+            with session_lock:
+                context_set = self._load_context_set_for_key_locked(
+                    ctx_key, "workspace", wid
+                )
+                for f in context_set.get("files", []):
+                    if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                        p = str(f.get("path", "") or "")
+                        if not p or not Path(p).exists():
+                            return None
+                        filename = str(f.get("filename", "") or f"{fid}.txt")
+                        mime_type = str(f.get("mime_type", "") or "application/octet-stream")
+                        return Path(p).read_bytes(), filename, mime_type
+        return None
+
+    def get_workspace_context_file_digest(
+        self, workspace_id: str, file_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        wid = str(workspace_id or "").strip()
+        fid = str(file_id or "").strip()
+        if not wid or not fid:
+            return None
+        oid = str(owner_id or "").strip()
+        for ctx_key in self._workspace_context_keys_for_access(wid, oid):
+            session_lock = self._session_lock_for(ctx_key)
+            with session_lock:
+                context_set = self._load_context_set_for_key_locked(
+                    ctx_key, "workspace", wid
+                )
+                for f in context_set.get("files", []):
+                    if isinstance(f, dict) and str(f.get("file_id", "")) == fid:
+                        ref = str(f.get("digest_ref", "") or "")
+                        if ref and Path(ref).exists():
+                            return json.loads(Path(ref).read_text(encoding="utf-8"))
+                        return None
+        return None
+
+    def get_workspace_context_aggregate_digest(
+        self, workspace_id: str, owner_id: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         wid = str(workspace_id or "").strip()
         if not wid:
             return None
-        ctx_key = self._workspace_context_key(wid)
-        session_lock = self._session_lock_for(ctx_key)
-        with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
-            ref = str(context_set.get("aggregate_digest_ref", "") or "")
-            if not ref or not Path(ref).exists():
-                return None
-            return json.loads(Path(ref).read_text(encoding="utf-8"))
+        oid = str(owner_id or "").strip()
+        for ctx_key in self._workspace_context_keys_for_access(wid, oid):
+            session_lock = self._session_lock_for(ctx_key)
+            with session_lock:
+                context_set = self._load_context_set_for_key_locked(
+                    ctx_key, "workspace", wid
+                )
+                ref = str(context_set.get("aggregate_digest_ref", "") or "")
+                if not ref or not Path(ref).exists():
+                    continue
+                return json.loads(Path(ref).read_text(encoding="utf-8"))
+        return None
 
     def upload_workspace_context_files(
         self,
@@ -4200,11 +4372,13 @@ class RunManager:
         uploads: List[Dict[str, Any]],
         expected_revision: Optional[int],
         idempotency_key: str = "",
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         wid = str(workspace_id or "").strip()
         if not wid:
             return None
-        scope = f"context_upload_ws:{wid}"
+        oid = str(owner_id or "").strip()
+        scope = f"context_upload_ws:{oid}:{wid}"
         idem = self.idempotency_begin(
             scope,
             idempotency_key,
@@ -4227,10 +4401,16 @@ class RunManager:
             return payload if isinstance(payload, dict) else None
         if idem_state in {"in_progress", "mismatch"}:
             return {"error": "Context upload request conflict.", "error_code": "busy"}
-        ctx_key = self._workspace_context_key(wid)
+        ctx_key = self._workspace_context_key(wid, owner_id=oid)
+        if self._auth_allow_legacy and oid:
+            legacy_key = self._workspace_context_key(wid, owner_id=None)
+            if self._context_set_path_for_key(legacy_key).exists():
+                ctx_key = legacy_key
         session_lock = self._session_lock_for(ctx_key)
         with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            context_set = self._load_context_set_for_key_locked(
+                ctx_key, "workspace", wid
+            )
             cur_rev = int(context_set.get("revision", 1) or 1)
             if expected_revision is not None and int(expected_revision) != cur_rev:
                 self.idempotency_clear_in_progress(scope, idempotency_key)
@@ -4306,12 +4486,14 @@ class RunManager:
         upload: Dict[str, Any],
         expected_revision: Optional[int],
         idempotency_key: str = "",
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         wid = str(workspace_id or "").strip()
         fid = str(file_id or "").strip()
         if not wid or not fid:
             return None
-        scope = f"context_replace_ws:{wid}:{fid}"
+        oid = str(owner_id or "").strip()
+        scope = f"context_replace_ws:{oid}:{wid}:{fid}"
         idem = self.idempotency_begin(
             scope,
             idempotency_key,
@@ -4328,10 +4510,16 @@ class RunManager:
             return payload if isinstance(payload, dict) else None
         if idem_state in {"in_progress", "mismatch"}:
             return {"error": "Context replace request conflict.", "error_code": "busy"}
-        ctx_key = self._workspace_context_key(wid)
+        ctx_key = self._workspace_context_key(wid, owner_id=oid)
+        if self._auth_allow_legacy and oid:
+            legacy_key = self._workspace_context_key(wid, owner_id=None)
+            if self._context_set_path_for_key(legacy_key).exists():
+                ctx_key = legacy_key
         session_lock = self._session_lock_for(ctx_key)
         with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            context_set = self._load_context_set_for_key_locked(
+                ctx_key, "workspace", wid
+            )
             cur_rev = int(context_set.get("revision", 1) or 1)
             if expected_revision is not None and int(expected_revision) != cur_rev:
                 self.idempotency_clear_in_progress(scope, idempotency_key)
@@ -4399,12 +4587,14 @@ class RunManager:
         file_id: str,
         expected_revision: Optional[int],
         idempotency_key: str = "",
+        owner_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         wid = str(workspace_id or "").strip()
         fid = str(file_id or "").strip()
         if not wid or not fid:
             return None
-        scope = f"context_delete_ws:{wid}:{fid}"
+        oid = str(owner_id or "").strip()
+        scope = f"context_delete_ws:{oid}:{wid}:{fid}"
         idem = self.idempotency_begin(
             scope,
             idempotency_key,
@@ -4417,10 +4607,16 @@ class RunManager:
             return payload if isinstance(payload, dict) else None
         if idem_state in {"in_progress", "mismatch"}:
             return {"error": "Context delete request conflict.", "error_code": "busy"}
-        ctx_key = self._workspace_context_key(wid)
+        ctx_key = self._workspace_context_key(wid, owner_id=oid)
+        if self._auth_allow_legacy and oid:
+            legacy_key = self._workspace_context_key(wid, owner_id=None)
+            if self._context_set_path_for_key(legacy_key).exists():
+                ctx_key = legacy_key
         session_lock = self._session_lock_for(ctx_key)
         with session_lock:
-            context_set = self._load_context_set_for_key_locked(ctx_key, "workspace", wid)
+            context_set = self._load_context_set_for_key_locked(
+                ctx_key, "workspace", wid
+            )
             cur_rev = int(context_set.get("revision", 1) or 1)
             if expected_revision is not None and int(expected_revision) != cur_rev:
                 self.idempotency_clear_in_progress(scope, idempotency_key)
@@ -4465,13 +4661,19 @@ class RunManager:
         self,
         workspace_id: str,
         session_id: str,
+        owner_id: Optional[str] = None,
         progress_callback: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> bool:
         wid = str(workspace_id or "").strip()
         sid = str(session_id or "").strip()
         if not wid or not sid:
             return False
-        ws_key = self._workspace_context_key(wid)
+        oid = str(owner_id or "").strip()
+        ws_key = self._workspace_context_key(wid, owner_id=oid)
+        if self._auth_allow_legacy and oid:
+            legacy_key = self._workspace_context_key(wid, owner_id=None)
+            if self._context_set_path_for_key(legacy_key).exists():
+                ws_key = legacy_key
         ws_lock = self._session_lock_for(ws_key)
         s_lock = self._session_lock_for(sid)
         # Acquire both locks in deterministic order only for short commit windows.
@@ -4482,7 +4684,9 @@ class RunManager:
         for _attempt in range(max_attempts):
             # Snapshot source workspace context quickly under workspace lock.
             with ws_lock:
-                src = self._load_context_set_for_key_locked(ws_key, "workspace", wid)
+                src = self._load_context_set_for_key_locked(
+                    ws_key, "workspace", wid
+                )
                 src_revision = int(src.get("revision", 1) or 1)
                 src_files = [
                     copy.deepcopy(f)

@@ -15,10 +15,15 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set API keys:
+Set API/auth environment variables:
 
 ```bash
 export OPENAI_API_KEY=...
+export AUTH0_DOMAIN=your-tenant.us.auth0.com
+export AUTH0_CLIENT_ID=...
+export AUTH0_CLIENT_SECRET=...
+export PUBLIC_BASE_URL=http://localhost:8000
+export AUTH_COOKIE_SECRET=change-me-to-a-long-random-secret
 ```
 
 Optional model override:
@@ -26,6 +31,15 @@ Optional model override:
 ```bash
 export OPENAI_MODEL=gpt-4.1
 export OPENAI_REPORT_MODEL=gpt-5.2
+```
+
+Optional auth tuning:
+
+```bash
+export AUTH0_CONNECTION_NAME=email
+export SESSION_TTL_DAYS=3
+export AUTH_ALLOW_LEGACY=false
+# export AUTH_COOKIE_SECURE=false   # useful for local http dev
 ```
 
 ## Usage
@@ -47,6 +61,20 @@ Then open:
 ```text
 http://<your-vm-ip>:8000/
 ```
+
+The web app is now authenticated:
+
+- unauthenticated users are redirected to `/login`
+- login uses Auth0 Universal Login (passwordless email OTP)
+- all `/api/*` routes require authentication
+- users only see/access their own sessions, runs, context files, SSE streams, and reports
+
+Auth routes:
+
+- `GET /login`
+- `GET /auth/callback`
+- `POST /logout`
+- `GET /auth/me`
 
 Key web endpoints:
 
@@ -95,6 +123,27 @@ Options:
 - Task traversal is lazy-first and depth-first: each node tries direct search first, then decomposes and explores children before moving to sibling branches.
 - Large evidence payloads are compacted before sufficiency/report calls to reduce token pressure.
 - LLM calls use retry with backoff on rate limits.
+- Web run/session ownership is enforced by `owner_id` (Auth0 `sub`) on backend access paths.
+- Workspace-staged context is user-scoped internally to avoid cross-user collisions.
+
+## Auth0 Dashboard Setup (Web App)
+
+Configure your Auth0 Application (Regular Web Application):
+
+- Allowed Callback URLs:
+  - `http://localhost:8000/auth/callback`
+  - `https://<your-domain>/auth/callback`
+- Allowed Logout URLs:
+  - `http://localhost:8000/`
+  - `https://<your-domain>/`
+- Allowed Web Origins:
+  - `http://localhost:8000`
+  - `https://<your-domain>`
+
+Enable passwordless email OTP:
+
+- Authentication -> Passwordless -> Email
+- enable the `email` connection (or your configured `AUTH0_CONNECTION_NAME`) for this app
 
 ## Prompt Customization
 

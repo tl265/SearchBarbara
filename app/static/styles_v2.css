@@ -41,6 +41,14 @@ body {
 
 h1 { margin: 0; font-size: 1.4rem; }
 .subtitle { margin: 2px 0 0; color: var(--muted); font-size: 0.9rem; }
+.auth-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.auth-box form {
+  margin: 0;
+}
 
 .top-metrics {
   display: flex;

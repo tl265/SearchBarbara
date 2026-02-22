@@ -13,6 +13,12 @@
         <h1>SearchBarbara</h1>
         <p class="subtitle">Thinking-partner mode</p>
       </div>
+      <div class="auth-box">
+        <span class="muted">{{ user_email }}</span>
+        <form method="post" action="/logout">
+          <button type="submit">Logout</button>
+        </form>
+      </div>
       <div class="top-metrics">
         <div><span class="k">Run</span><span id="runStatus">idle</span></div>
         <div><span class="k">Research</span><span id="researchStatus">idle</span></div>
