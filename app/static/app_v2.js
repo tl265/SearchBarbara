@@ -369,9 +369,8 @@ function setContextBusy(busy) {
 
 function refreshContextUploadButtonState() {
   if (!contextUploadBtn) return;
-  const hasFiles = !!(contextUploadInput && contextUploadInput.files && contextUploadInput.files.length);
   const disabled = !!contextInputLocked || !!contextMutationInFlight;
-  contextUploadBtn.disabled = disabled || !hasFiles;
+  contextUploadBtn.disabled = disabled;
   contextUploadBtn.textContent = contextMutationInFlight ? "Uploading..." : "Upload Files";
   if (contextUploadInput) {
     contextUploadInput.disabled = disabled;
@@ -2508,12 +2507,22 @@ if (newSessionBtn) {
 
 if (contextUploadBtn) {
   contextUploadBtn.addEventListener("click", async () => {
+    if (contextMutationInFlight || contextInputLocked) return;
+    if (contextUploadInput) {
+      contextUploadInput.click();
+    }
+  });
+}
+
+if (contextUploadInput) {
+  contextUploadInput.addEventListener("change", async () => {
+    refreshContextUploadButtonState();
+    const files = contextUploadInput && contextUploadInput.files ? contextUploadInput.files : null;
+    if (!files || files.length === 0) return;
     try {
-      await uploadContextFiles(contextUploadInput && contextUploadInput.files ? contextUploadInput.files : []);
-      if (contextUploadInput) {
-        contextUploadInput.value = "";
-        refreshContextUploadButtonState();
-      }
+      await uploadContextFiles(files);
+      contextUploadInput.value = "";
+      refreshContextUploadButtonState();
     } catch (err) {
       const msg = err && err.message ? err.message : String(err);
       if (msg === "Context update already in progress. Please wait.") {
@@ -2522,12 +2531,6 @@ if (contextUploadBtn) {
         showError(msg);
       }
     }
-  });
-}
-
-if (contextUploadInput) {
-  contextUploadInput.addEventListener("change", () => {
-    refreshContextUploadButtonState();
   });
 }
 
