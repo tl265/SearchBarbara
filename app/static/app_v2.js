@@ -400,7 +400,13 @@ function renderContextPane() {
     seenFileKeys.add(key);
     dedupFiles.push(f);
   }
-  const aggStatus = contextStatusLabel(set.aggregate_digest_status || "stale");
+  const startupPhase = currentStartupPhase();
+  const startupParsing = isStartupBindingPhase(startupPhase) && startupPhase === "parsing_context";
+  const aggRaw = String(set.aggregate_digest_status || "stale");
+  const aggRawEffective = (startupParsing && (aggRaw === "stale" || aggRaw === "uploaded" || !aggRaw))
+    ? "parsing"
+    : aggRaw;
+  const aggStatus = contextStatusLabel(aggRawEffective || "stale");
   const sourceSuffix = currentContextSource === "workspace" ? " · Source staged workspace" : "";
   contextMetaEl.textContent = `Revision ${rev} · Aggregate ${aggStatus}${sourceSuffix}`;
   contextDiffBannerEl.textContent = "";
@@ -411,8 +417,12 @@ function renderContextPane() {
   } else {
     const existingHtml = dedupFiles.map((f) => {
       const fid = String(f.file_id || "");
-      const status = contextStatusLabel(f.digest_status || "stale");
-      const chipClass = contextStateClass(status);
+      const rawStatus = String(f.digest_status || "stale").trim().toLowerCase();
+      const effectiveRawStatus = (startupParsing && (rawStatus === "stale" || rawStatus === "uploaded" || !rawStatus))
+        ? "parsing"
+        : rawStatus;
+      const status = contextStatusLabel(effectiveRawStatus);
+      const chipClass = contextStateClass(effectiveRawStatus);
       return `<div class="context-file-row" data-file-id="${esc(fid)}">
         <div class="context-file-main">
           <div class="context-file-name">${esc(f.filename || fid)}</div>
@@ -1852,6 +1862,12 @@ function pickAutoFollowTargetNode() {
   return best;
 }
 
+function isAbortPendingSnapshot(snap) {
+  if (!snap || typeof snap !== "object") return false;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  return !!tree.abort_pending;
+}
+
 function applySnapshot(snap) {
   currentSnapshot = snap;
   const sid = String(snap.session_id || snap.run_id || "").trim();
@@ -1944,6 +1960,7 @@ function applySnapshot(snap) {
   const running = researchState ? researchState === "running" : executionState === "running";
   const paused = researchState ? researchState === "paused" : executionState === "paused";
   const terminal = researchState ? researchState === "terminal" : ["completed", "aborted", "failed"].includes(executionState);
+  const abortPending = abortRequested || isAbortPendingSnapshot(snap);
   const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
   const reportState = String(snap.report_state || "").toLowerCase();
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
@@ -1955,7 +1972,7 @@ function applySnapshot(snap) {
   pauseBtn.disabled = !(running && !reportBusy);
   resumeBtn.disabled = !(paused && !reportBusy);
   abortBtn.disabled = !((running || paused) && !reportBusy);
-  abortBtn.textContent = abortRequested && !abortBtn.disabled ? "Stopping..." : "Abort Research";
+  abortBtn.textContent = abortPending && !abortBtn.disabled ? "Stopping..." : "Abort Research";
 
   const hasDownloadableReport = !!reportFilePath;
   downloadBtn.disabled = !hasDownloadableReport;
@@ -2112,6 +2129,9 @@ function connectEvents(runId) {
         }
         if (parsed.event_type === "report_generation_completed" || parsed.event_type === "report_generation_failed") {
           reportGeneratingRunIds.delete(String(runId));
+        }
+        if (parsed.event_type === "run_abort_requested" || parsed.event_type === "abort_requested") {
+          abortRequested = true;
         }
         if (parsed.event_type === "run_aborted" || parsed.event_type === "run_completed" || parsed.event_type === "run_failed") {
           abortRequested = false;
