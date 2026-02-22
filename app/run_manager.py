@@ -1582,6 +1582,8 @@ class RunManager:
         if et == "run_started":
             state.status = "running"
             state.execution_state = "running"
+            if isinstance(tree, dict):
+                tree["abort_pending"] = False
             self._set_report_phase_locked(
                 state,
                 report_status="pending",
@@ -1828,6 +1830,8 @@ class RunManager:
         if et == "run_completed":
             state.status = "completed"
             state.execution_state = "completed"
+            if isinstance(tree, dict):
+                tree["abort_pending"] = False
             self._set_report_phase_locked(
                 state,
                 report_status="completed",
@@ -1840,6 +1844,8 @@ class RunManager:
             state.status = "failed"
             state.execution_state = "failed"
             state.error = str(payload.get("error", "unknown error"))
+            if isinstance(tree, dict):
+                tree["abort_pending"] = False
             self._set_report_phase_locked(
                 state,
                 report_status="failed",
@@ -1852,6 +1858,8 @@ class RunManager:
             state.status = "failed"
             state.execution_state = "aborted"
             state.error = str(payload.get("error", "Run aborted by user"))
+            if isinstance(tree, dict):
+                tree["abort_pending"] = False
             self._set_report_phase_locked(
                 state,
                 report_status="failed",
@@ -1860,7 +1868,13 @@ class RunManager:
                 report_error=state.error,
             )
             return
+        if et == "run_abort_requested":
+            if isinstance(tree, dict):
+                tree["abort_pending"] = True
+            return
         if et == "abort_requested":
+            if isinstance(tree, dict):
+                tree["abort_pending"] = True
             return
         if et == "abort_acknowledged":
             return
