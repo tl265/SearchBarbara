@@ -2,13 +2,22 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Iterator, List
 import json
+import os
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
-from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
+from app.auth import AuthConfig, AuthService, get_current_user_from_request
 from app.models import (
     ContextDigestResponse,
     ContextFileDetailResponse,
@@ -209,8 +218,12 @@ def _load_web_config() -> Dict[str, Any]:
 
 
 WEB_CONFIG = _load_web_config()
+AUTH_CONFIG = AuthConfig()
+auth_service = AuthService(AUTH_CONFIG)
 run_manager = RunManager(
     heartbeat_interval_sec=float(WEB_CONFIG.get("heartbeat_interval_sec", 8)),
+    auth_allow_legacy=str(os.getenv("AUTH_ALLOW_LEGACY", "false")).strip().lower()
+    in {"1", "true", "yes"},
     context_preprocess_enabled=bool(
         WEB_CONFIG.get("context_preprocess_enabled", True)
     ),
@@ -244,12 +257,160 @@ run_manager = RunManager(
 )
 
 
+def _current_user(request: Request):
+    user = getattr(request.state, "user", None)
+    if user is None:
+        user = get_current_user_from_request(request, auth_service)
+    return user
+
+
+def _require_user(request: Request):
+    user = _current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return user
+
+
+def _set_session_cookie(response: Response, user_id: str, email: str | None) -> None:
+    token = auth_service.build_session_cookie_value(user_id=user_id, email=email)
+    max_age = int(AUTH_CONFIG.session_ttl_days * 86400)
+    response.set_cookie(
+        key=AuthService.SESSION_COOKIE_NAME,
+        value=token,
+        max_age=max_age,
+        httponly=True,
+        secure=AUTH_CONFIG.cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(AuthService.SESSION_COOKIE_NAME, path="/")
+    response.delete_cookie(AuthService.STATE_COOKIE_NAME, path="/")
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path or "/"
+    public_paths = {
+        "/login",
+        "/auth/callback",
+        "/logout",
+        "/auth/me",
+    }
+    if path.startswith("/static/") or path in public_paths:
+        return await call_next(request)
+
+    protected = path == "/" or path == "/legacy" or path.startswith("/api/")
+    if not protected:
+        return await call_next(request)
+
+    if not AUTH_CONFIG.configured:
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=500, content={"error": "auth_not_configured"})
+        return HTMLResponse(
+            "<h2>Auth not configured.</h2><p>Set AUTH0_* and AUTH_COOKIE_SECRET env vars.</p>",
+            status_code=500,
+        )
+
+    user = get_current_user_from_request(request, auth_service)
+    if not user:
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return RedirectResponse(url="/login", status_code=302)
+
+    request.state.user = user
+    response = await call_next(request)
+    # Sliding renewal on authenticated traffic.
+    _set_session_cookie(response, user.user_id, user.email)
+    return response
+
+
+@app.get("/login")
+def login() -> RedirectResponse:
+    auth_service.ensure_configured()
+    state, nonce = auth_service.mint_state_nonce()
+    resp = RedirectResponse(url=auth_service.build_authorize_url(state, nonce), status_code=302)
+    resp.set_cookie(
+        key=AuthService.STATE_COOKIE_NAME,
+        value=auth_service.make_state_cookie_value(state, nonce),
+        max_age=600,
+        httponly=True,
+        secure=AUTH_CONFIG.cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.get("/auth/callback")
+def auth_callback(request: Request, code: str = "", state: str = "") -> Response:
+    auth_service.ensure_configured()
+    if not code or not state:
+        return HTMLResponse(
+            "<h2>Login failed</h2><p>Missing code/state.</p><p><a href='/login'>Try again</a></p>",
+            status_code=400,
+        )
+    state_cookie = request.cookies.get(AuthService.STATE_COOKIE_NAME, "")
+    saved = auth_service.parse_state_cookie(state_cookie)
+    if not saved or str(saved.get("state", "")).strip() != str(state).strip():
+        return HTMLResponse(
+            "<h2>Login failed</h2><p>State validation failed.</p><p><a href='/login'>Try again</a></p>",
+            status_code=400,
+        )
+    try:
+        tokens = auth_service.exchange_code_for_tokens(code)
+        id_token = str(tokens.get("id_token", "")).strip()
+        if not id_token:
+            raise RuntimeError("Missing id_token in token response.")
+        claims = auth_service.validate_id_token(
+            id_token, nonce=str(saved.get("nonce", ""))
+        )
+        user_id = str(claims.get("sub", "")).strip()
+        email = str(claims.get("email", "")).strip() or None
+        if not user_id:
+            raise RuntimeError("Missing subject claim.")
+        resp = RedirectResponse(url="/", status_code=302)
+        _clear_auth_cookies(resp)
+        _set_session_cookie(resp, user_id, email)
+        return resp
+    except Exception as exc:
+        return HTMLResponse(
+            (
+                "<h2>Login failed</h2>"
+                f"<p>{str(exc)}</p>"
+                "<p><a href='/login'>Try again</a></p>"
+            ),
+            status_code=401,
+        )
+
+
+@app.post("/logout")
+def logout() -> RedirectResponse:
+    resp = RedirectResponse(url=auth_service.cfg.logout_url or "/", status_code=302)
+    _clear_auth_cookies(resp)
+    return resp
+
+
+@app.get("/auth/me")
+def auth_me(request: Request) -> Dict[str, Any]:
+    user = _require_user(request)
+    return {
+        "user_id": user.user_id,
+        "email": user.email,
+        "session_expires_at": user.session_expires_at,
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request) -> HTMLResponse:
+    user = _require_user(request)
     return templates.TemplateResponse(
         request,
         "index_v2.html",
         {
+            "user_email": user.email or user.user_id,
             "min_canvas_zoom": float(WEB_CONFIG.get("min_canvas_zoom", 0.45)),
             "auto_fit_safety_px": int(WEB_CONFIG.get("auto_fit_safety_px", 10)),
             "max_depth_min": int(WEB_CONFIG.get("max_depth_min", 1)),
@@ -267,6 +428,7 @@ def index(request: Request) -> HTMLResponse:
 
 @app.get("/legacy", response_class=HTMLResponse)
 def index_legacy(request: Request) -> HTMLResponse:
+    _require_user(request)
     return templates.TemplateResponse(
         request,
         "index.html",
@@ -451,6 +613,7 @@ def _raise_on_idempotency_state(state: str) -> None:
 
 @app.post("/api/runs", response_model=CreateRunResponse)
 def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
+    user = _require_user(request)
     max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
     max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
     rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
@@ -468,7 +631,7 @@ def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
     model = str(WEB_CONFIG.get("model", "gpt-4.1"))
     report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
     idem_key = _idempotency_key_from_request(request)
-    idem_scope = "create_run"
+    idem_scope = f"create_run:{user.user_id}"
     idem_payload = {
         "task": req.task,
         "max_depth": int(req.max_depth),
@@ -495,6 +658,7 @@ def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
             results_per_query=req.results_per_query,
             model=model,
             report_model=report_model,
+            owner_id=user.user_id,
         )
     except Exception:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
@@ -513,6 +677,7 @@ def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
 def create_run_from_workspace(
     req: StartFromWorkspaceRequest, request: Request
 ) -> CreateRunResponse:
+    user = _require_user(request)
     max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
     max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
     rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
@@ -533,7 +698,7 @@ def create_run_from_workspace(
     model = str(WEB_CONFIG.get("model", "gpt-4.1"))
     report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
     idem_key = _idempotency_key_from_request(request)
-    idem_scope = f"start_from_workspace:{workspace_id}"
+    idem_scope = f"start_from_workspace:{user.user_id}:{workspace_id}"
     idem_payload = {
         "workspace_id": workspace_id,
         "task": req.task,
@@ -562,6 +727,7 @@ def create_run_from_workspace(
             results_per_query=req.results_per_query,
             model=model,
             report_model=report_model,
+            owner_id=user.user_id,
         )
     except Exception:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
@@ -577,13 +743,15 @@ def create_run_from_workspace(
 
 
 @app.post("/api/sessions/draft", response_model=CreateRunResponse)
-def create_draft_session() -> CreateRunResponse:
+def create_draft_session(request: Request) -> CreateRunResponse:
+    user = _require_user(request)
     run_id = run_manager.create_draft_session(
         max_depth=int(WEB_CONFIG.get("default_max_depth", 3)),
         max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
         results_per_query=int(WEB_CONFIG.get("default_results_per_query", 3)),
         model=str(WEB_CONFIG.get("model", "gpt-4.1")),
         report_model=str(WEB_CONFIG.get("report_model", "gpt-5.2")),
+        owner_id=user.user_id,
     )
     return CreateRunResponse(run_id=run_id, status="queued")
 
@@ -594,6 +762,7 @@ def start_draft_session_run(
     req: CreateRunRequest,
     request: Request,
 ) -> CreateRunResponse:
+    user = _require_user(request)
     max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
     max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
     rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
@@ -638,6 +807,7 @@ def start_draft_session_run(
         results_per_query=req.results_per_query,
         model=model,
         report_model=report_model,
+        owner_id=user.user_id,
     )
     if out is None:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
@@ -656,8 +826,9 @@ def start_draft_session_run(
 
 
 @app.get("/api/runs/{run_id}", response_model=RunSnapshotResponse)
-def get_run(run_id: str) -> RunSnapshotResponse:
-    state = run_manager.get_snapshot(run_id)
+def get_run(run_id: str, request: Request) -> RunSnapshotResponse:
+    user = _require_user(request)
+    state = run_manager.get_snapshot(run_id, owner_id=user.user_id)
     if not state:
         raise HTTPException(status_code=404, detail="Run not found")
     insights, syntheses = _collect_tree_summaries(state.tree)
@@ -703,16 +874,19 @@ def get_run(run_id: str) -> RunSnapshotResponse:
 
 
 @app.get("/api/sessions", response_model=SessionListResponse)
-def list_sessions() -> SessionListResponse:
+def list_sessions(request: Request) -> SessionListResponse:
+    user = _require_user(request)
     sessions = run_manager.list_sessions(
+        owner_id=user.user_id,
         include_lock_debug=bool(WEB_CONFIG.get("ui_debug", False))
     )
     return SessionListResponse(sessions=sessions)
 
 
 @app.get("/api/sessions/{session_id}", response_model=RunSnapshotResponse)
-def get_session(session_id: str) -> RunSnapshotResponse:
-    state = run_manager.get_snapshot(session_id)
+def get_session(session_id: str, request: Request) -> RunSnapshotResponse:
+    user = _require_user(request)
+    state = run_manager.get_snapshot(session_id, owner_id=user.user_id)
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
     insights, syntheses = _collect_tree_summaries(state.tree)
@@ -758,16 +932,20 @@ def get_session(session_id: str) -> RunSnapshotResponse:
 
 
 @app.get("/api/sessions/{session_id}/context", response_model=ContextSetResponse)
-def get_session_context(session_id: str) -> ContextSetResponse:
-    context_set = run_manager.get_context_set(session_id)
+def get_session_context(session_id: str, request: Request) -> ContextSetResponse:
+    user = _require_user(request)
+    context_set = run_manager.get_context_set(session_id, owner_id=user.user_id)
     if context_set is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return ContextSetResponse.model_validate({"context_set": context_set})
 
 
 @app.get("/api/workspaces/{workspace_id}/context", response_model=ContextSetResponse)
-def get_workspace_context(workspace_id: str) -> ContextSetResponse:
-    context_set = run_manager.get_workspace_context_set(workspace_id)
+def get_workspace_context(workspace_id: str, request: Request) -> ContextSetResponse:
+    user = _require_user(request)
+    context_set = run_manager.get_workspace_context_set(
+        workspace_id, owner_id=user.user_id
+    )
     if context_set is None:
         raise HTTPException(status_code=404, detail="Workspace context not found")
     return ContextSetResponse.model_validate({"context_set": context_set})
@@ -777,8 +955,11 @@ def get_workspace_context(workspace_id: str) -> ContextSetResponse:
     "/api/sessions/{session_id}/context/files/{file_id}",
     response_model=ContextFileDetailResponse,
 )
-def get_context_file_detail(session_id: str, file_id: str) -> ContextFileDetailResponse:
-    out = run_manager.get_context_file(session_id, file_id)
+def get_context_file_detail(
+    session_id: str, file_id: str, request: Request
+) -> ContextFileDetailResponse:
+    user = _require_user(request)
+    out = run_manager.get_context_file(session_id, file_id, owner_id=user.user_id)
     if out is None:
         raise HTTPException(status_code=404, detail="Context file not found")
     return ContextFileDetailResponse.model_validate(out)
@@ -789,20 +970,26 @@ def get_context_file_detail(session_id: str, file_id: str) -> ContextFileDetailR
     response_model=ContextFileDetailResponse,
 )
 def get_workspace_context_file_detail(
-    workspace_id: str, file_id: str
+    workspace_id: str, file_id: str, request: Request
 ) -> ContextFileDetailResponse:
-    out = run_manager.get_workspace_context_file(workspace_id, file_id)
+    user = _require_user(request)
+    out = run_manager.get_workspace_context_file(
+        workspace_id, file_id, owner_id=user.user_id
+    )
     if out is None:
         raise HTTPException(status_code=404, detail="Context file not found")
     return ContextFileDetailResponse.model_validate(out)
 
 
 @app.get("/api/sessions/{session_id}/context/files/{file_id}/download")
-def download_context_file(session_id: str, file_id: str) -> Response:
-    out = run_manager.get_context_file(session_id, file_id)
+def download_context_file(session_id: str, file_id: str, request: Request) -> Response:
+    user = _require_user(request)
+    out = run_manager.get_context_file(session_id, file_id, owner_id=user.user_id)
     if out is None:
         raise HTTPException(status_code=404, detail="Context file not found")
-    blob = run_manager.get_context_file_bytes(session_id, file_id)
+    blob = run_manager.get_context_file_bytes(
+        session_id, file_id, owner_id=user.user_id
+    )
     if blob is None:
         raise HTTPException(status_code=404, detail="Context file bytes not found")
     data, filename, mime_type = blob
@@ -817,11 +1004,18 @@ def download_context_file(session_id: str, file_id: str) -> Response:
 
 
 @app.get("/api/workspaces/{workspace_id}/context/files/{file_id}/download")
-def download_workspace_context_file(workspace_id: str, file_id: str) -> Response:
-    out = run_manager.get_workspace_context_file(workspace_id, file_id)
+def download_workspace_context_file(
+    workspace_id: str, file_id: str, request: Request
+) -> Response:
+    user = _require_user(request)
+    out = run_manager.get_workspace_context_file(
+        workspace_id, file_id, owner_id=user.user_id
+    )
     if out is None:
         raise HTTPException(status_code=404, detail="Context file not found")
-    blob = run_manager.get_workspace_context_file_bytes(workspace_id, file_id)
+    blob = run_manager.get_workspace_context_file_bytes(
+        workspace_id, file_id, owner_id=user.user_id
+    )
     if blob is None:
         raise HTTPException(status_code=404, detail="Context file bytes not found")
     data, filename, mime_type = blob
@@ -839,8 +1033,13 @@ def download_workspace_context_file(workspace_id: str, file_id: str) -> Response
     "/api/sessions/{session_id}/context/files/{file_id}/digest",
     response_model=ContextDigestResponse,
 )
-def get_context_file_digest(session_id: str, file_id: str) -> ContextDigestResponse:
-    digest = run_manager.get_context_file_digest(session_id, file_id)
+def get_context_file_digest(
+    session_id: str, file_id: str, request: Request
+) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_context_file_digest(
+        session_id, file_id, owner_id=user.user_id
+    )
     if digest is None:
         raise HTTPException(status_code=404, detail="Context file digest not found")
     return ContextDigestResponse(digest=digest)
@@ -851,17 +1050,23 @@ def get_context_file_digest(session_id: str, file_id: str) -> ContextDigestRespo
     response_model=ContextDigestResponse,
 )
 def get_workspace_context_file_digest(
-    workspace_id: str, file_id: str
+    workspace_id: str, file_id: str, request: Request
 ) -> ContextDigestResponse:
-    digest = run_manager.get_workspace_context_file_digest(workspace_id, file_id)
+    user = _require_user(request)
+    digest = run_manager.get_workspace_context_file_digest(
+        workspace_id, file_id, owner_id=user.user_id
+    )
     if digest is None:
         raise HTTPException(status_code=404, detail="Context file digest not found")
     return ContextDigestResponse(digest=digest)
 
 
 @app.get("/api/sessions/{session_id}/context/digest", response_model=ContextDigestResponse)
-def get_context_aggregate_digest(session_id: str) -> ContextDigestResponse:
-    digest = run_manager.get_context_aggregate_digest(session_id)
+def get_context_aggregate_digest(session_id: str, request: Request) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_context_aggregate_digest(
+        session_id, owner_id=user.user_id
+    )
     if digest is None:
         raise HTTPException(status_code=404, detail="Aggregate context digest not found")
     return ContextDigestResponse(digest=digest)
@@ -871,8 +1076,13 @@ def get_context_aggregate_digest(session_id: str) -> ContextDigestResponse:
     "/api/workspaces/{workspace_id}/context/digest",
     response_model=ContextDigestResponse,
 )
-def get_workspace_context_aggregate_digest(workspace_id: str) -> ContextDigestResponse:
-    digest = run_manager.get_workspace_context_aggregate_digest(workspace_id)
+def get_workspace_context_aggregate_digest(
+    workspace_id: str, request: Request
+) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_workspace_context_aggregate_digest(
+        workspace_id, owner_id=user.user_id
+    )
     if digest is None:
         raise HTTPException(status_code=404, detail="Aggregate context digest not found")
     return ContextDigestResponse(digest=digest)
@@ -885,6 +1095,7 @@ async def upload_context_files(
     files: List[UploadFile] = File(...),
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ContextMutateResponse:
+    user = _require_user(request)
     expected_revision = _parse_if_match_revision(if_match)
     idem_key = _idempotency_key_from_request(request)
     uploads: List[Dict[str, Any]] = []
@@ -903,6 +1114,7 @@ async def upload_context_files(
         uploads=uploads,
         expected_revision=expected_revision,
         idempotency_key=idem_key,
+        owner_id=user.user_id,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -922,6 +1134,7 @@ async def upload_workspace_context_files(
     files: List[UploadFile] = File(...),
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ContextMutateResponse:
+    user = _require_user(request)
     expected_revision = _parse_if_match_revision(if_match)
     idem_key = _idempotency_key_from_request(request)
     uploads: List[Dict[str, Any]] = []
@@ -940,6 +1153,7 @@ async def upload_workspace_context_files(
         uploads=uploads,
         expected_revision=expected_revision,
         idempotency_key=idem_key,
+        owner_id=user.user_id,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Workspace not found")
@@ -963,6 +1177,7 @@ async def replace_context_file(
     file: UploadFile = File(...),
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ContextMutateResponse:
+    user = _require_user(request)
     expected_revision = _parse_if_match_revision(if_match)
     idem_key = _idempotency_key_from_request(request)
     data = await file.read()
@@ -978,6 +1193,7 @@ async def replace_context_file(
         upload=upload,
         expected_revision=expected_revision,
         idempotency_key=idem_key,
+        owner_id=user.user_id,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Context file not found")
@@ -1001,6 +1217,7 @@ async def replace_workspace_context_file(
     file: UploadFile = File(...),
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ContextMutateResponse:
+    user = _require_user(request)
     expected_revision = _parse_if_match_revision(if_match)
     idem_key = _idempotency_key_from_request(request)
     data = await file.read()
@@ -1016,6 +1233,7 @@ async def replace_workspace_context_file(
         upload=upload,
         expected_revision=expected_revision,
         idempotency_key=idem_key,
+        owner_id=user.user_id,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Context file not found")
@@ -1038,6 +1256,7 @@ def delete_context_file(
     request: Request,
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ContextMutateResponse:
+    user = _require_user(request)
     expected_revision = _parse_if_match_revision(if_match)
     idem_key = _idempotency_key_from_request(request)
     result = run_manager.delete_context_file(
@@ -1045,6 +1264,7 @@ def delete_context_file(
         file_id=file_id,
         expected_revision=expected_revision,
         idempotency_key=idem_key,
+        owner_id=user.user_id,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Context file not found")
@@ -1067,6 +1287,7 @@ def delete_workspace_context_file(
     request: Request,
     if_match: str | None = Header(default=None, alias="If-Match"),
 ) -> ContextMutateResponse:
+    user = _require_user(request)
     expected_revision = _parse_if_match_revision(if_match)
     idem_key = _idempotency_key_from_request(request)
     result = run_manager.delete_workspace_context_file(
@@ -1074,6 +1295,7 @@ def delete_workspace_context_file(
         file_id=file_id,
         expected_revision=expected_revision,
         idempotency_key=idem_key,
+        owner_id=user.user_id,
     )
     if result is None:
         raise HTTPException(status_code=404, detail="Context file not found")
@@ -1086,7 +1308,7 @@ def delete_workspace_context_file(
     return ContextMutateResponse.model_validate(result)
 
 
-def _context_event_stream(session_id: str, q: Queue) -> Iterator[str]:
+def _context_event_stream(session_id: str, q: Queue, owner_id: str) -> Iterator[str]:
     try:
         while True:
             try:
@@ -1095,23 +1317,27 @@ def _context_event_stream(session_id: str, q: Queue) -> Iterator[str]:
             except Empty:
                 yield ": keep-alive\n\n"
     finally:
-        run_manager.unsubscribe_context(session_id, q)
+        run_manager.unsubscribe_context(session_id, q, owner_id=owner_id)
 
 
 @app.get("/api/sessions/{session_id}/context/stream")
-def stream_context_events(session_id: str) -> StreamingResponse:
-    q = run_manager.subscribe_context(session_id)
+def stream_context_events(session_id: str, request: Request) -> StreamingResponse:
+    user = _require_user(request)
+    q = run_manager.subscribe_context(session_id, owner_id=user.user_id)
     if q is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return StreamingResponse(
-        _context_event_stream(session_id, q),
+        _context_event_stream(session_id, q, owner_id=user.user_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 
 
 @app.patch("/api/sessions/{session_id}")
-def rename_session(session_id: str, req: PatchSessionRequest) -> dict:
+def rename_session(session_id: str, req: PatchSessionRequest, request: Request) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(session_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Session not found")
     clean = " ".join(str(req.title or "").split()).strip()
     if not clean:
         raise HTTPException(status_code=422, detail="Title must contain non-whitespace characters.")
@@ -1122,7 +1348,10 @@ def rename_session(session_id: str, req: PatchSessionRequest) -> dict:
 
 
 @app.delete("/api/sessions/{session_id}")
-def delete_session(session_id: str) -> dict:
+def delete_session(session_id: str, request: Request) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(session_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Session not found")
     result = run_manager.delete_session(session_id)
     if result is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1134,7 +1363,7 @@ def delete_session(session_id: str) -> dict:
     return {"session_id": session_id, "status": "deleted"}
 
 
-def _event_stream(run_id: str, q: Queue) -> Iterator[str]:
+def _event_stream(run_id: str, q: Queue, owner_id: str) -> Iterator[str]:
     try:
         while True:
             try:
@@ -1143,16 +1372,17 @@ def _event_stream(run_id: str, q: Queue) -> Iterator[str]:
             except Empty:
                 yield ": keep-alive\n\n"
     finally:
-        run_manager.unsubscribe(run_id, q)
+        run_manager.unsubscribe(run_id, q, owner_id=owner_id)
 
 
 @app.get("/api/runs/{run_id}/events")
-def stream_events(run_id: str) -> StreamingResponse:
-    q = run_manager.subscribe(run_id)
+def stream_events(run_id: str, request: Request) -> StreamingResponse:
+    user = _require_user(request)
+    q = run_manager.subscribe(run_id, owner_id=user.user_id)
     if q is None:
         raise HTTPException(status_code=404, detail="Run not found")
     return StreamingResponse(
-        _event_stream(run_id, q),
+        _event_stream(run_id, q, owner_id=user.user_id),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
@@ -1160,9 +1390,12 @@ def stream_events(run_id: str) -> StreamingResponse:
 
 @app.get("/api/runs/{run_id}/report/download")
 def download_report(
-    run_id: str, version_index: int | None = Query(default=None, ge=1)
+    run_id: str,
+    request: Request,
+    version_index: int | None = Query(default=None, ge=1),
 ) -> FileResponse:
-    state = run_manager.get_snapshot(run_id)
+    user = _require_user(request)
+    state = run_manager.get_snapshot(run_id, owner_id=user.user_id)
     if not state:
         raise HTTPException(status_code=404, detail="Run not found")
     report_file_path = state.report_file_path
@@ -1189,6 +1422,9 @@ def abort_run(
     request: Request,
     expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
     idem_key = _idempotency_key_from_request(request)
     idem_scope = f"control_abort:{run_id}"
     idem_payload = {"run_id": run_id, "action": "abort"}
@@ -1226,7 +1462,14 @@ def abort_run(
 
 
 @app.post("/api/runs/{run_id}/pause")
-def pause_run(run_id: str, expected_version: int | None = Query(default=None, ge=1)) -> dict:
+def pause_run(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
     result = run_manager.pause_run(run_id, expected_version=expected_version)
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1240,7 +1483,14 @@ def pause_run(run_id: str, expected_version: int | None = Query(default=None, ge
 
 
 @app.post("/api/runs/{run_id}/resume")
-def resume_run(run_id: str, expected_version: int | None = Query(default=None, ge=1)) -> dict:
+def resume_run(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
     result = run_manager.resume_run(run_id, expected_version=expected_version)
     if result is None:
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1259,6 +1509,9 @@ def generate_partial_report(
     request: Request,
     expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
     idem_key = _idempotency_key_from_request(request)
     idem_scope = f"report_partial:{run_id}"
     idem_payload = {
@@ -1306,6 +1559,9 @@ def generate_report_now(
     request: Request,
     expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
     idem_key = _idempotency_key_from_request(request)
     idem_scope = f"report_full:{run_id}"
     idem_payload = {
@@ -1350,9 +1606,13 @@ def generate_report_now(
 @app.post("/api/runs/{run_id}/report/select")
 def select_report_version(
     run_id: str,
+    request: Request,
     version_index: int = Query(..., ge=1),
     expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
     result = run_manager.select_report_version(
         run_id, version_index, expected_version=expected_version
     )
