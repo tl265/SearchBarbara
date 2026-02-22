@@ -103,10 +103,14 @@ let lastDebugReportPhaseKey = "";
 let contextEs = null;
 let currentContextSet = null;
 let selectedContextFileId = "";
-let contextLoading = false;
 let contextMutationInFlight = false;
 let pendingUploadFiles = [];
 let contextInputLocked = false;
+const contextFetchStateByKey = new Map();
+const contextRefreshDebounceTimerByKey = new Map();
+const contextFetchSeqByKey = new Map();
+const stagedContextBySessionId = new Map();
+let currentContextSource = "session";
 let errorBannerTimer = null;
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
@@ -158,7 +162,8 @@ function resetWorkspaceForNewSession() {
     contextEs = null;
   }
   currentRunId = null;
-  currentWorkspaceId = ensureWorkspaceId();
+  // Start a truly fresh workspace context for each new session/reset.
+  currentWorkspaceId = newWorkspaceId();
   currentSnapshot = null;
   abortRequested = false;
   reportGeneratingRunIds.clear();
@@ -236,10 +241,10 @@ function ensureWorkspaceId() {
   return currentWorkspaceId;
 }
 
-function contextBasePath() {
-  const sid = String(currentRunId || "").trim();
+function contextBasePath(runIdOverride = "", workspaceIdOverride = "") {
+  const sid = String(runIdOverride || currentRunId || "").trim();
   if (sid) return `/api/sessions/${encodeURIComponent(sid)}/context`;
-  const wid = ensureWorkspaceId();
+  const wid = String(workspaceIdOverride || ensureWorkspaceId()).trim();
   return `/api/workspaces/${encodeURIComponent(wid)}/context`;
 }
 
@@ -351,6 +356,7 @@ function setContextEnabled(enabled) {
 
 function clearContextPane(msg = "No context files uploaded.") {
   currentContextSet = null;
+  currentContextSource = "session";
   selectedContextFileId = "";
   contextMetaEl.textContent = msg;
   contextDiffBannerEl.textContent = "";
@@ -395,7 +401,8 @@ function renderContextPane() {
     dedupFiles.push(f);
   }
   const aggStatus = contextStatusLabel(set.aggregate_digest_status || "stale");
-  contextMetaEl.textContent = `Revision ${rev} · Aggregate ${aggStatus}`;
+  const sourceSuffix = currentContextSource === "workspace" ? " · Source staged workspace" : "";
+  contextMetaEl.textContent = `Revision ${rev} · Aggregate ${aggStatus}${sourceSuffix}`;
   contextDiffBannerEl.textContent = "";
 
   const pendingRows = Array.isArray(pendingUploadFiles) ? pendingUploadFiles : [];
@@ -430,6 +437,45 @@ function renderContextPane() {
     }).join("");
     contextFilesEl.innerHTML = existingHtml + pendingHtml;
   }
+}
+
+function cloneJson(v) {
+  try {
+    return JSON.parse(JSON.stringify(v));
+  } catch (_err) {
+    return v;
+  }
+}
+
+function currentStartupPhase() {
+  const tree = currentSnapshot && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
+  return String(tree.startup_phase || "").trim().toLowerCase();
+}
+
+function currentPendingWorkspaceId() {
+  const tree = currentSnapshot && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
+  return String(tree.pending_workspace_id || "").trim();
+}
+
+function isStartupBindingPhase(phase) {
+  const p = String(phase || "").trim().toLowerCase();
+  return p === "queued_for_binding" || p === "binding_context" || p === "parsing_context";
+}
+
+function hasUsableContextData(set) {
+  if (!set || typeof set !== "object") return false;
+  const files = Array.isArray(set.files) ? set.files : [];
+  if (files.length > 0) return true;
+  const agg = String(set.aggregate_digest_status || "").trim().toLowerCase();
+  return agg === "ready" || agg === "error" || agg === "parsing";
+}
+
+async function fetchContextSetRawByPath(path) {
+  const rsp = await fetch(path);
+  if (!rsp.ok) return null;
+  const data = await rsp.json();
+  const set = data && data.context_set ? data.context_set : null;
+  return set && typeof set === "object" ? set : null;
 }
 
 function markContextFilesParsingStarted() {
@@ -472,7 +518,7 @@ function markContextFileParsingProgress(payload) {
   renderContextPane();
 }
 
-async function fetchContextAggregateDigest() {
+async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverride = "") {
   if (!UI_DEBUG) {
     if (contextAggregateDigestEl) {
       contextAggregateDigestEl.textContent = "";
@@ -481,7 +527,7 @@ async function fetchContextAggregateDigest() {
   }
   const set = currentContextSet && typeof currentContextSet === "object" ? currentContextSet : {};
   const files = Array.isArray(set.files) ? set.files.filter((f) => f && typeof f === "object") : [];
-  const base = contextBasePath();
+  const base = contextBasePath(runIdOverride, workspaceIdOverride);
   const singleFileId = files.length === 1 ? String(files[0].file_id || "").trim() : "";
 
   const renderError = (statusCode, label) => {
@@ -524,10 +570,10 @@ async function fetchContextAggregateDigest() {
   contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
 }
 
-async function fetchContextFileDigest(fileId) {
+async function fetchContextFileDigest(fileId, runIdOverride = "", workspaceIdOverride = "") {
   const fid = String(fileId || "").trim();
   if (!fid) return;
-  const rsp = await fetch(`${contextBasePath()}/files/${encodeURIComponent(fid)}/digest`);
+  const rsp = await fetch(`${contextBasePath(runIdOverride, workspaceIdOverride)}/files/${encodeURIComponent(fid)}/digest`);
   if (!contextFileDigestEl) {
     return;
   }
@@ -540,32 +586,118 @@ async function fetchContextFileDigest(fileId) {
   contextFileDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
 }
 
-async function fetchContextSet() {
-  if (contextLoading) return;
-  contextLoading = true;
+function resolveContextTarget(runIdOverride = "", workspaceIdOverride = "") {
+  const rid = String(runIdOverride || currentRunId || "").trim();
+  const wid = rid ? "" : String(workspaceIdOverride || ensureWorkspaceId()).trim();
+  const key = rid ? `s:${rid}` : `w:${wid}`;
+  return { rid, wid, key };
+}
+
+async function fetchContextSetOnce(runIdOverride = "", workspaceIdOverride = "") {
+  const target = resolveContextTarget(runIdOverride, workspaceIdOverride);
+  const reqSeq = Number(contextFetchSeqByKey.get(target.key) || 0) + 1;
+  contextFetchSeqByKey.set(target.key, reqSeq);
   try {
-    const rsp = await fetch(contextBasePath());
-    if (!rsp.ok) {
-      throw new Error(`Context load failed: ${rsp.status}`);
+    const primarySet = await fetchContextSetRawByPath(contextBasePath(target.rid, target.wid));
+    if (!primarySet) {
+      throw new Error("Context load failed.");
     }
-    const data = await rsp.json();
-    currentContextSet = data && data.context_set ? data.context_set : null;
+    if (target.rid) {
+      if (String(currentRunId || "") !== target.rid) return;
+    } else if (String(currentRunId || "").trim()) {
+      return;
+    }
+    if (Number(contextFetchSeqByKey.get(target.key) || 0) !== reqSeq) return;
+    let chosenSet = primarySet;
+    let chosenSource = target.rid ? "session" : "workspace";
+    if (target.rid) {
+      const phase = currentStartupPhase();
+      const pendingWid = currentPendingWorkspaceId();
+      const preferWorkspace = isStartupBindingPhase(phase) && !!pendingWid && !hasUsableContextData(primarySet);
+      if (preferWorkspace) {
+        const cached = stagedContextBySessionId.get(target.rid);
+        if (cached && cached.contextSet && typeof cached.contextSet === "object") {
+          chosenSet = cloneJson(cached.contextSet);
+          chosenSource = "workspace";
+        } else if (pendingWid) {
+          const wsSet = await fetchContextSetRawByPath(
+            `/api/workspaces/${encodeURIComponent(pendingWid)}/context`
+          );
+          if (wsSet && typeof wsSet === "object") {
+            stagedContextBySessionId.set(target.rid, {
+              workspaceId: pendingWid,
+              contextSet: cloneJson(wsSet),
+            });
+            chosenSet = wsSet;
+            chosenSource = "workspace";
+          }
+        }
+      } else if (hasUsableContextData(primarySet)) {
+        stagedContextBySessionId.delete(target.rid);
+      }
+    }
+    currentContextSet = chosenSet;
+    currentContextSource = chosenSource;
     renderContextPane();
     if (UI_DEBUG) {
-      await fetchContextAggregateDigest();
+      if (chosenSource === "workspace" && target.rid) {
+        const wsid = currentPendingWorkspaceId();
+        await fetchContextAggregateDigest("", wsid);
+      } else {
+        await fetchContextAggregateDigest(target.rid, target.wid);
+      }
     } else if (contextAggregateDigestEl) {
       contextAggregateDigestEl.textContent = "";
     }
     if (selectedContextFileId && contextFileDigestEl) {
-      await fetchContextFileDigest(selectedContextFileId);
+      if (chosenSource === "workspace" && target.rid) {
+        const wsid = currentPendingWorkspaceId();
+        await fetchContextFileDigest(selectedContextFileId, "", wsid);
+      } else {
+        await fetchContextFileDigest(selectedContextFileId, target.rid, target.wid);
+      }
     } else if (contextFileDigestEl) {
       contextFileDigestEl.textContent = "";
     }
   } catch (_err) {
-    clearContextPane("Context unavailable.");
-  } finally {
-    contextLoading = false;
+    const currentRid = String(currentRunId || "").trim();
+    const activeMatches = target.rid ? currentRid === target.rid : !currentRid;
+    if (activeMatches && Number(contextFetchSeqByKey.get(target.key) || 0) === reqSeq) {
+      clearContextPane("Context unavailable.");
+    }
   }
+}
+
+async function scheduleContextRefresh(runIdOverride = "", workspaceIdOverride = "") {
+  const target = resolveContextTarget(runIdOverride, workspaceIdOverride);
+  const st = contextFetchStateByKey.get(target.key) || { inFlight: false, queued: false };
+  st.queued = true;
+  if (st.inFlight) {
+    contextFetchStateByKey.set(target.key, st);
+    return;
+  }
+  st.inFlight = true;
+  contextFetchStateByKey.set(target.key, st);
+  try {
+    do {
+      st.queued = false;
+      await fetchContextSetOnce(target.rid, target.wid);
+    } while (st.queued);
+  } finally {
+    contextFetchStateByKey.delete(target.key);
+  }
+}
+
+function scheduleContextRefreshDebounced(runIdOverride = "", workspaceIdOverride = "", delayMs = 180) {
+  const target = resolveContextTarget(runIdOverride, workspaceIdOverride);
+  if (contextRefreshDebounceTimerByKey.has(target.key)) {
+    clearTimeout(contextRefreshDebounceTimerByKey.get(target.key));
+  }
+  const t = setTimeout(() => {
+    contextRefreshDebounceTimerByKey.delete(target.key);
+    void scheduleContextRefresh(target.rid, target.wid);
+  }, delayMs);
+  contextRefreshDebounceTimerByKey.set(target.key, t);
 }
 
 function connectContextEvents(runId) {
@@ -578,7 +710,7 @@ function connectContextEvents(runId) {
   contextEs = new EventSource(`/api/sessions/${encodeURIComponent(rid)}/context/stream`);
   const onContextEvt = async () => {
     if (String(currentRunId || "") !== rid) return;
-    await fetchContextSet();
+    await scheduleContextRefresh(rid);
   };
   contextEs.onmessage = onContextEvt;
   contextEs.addEventListener("context_updated", onContextEvt);
@@ -1883,7 +2015,8 @@ async function openSession(runId, opts = {}) {
   abortRequested = false;
   await fetchSnapshot(sid);
   setContextEnabled(true);
-  await fetchContextSet();
+  clearContextPane("Loading context...");
+  void scheduleContextRefresh(sid);
   if (switchToken !== activeSessionSwitchToken || currentRunId !== sid) {
     return;
   }
@@ -1958,8 +2091,16 @@ function connectEvents(runId) {
         }
         if (parsed.event_type === "context_binding_parsing_started") {
           markContextFilesParsingStarted();
+          scheduleContextRefreshDebounced(runId);
         } else if (parsed.event_type === "context_binding_parsing_file_completed") {
           markContextFileParsingProgress(parsed.payload || {});
+          scheduleContextRefreshDebounced(runId);
+        } else if (
+          parsed.event_type === "context_binding_parsing_completed"
+          || parsed.event_type === "context_binding_completed"
+          || parsed.event_type === "context_binding_failed"
+        ) {
+          scheduleContextRefreshDebounced(runId);
         }
         if (UI_DEBUG && parsed.event_type === "context_for_node_ready" && contextAggregateDigestEl) {
           const ctx = parsed.payload && typeof parsed.payload === "object"
@@ -2017,6 +2158,14 @@ async function startRun(idempotencyKey) {
       throw new Error(`Run creation failed: ${rsp.status}`);
     }
     const data = await rsp.json();
+    const newRunId = String(data.run_id || "").trim();
+    const stagedWorkspaceId = String(ensureWorkspaceId() || "").trim();
+    if (newRunId && stagedWorkspaceId && currentContextSet && typeof currentContextSet === "object") {
+      stagedContextBySessionId.set(newRunId, {
+        workspaceId: stagedWorkspaceId,
+        contextSet: cloneJson(currentContextSet),
+      });
+    }
     currentRunId = String(data.run_id || currentRunId || "");
     setRunIdInUrl(currentRunId);
     // Subscribe immediately so startup parsing events are not missed.
@@ -2024,7 +2173,7 @@ async function startRun(idempotencyKey) {
     connectContextEvents(currentRunId);
     await fetchSnapshot(currentRunId);
     setContextEnabled(true);
-    await fetchContextSet();
+    await scheduleContextRefresh(currentRunId);
     await fetchSessions();
     emitSessionMutation("create", currentRunId);
   } catch (err) {
@@ -2136,7 +2285,7 @@ async function uploadContextFiles(files) {
     };
     let rsp = await send();
     if (rsp.status === 409) {
-      await fetchContextSet();
+      await scheduleContextRefresh();
       rsp = await send();
     }
     if (!rsp.ok) {
@@ -2177,7 +2326,7 @@ async function replaceContextFile(fileId, fileObj) {
     };
     let rsp = await send();
     if (rsp.status === 409) {
-      await fetchContextSet();
+      await scheduleContextRefresh();
       rsp = await send();
     }
     if (!rsp.ok) {
@@ -2216,7 +2365,7 @@ async function deleteContextFile(fileId) {
     };
     let rsp = await send();
     if (rsp.status === 409) {
-      await fetchContextSet();
+      await scheduleContextRefresh();
       rsp = await send();
     }
     if (!rsp.ok) {
@@ -2378,7 +2527,7 @@ async function bootstrapFromUrl() {
     const selected = runId ? String(runId) : "";
     if (!selected) {
       resetWorkspaceForNewSession();
-      await fetchContextSet();
+      await scheduleContextRefresh();
       return;
     }
     await openSession(selected, { updateUrl: true });
@@ -2469,6 +2618,7 @@ if (sessionListEl) {
           throw new Error(String(body.detail || "Cannot delete running session."));
         }
         if (!rsp.ok) throw new Error(`Delete failed: ${rsp.status}`);
+        stagedContextBySessionId.delete(sid);
         if (currentRunId === sid) {
           resetWorkspaceForNewSession();
         }
@@ -2496,7 +2646,7 @@ if (newSessionBtn) {
   newSessionBtn.addEventListener("click", async () => {
     resetWorkspaceForNewSession();
     try {
-      await fetchContextSet();
+      await scheduleContextRefresh();
       await fetchSessions();
     } catch (err) {
       showError(err.message || String(err));

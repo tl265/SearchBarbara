@@ -4460,50 +4460,91 @@ class RunManager:
         ws_key = self._workspace_context_key(wid)
         ws_lock = self._session_lock_for(ws_key)
         s_lock = self._session_lock_for(sid)
-        # Acquire in deterministic order to avoid deadlocks.
+        # Acquire both locks in deterministic order only for short commit windows.
         first, second = (ws_lock, s_lock) if ws_key <= sid else (s_lock, ws_lock)
-        with first:
-            with second:
+        max_attempts = 2
+        saw_revision_conflict = False
+
+        for _attempt in range(max_attempts):
+            # Snapshot source workspace context quickly under workspace lock.
+            with ws_lock:
                 src = self._load_context_set_for_key_locked(ws_key, "workspace", wid)
-                dst = self._context_default_set_for_key(sid, "session", sid)
-                src_files = [f for f in src.get("files", []) if isinstance(f, dict)]
-                for f in src_files:
-                    old_path = str(f.get("path", "") or "")
-                    if not old_path or not Path(old_path).exists():
-                        continue
-                    data = Path(old_path).read_bytes()
-                    file_id = str(f.get("file_id", "") or str(uuid.uuid4()))
-                    filename = str(f.get("filename", "") or f"{file_id}.txt")
-                    mime_type = str(f.get("mime_type", "") or "text/plain")
-                    new_path = self._context_file_path_for_key(sid, file_id, filename)
-                    Path(new_path).write_bytes(data)
-                    dst.setdefault("files", []).append(
-                        {
-                            "file_id": file_id,
-                            "filename": filename,
-                            "mime_type": mime_type,
-                            "size_bytes": int(f.get("size_bytes", len(data)) or len(data)),
-                            "uploaded_at": str(f.get("uploaded_at", _now().isoformat())),
-                            "content_hash": self._sha256_bytes(data),
-                            "extracted_text_hash": "",
-                            "chunking_version": "",
-                            "spans_hash": "",
-                            "prompt_version": "",
-                            "digest_status": "stale",
-                            "digest_hash": "",
-                            "digest_ref": "",
-                            "error": "",
-                            "path": str(new_path),
-                        }
-                    )
-                dst["aggregate_digest_status"] = "stale"
-                self._run_context_recompute_locked(
-                    sid,
-                    dst,
-                    force_aggregate=True,
-                    progress_callback=progress_callback,
+                src_revision = int(src.get("revision", 1) or 1)
+                src_files = [
+                    copy.deepcopy(f)
+                    for f in src.get("files", [])
+                    if isinstance(f, dict)
+                ]
+
+            # Heavy parse/digest work is intentionally outside locks.
+            dst = self._context_default_set_for_key(sid, "session", sid)
+            for f in src_files:
+                old_path = str(f.get("path", "") or "")
+                if not old_path or not Path(old_path).exists():
+                    continue
+                data = Path(old_path).read_bytes()
+                file_id = str(f.get("file_id", "") or str(uuid.uuid4()))
+                filename = str(f.get("filename", "") or f"{file_id}.txt")
+                mime_type = str(f.get("mime_type", "") or "text/plain")
+                new_path = self._context_file_path_for_key(sid, file_id, filename)
+                Path(new_path).write_bytes(data)
+                dst.setdefault("files", []).append(
+                    {
+                        "file_id": file_id,
+                        "filename": filename,
+                        "mime_type": mime_type,
+                        "size_bytes": int(f.get("size_bytes", len(data)) or len(data)),
+                        "uploaded_at": str(f.get("uploaded_at", _now().isoformat())),
+                        "content_hash": self._sha256_bytes(data),
+                        "extracted_text_hash": "",
+                        "chunking_version": "",
+                        "spans_hash": "",
+                        "prompt_version": "",
+                        "digest_status": "stale",
+                        "digest_hash": "",
+                        "digest_ref": "",
+                        "error": "",
+                        "path": str(new_path),
+                    }
                 )
-                dst["revision"] = 1
-                dst["updated_at"] = _now().isoformat()
-                self._save_context_set_for_key_locked(sid, dst)
-                return True
+            dst["aggregate_digest_status"] = "stale"
+            recompute_diff = self._run_context_recompute_locked(
+                sid,
+                dst,
+                force_aggregate=True,
+                progress_callback=progress_callback,
+            )
+            dst["revision"] = 1
+            dst["updated_at"] = _now().isoformat()
+            dst["last_diff"] = {
+                "new": int(len(src_files)),
+                "changed": int(recompute_diff.get("changed", 0)),
+                "unchanged": int(recompute_diff.get("unchanged", 0)),
+                "deleted": 0,
+            }
+
+            with first:
+                with second:
+                    cur_src = self._load_context_set_for_key_locked(ws_key, "workspace", wid)
+                    cur_revision = int(cur_src.get("revision", 1) or 1)
+                    if cur_revision != src_revision:
+                        saw_revision_conflict = True
+                        continue
+                    if not self._session_exists_session_locked(sid):
+                        return False
+                    self._save_context_set_for_key_locked(sid, dst)
+                    self._publish_context_event(
+                        sid,
+                        "context_updated",
+                        {
+                            "revision": int(dst["revision"]),
+                            "diff": dict(dst.get("last_diff", {})),
+                        },
+                    )
+                    return True
+
+        if saw_revision_conflict:
+            raise RuntimeError(
+                "Context source changed during bind; please retry."
+            )
+        return False
