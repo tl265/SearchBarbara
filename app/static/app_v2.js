@@ -110,13 +110,14 @@ const contextFetchStateByKey = new Map();
 const contextRefreshDebounceTimerByKey = new Map();
 const contextFetchSeqByKey = new Map();
 const stagedContextBySessionId = new Map();
+const startupParseStateByRunId = new Map();
 let currentContextSource = "session";
 let errorBannerTimer = null;
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
 }
 if (contextDigestPaneEl) {
-  contextDigestPaneEl.style.display = UI_DEBUG ? "" : "none";
+  contextDigestPaneEl.style.display = "";
 }
 
 function esc(s) {
@@ -367,6 +368,101 @@ function clearContextPane(msg = "No context files uploaded.") {
   }
 }
 
+function getStartupParseState(runId) {
+  const rid = String(runId || "").trim();
+  if (!rid) return null;
+  const st = startupParseStateByRunId.get(rid);
+  return st && typeof st === "object" ? st : null;
+}
+
+function hasStartupParseProgress(runId) {
+  const st = getStartupParseState(runId);
+  if (!st) return false;
+  const perIndex = st.perIndex && typeof st.perIndex === "object" ? st.perIndex : {};
+  return Object.keys(perIndex).length > 0;
+}
+
+function clearStartupParseState(runId) {
+  const rid = String(runId || "").trim();
+  if (!rid) return;
+  startupParseStateByRunId.delete(rid);
+}
+
+function initStartupParseState(runId, filesTotal = 0) {
+  const rid = String(runId || "").trim();
+  if (!rid) return;
+  const prev = getStartupParseState(rid);
+  const next = {
+    started: true,
+    total: Math.max(0, Number(filesTotal || (prev && prev.total) || 0)),
+    perIndex: (prev && prev.perIndex && typeof prev.perIndex === "object") ? { ...prev.perIndex } : {},
+    updatedAt: Date.now(),
+  };
+  startupParseStateByRunId.set(rid, next);
+}
+
+function updateStartupParseState(runId, payload) {
+  const rid = String(runId || "").trim();
+  if (!rid) return;
+  const prev = getStartupParseState(rid) || { started: true, total: 0, perIndex: {} };
+  const perIndex = (prev.perIndex && typeof prev.perIndex === "object") ? { ...prev.perIndex } : {};
+  const idx = Number(payload && payload.index);
+  if (!Number.isFinite(idx) || idx < 1) return;
+  const status = String((payload && payload.status) || "").trim().toLowerCase();
+  const error = String((payload && payload.error) || "").trim();
+  perIndex[Math.floor(idx)] = {
+    status: (status === "ready" || status === "parsed")
+      ? "ready"
+      : (status === "error" || status === "failed" ? "error" : "parsing"),
+    error,
+  };
+  startupParseStateByRunId.set(rid, {
+    started: true,
+    total: Math.max(0, Number((payload && payload.total) || prev.total || 0)),
+    perIndex,
+    updatedAt: Date.now(),
+  });
+}
+
+function applyStartupParseOverlay(set, runId) {
+  const rid = String(runId || "").trim();
+  if (!rid || !set || typeof set !== "object") return set;
+  const st = getStartupParseState(rid);
+  if (!st || !st.started) return set;
+  const baseFiles = Array.isArray(set.files) ? set.files : [];
+  if (!baseFiles.length) return set;
+  const out = cloneJson(set);
+  const files = Array.isArray(out.files) ? out.files : [];
+  const perIndex = st.perIndex && typeof st.perIndex === "object" ? st.perIndex : {};
+  for (let i = 0; i < files.length; i += 1) {
+    const f = files[i];
+    if (!f || typeof f !== "object") continue;
+    const ov = perIndex[i + 1];
+    if (!ov || typeof ov !== "object") continue;
+    const current = String(f.digest_status || "").trim().toLowerCase();
+    const ovStatus = String(ov.status || "").trim().toLowerCase();
+    if (ovStatus === "ready") {
+      f.digest_status = "ready";
+      f.error = "";
+      continue;
+    }
+    if (ovStatus === "error") {
+      f.digest_status = "error";
+      if (String(ov.error || "").trim()) f.error = String(ov.error || "").trim();
+      continue;
+    }
+    if (ovStatus === "parsing" && current !== "ready" && current !== "error") {
+      f.digest_status = "parsing";
+    }
+  }
+  const agg = String(out.aggregate_digest_status || "").trim().toLowerCase();
+  // Keep backend terminal states visible during startup overlays.
+  if (!agg || agg === "stale" || agg === "uploaded" || agg === "parsing" || agg === "generating") {
+    out.aggregate_digest_status = "parsing";
+  }
+  return out;
+}
+
 function setContextBusy(busy) {
   const on = !!busy;
   contextMutationInFlight = on;
@@ -488,7 +584,8 @@ async function fetchContextSetRawByPath(path) {
   return set && typeof set === "object" ? set : null;
 }
 
-function markContextFilesParsingStarted() {
+function markContextFilesParsingStarted(runId = "", filesTotal = 0) {
+  initStartupParseState(runId || currentRunId, filesTotal);
   if (!currentContextSet || typeof currentContextSet !== "object") return;
   const files = Array.isArray(currentContextSet.files) ? currentContextSet.files : [];
   if (!files.length) return;
@@ -506,7 +603,8 @@ function markContextFilesParsingStarted() {
   renderContextPane();
 }
 
-function markContextFileParsingProgress(payload) {
+function markContextFileParsingProgress(payload, runId = "") {
+  updateStartupParseState(runId || currentRunId, payload || {});
   if (!currentContextSet || typeof currentContextSet !== "object") return;
   const files = Array.isArray(currentContextSet.files) ? currentContextSet.files : [];
   if (!files.length) return;
@@ -529,20 +627,29 @@ function markContextFileParsingProgress(payload) {
 }
 
 async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverride = "") {
-  if (!UI_DEBUG) {
-    if (contextAggregateDigestEl) {
-      contextAggregateDigestEl.textContent = "";
-    }
-    return;
-  }
   const set = currentContextSet && typeof currentContextSet === "object" ? currentContextSet : {};
   const files = Array.isArray(set.files) ? set.files.filter((f) => f && typeof f === "object") : [];
+  if (files.length === 0) {
+    contextAggregateDigestEl.textContent = "";
+    return;
+  }
   const base = contextBasePath(runIdOverride, workspaceIdOverride);
   const singleFileId = files.length === 1 ? String(files[0].file_id || "").trim() : "";
 
   const renderError = (statusCode, label) => {
     const status = String(set.aggregate_digest_status || "").trim();
     const err = String(set.aggregate_error || "").trim();
+    const statusLower = status.toLowerCase();
+    // During upload/parsing, digest may legitimately be unavailable; keep panel blank.
+    if (
+      Number(statusCode) === 404 &&
+      statusLower !== "error" &&
+      statusLower !== "failed" &&
+      !err
+    ) {
+      contextAggregateDigestEl.textContent = "";
+      return;
+    }
     contextAggregateDigestEl.textContent = JSON.stringify(
       {
         status: status || "missing",
@@ -623,7 +730,10 @@ async function fetchContextSetOnce(runIdOverride = "", workspaceIdOverride = "")
     if (target.rid) {
       const phase = currentStartupPhase();
       const pendingWid = currentPendingWorkspaceId();
-      const preferWorkspace = isStartupBindingPhase(phase) && !!pendingWid && !hasUsableContextData(primarySet);
+      const preferWorkspace =
+        isStartupBindingPhase(phase) &&
+        !!pendingWid &&
+        !hasUsableContextData(primarySet);
       if (preferWorkspace) {
         const cached = stagedContextBySessionId.get(target.rid);
         if (cached && cached.contextSet && typeof cached.contextSet === "object") {
@@ -646,18 +756,17 @@ async function fetchContextSetOnce(runIdOverride = "", workspaceIdOverride = "")
         stagedContextBySessionId.delete(target.rid);
       }
     }
+    if (target.rid) {
+      chosenSet = applyStartupParseOverlay(chosenSet, target.rid);
+    }
     currentContextSet = chosenSet;
     currentContextSource = chosenSource;
     renderContextPane();
-    if (UI_DEBUG) {
-      if (chosenSource === "workspace" && target.rid) {
-        const wsid = currentPendingWorkspaceId();
-        await fetchContextAggregateDigest("", wsid);
-      } else {
-        await fetchContextAggregateDigest(target.rid, target.wid);
-      }
-    } else if (contextAggregateDigestEl) {
-      contextAggregateDigestEl.textContent = "";
+    if (chosenSource === "workspace" && target.rid) {
+      const wsid = currentPendingWorkspaceId();
+      await fetchContextAggregateDigest("", wsid);
+    } else {
+      await fetchContextAggregateDigest(target.rid, target.wid);
     }
     if (selectedContextFileId && contextFileDigestEl) {
       if (chosenSource === "workspace" && target.rid) {
@@ -1873,7 +1982,7 @@ function applySnapshot(snap) {
   const sid = String(snap.session_id || snap.run_id || "").trim();
   setContextEnabled(!!sid);
   if (contextDigestPaneEl) {
-    contextDigestPaneEl.style.display = UI_DEBUG ? "" : "none";
+    contextDigestPaneEl.style.display = "";
   }
   if (sid && Array.isArray(sessions)) {
     const idx = sessions.findIndex((s) => String((s && s.session_id) || "") === sid);
@@ -2107,16 +2216,18 @@ function connectEvents(runId) {
           upsertThought(narration, parsed.event_type || e);
         }
         if (parsed.event_type === "context_binding_parsing_started") {
-          markContextFilesParsingStarted();
+          const total = Number(parsed.payload && parsed.payload.files_total);
+          markContextFilesParsingStarted(runId, Number.isFinite(total) ? total : 0);
           scheduleContextRefreshDebounced(runId);
         } else if (parsed.event_type === "context_binding_parsing_file_completed") {
-          markContextFileParsingProgress(parsed.payload || {});
+          markContextFileParsingProgress(parsed.payload || {}, runId);
           scheduleContextRefreshDebounced(runId);
         } else if (
           parsed.event_type === "context_binding_parsing_completed"
           || parsed.event_type === "context_binding_completed"
           || parsed.event_type === "context_binding_failed"
         ) {
+          clearStartupParseState(runId);
           scheduleContextRefreshDebounced(runId);
         }
         if (UI_DEBUG && parsed.event_type === "context_for_node_ready" && contextAggregateDigestEl) {
@@ -2134,6 +2245,7 @@ function connectEvents(runId) {
           abortRequested = true;
         }
         if (parsed.event_type === "run_aborted" || parsed.event_type === "run_completed" || parsed.event_type === "run_failed") {
+          clearStartupParseState(runId);
           abortRequested = false;
         }
       } catch (_err) {
@@ -2153,7 +2265,6 @@ async function startRun(idempotencyKey) {
   setRunConfigLocked(true);
   showError("");
   abortRequested = false;
-  markContextFilesParsingStarted();
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
   thoughts.length = 0;
@@ -2179,6 +2290,12 @@ async function startRun(idempotencyKey) {
     }
     const data = await rsp.json();
     const newRunId = String(data.run_id || "").trim();
+    if (currentRunId && currentRunId !== newRunId) {
+      clearStartupParseState(currentRunId);
+    }
+    if (newRunId) {
+      markContextFilesParsingStarted(newRunId, 0);
+    }
     const stagedWorkspaceId = String(ensureWorkspaceId() || "").trim();
     if (newRunId && stagedWorkspaceId && currentContextSet && typeof currentContextSet === "object") {
       stagedContextBySessionId.set(newRunId, {
@@ -2664,6 +2781,9 @@ if (refreshSessionsBtn) {
 
 if (newSessionBtn) {
   newSessionBtn.addEventListener("click", async () => {
+    if (currentRunId) {
+      clearStartupParseState(currentRunId);
+    }
     resetWorkspaceForNewSession();
     try {
       await scheduleContextRefresh();
