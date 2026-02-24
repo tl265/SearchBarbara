@@ -3,30 +3,44 @@ Return strict JSON:
 {
   "queries": ["...", "..."]
 }
+
 Rules:
-- 1 to 1 high-signal web search queries.
+- 1 to 2 high-signal web search queries.
 - Prefer "lazy-first" retrieval: try direct answer queries before decomposing further.
-- Include terms likely to surface primary sources where possible.
-- Keep queries concise and specific.
 - Prioritize novelty vs previously attempted intents; avoid near-duplicate paraphrases.
 - Each query should target at least one explicit evidence gap.
+
+Domain-aware authority policy (generalized):
+- First classify topic risk/profile using user context:
+  - high_stakes_or_regulated: medical, legal, financial, engineering/safety, architecture/building-code, policy/compliance, or similar domains where incorrect advice can cause material harm.
+  - normal: all other topics.
+- If high_stakes_or_regulated:
+  - At least one query must explicitly target authoritative sources (official bodies, standards bodies, peer-reviewed primary research, official filings, professional institutions).
+  - De-prioritize generic portals/news/blog/forum/social unless needed for context.
+  - Prefer source-targeting query patterns (examples: official guideline, regulator filing, peer-reviewed study, standard code section).
+- If normal:
+  - Keep broad high-quality coverage without over-constraining to specific domains.
+
+Source-tier intent:
+- Tier A: regulator/official body, standards body, peer-reviewed primary research, official filings.
+- Tier B: reputable institutional summaries and professional media.
+- Tier C: general media/portal/blog/forum/social.
+- Query design should maximize chance of Tier A/B results first for high-stakes topics.
+
+Time-awareness:
 - For time-sensitive questions (prices, latest updates, current status, recent events), make queries time-aware.
-- Prefer explicit temporal anchors when useful (for example: current year, month, or an "as of" date phrase) instead of timeless wording.
-- Include freshness intent terms when appropriate (for example: latest, today, current, real-time, live).
-- If a query risks stale answers, add a recency cue so search returns up-to-date evidence.
-- Use the runtime date/year provided by the caller as the authoritative clock reference.
-- Do not invent stale year anchors (for example, 2024) unless the user explicitly requests historical scope.
+- Prefer explicit temporal anchors when useful (current year/month or "as of" phrase).
+- Use runtime date/year provided by caller as authoritative clock.
+- Do not invent stale year anchors unless user asks for historical scope.
 
-Examples (time-sensitive):
-- Task intent: "What is Tencent's stock price?"
-  Good query: "Tencent Holdings stock price today HKEX 0700 real-time"
-  Good query: "0700.HK latest price as of today market close"
+Examples:
+- Task intent: "Parkinson's disease treatment options"
+  Good query: "Parkinson disease treatment guideline official neurology society latest"
+  Good query: "Parkinson disease randomized trial peer-reviewed systematic review"
 
-- Task intent: "Latest OpenAI API pricing changes"
-  Good query: "OpenAI API pricing latest update official documentation 2026"
+- Task intent: "Is a non-compete enforceable in California?"
+  Good query: "California non-compete enforceability statute court guidance official source"
+  Good query: "California Business and Professions Code 16600 current interpretation"
 
-- Task intent: "Current US Fed policy rate"
-  Good query: "Federal Reserve current policy rate today official statement"
-
-- Task intent: "Recent NVIDIA earnings guidance"
-  Good query: "NVIDIA latest earnings guidance Q4 2026 investor relations"
+- Task intent: "Tencent's latest stock price"
+  Good query: "Tencent Holdings stock price today HKEX 0700 real-time official exchange"

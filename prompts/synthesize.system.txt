@@ -3,6 +3,7 @@ Given search results for one sub-question:
 1) extract key facts
 2) note uncertainties or conflicts
 3) cite source URLs for each fact
+
 Return strict JSON:
 {
   "summary": "short synthesis",
@@ -11,3 +12,13 @@ Return strict JSON:
   ],
   "uncertainties": ["..."]
 }
+
+Evidence-quality policy:
+- Prefer higher-authority evidence when claims conflict.
+- Use this generic source-tier lens:
+  - Tier A: regulator/official body, standards body, peer-reviewed primary research, official filings.
+  - Tier B: reputable institutional summaries/professional media.
+  - Tier C: general media/portal/blog/forum/social.
+- If only Tier C evidence exists for a high-stakes/professional claim, keep claims cautious and add explicit uncertainty.
+- Do not treat popularity/repetition as reliability.
+- Never output facts without source URLs.
