@@ -1,6 +1,5 @@
 const taskEl = document.getElementById("task");
 const maxDepthEl = document.getElementById("maxDepth");
-const resultsPerQueryEl = document.getElementById("resultsPerQuery");
 const runBtn = document.getElementById("runBtn");
 const reportBtn = document.getElementById("reportBtn");
 const downloadBtn = document.getElementById("downloadBtn");
@@ -69,6 +68,7 @@ let snapshotFetchInFlight = false;
 let snapshotFetchQueued = false;
 let startRunInFlight = false;
 const reportGeneratingRunIds = new Set();
+let pauseRequested = false;
 let abortRequested = false;
 let selectedReportVersionIndex = null;
 let autoFollowActiveNode = true;
@@ -204,6 +204,7 @@ function resetWorkspaceForNewSession() {
   // Start a truly fresh workspace context for each new session/reset.
   currentWorkspaceId = newWorkspaceId();
   currentSnapshot = null;
+  pauseRequested = false;
   abortRequested = false;
   reportGeneratingRunIds.clear();
   activeSessionSwitchToken += 1;
@@ -224,7 +225,6 @@ function resetWorkspaceForNewSession() {
   usageEl.textContent = "";
   taskEl.value = "";
   maxDepthEl.value = String(DEFAULT_MAX_DEPTH);
-  resultsPerQueryEl.value = String(DEFAULT_RESULTS_PER_QUERY);
   setTaskBoxLocked(false);
   setRunConfigLocked(false);
   setContextEnabled(true);
@@ -309,7 +309,6 @@ function setTaskBoxLocked(locked) {
 function setRunConfigLocked(locked) {
   const on = !!locked;
   maxDepthEl.disabled = on;
-  resultsPerQueryEl.disabled = on;
 }
 
 function fmtTime(iso) {
@@ -2057,9 +2056,6 @@ function applySnapshot(snap) {
   if (Number.isFinite(Number(snap.max_depth)) && Number(snap.max_depth) >= 1) {
     maxDepthEl.value = String(Math.floor(Number(snap.max_depth)));
   }
-  if (Number.isFinite(Number(snap.results_per_query)) && Number(snap.results_per_query) >= 1) {
-    resultsPerQueryEl.value = String(Math.floor(Number(snap.results_per_query)));
-  }
   stopReasonEl.textContent = snap.stop_reason ? `Stop rationale: ${snap.stop_reason}` : "";
   latestThoughtEl.textContent = snap.latest_thought || "";
   coverageNoteEl.textContent = snap.coverage_note || "";
@@ -2112,7 +2108,15 @@ function applySnapshot(snap) {
   const running = researchState ? researchState === "running" : executionState === "running";
   const paused = researchState ? researchState === "paused" : executionState === "paused";
   const terminal = researchState ? researchState === "terminal" : ["completed", "aborted", "failed"].includes(executionState);
+  if (paused || terminal) {
+    pauseRequested = false;
+  }
+  if (terminal) {
+    abortRequested = false;
+  }
+  const pausePending = pauseRequested && !paused && !terminal;
   const abortPending = abortRequested || isAbortPendingSnapshot(snap);
+  const transitionPending = pausePending || abortPending;
   const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
   const reportState = String(snap.report_state || "").toLowerCase();
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
@@ -2121,10 +2125,16 @@ function applySnapshot(snap) {
   runBtn.textContent = "Start Research";
   runBtn.classList.add("primary");
   runBtn.disabled = !isNewSessionWorkspace || reportBusy;
-  pauseBtn.disabled = !(running && !reportBusy);
-  resumeBtn.disabled = !(paused && !reportBusy);
-  abortBtn.disabled = !((running || paused) && !reportBusy);
-  abortBtn.textContent = abortPending && !abortBtn.disabled ? "Stopping..." : "Abort Research";
+  if (transitionPending) {
+    pauseBtn.disabled = true;
+    resumeBtn.disabled = true;
+    abortBtn.disabled = true;
+  } else {
+    pauseBtn.disabled = !(running && !reportBusy);
+    resumeBtn.disabled = !(paused && !reportBusy);
+    abortBtn.disabled = !((running || paused) && !reportBusy);
+  }
+  abortBtn.textContent = abortPending ? "Stopping..." : "Abort";
 
   const hasDownloadableReport = !!reportFilePath;
   downloadBtn.disabled = !hasDownloadableReport;
@@ -2181,6 +2191,7 @@ async function openSession(runId, opts = {}) {
     es = null;
   }
   currentRunId = sid;
+  pauseRequested = false;
   abortRequested = false;
   await fetchSnapshot(sid);
   setContextEnabled(true);
@@ -2284,11 +2295,15 @@ function connectEvents(runId) {
         if (parsed.event_type === "report_generation_completed" || parsed.event_type === "report_generation_failed") {
           reportGeneratingRunIds.delete(String(runId));
         }
+        if (parsed.event_type === "run_paused" || parsed.event_type === "run_resumed") {
+          pauseRequested = false;
+        }
         if (parsed.event_type === "run_abort_requested" || parsed.event_type === "abort_requested") {
           abortRequested = true;
         }
         if (parsed.event_type === "run_aborted" || parsed.event_type === "run_completed" || parsed.event_type === "run_failed") {
           clearStartupParseState(runId);
+          pauseRequested = false;
           abortRequested = false;
         }
       } catch (_err) {
@@ -2307,6 +2322,7 @@ async function startRun(idempotencyKey) {
   }
   setRunConfigLocked(true);
   showError("");
+  pauseRequested = false;
   abortRequested = false;
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
@@ -2325,7 +2341,7 @@ async function startRun(idempotencyKey) {
         workspace_id: ensureWorkspaceId(),
         task,
         max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
-        results_per_query: Number(resultsPerQueryEl.value || DEFAULT_RESULTS_PER_QUERY),
+        results_per_query: DEFAULT_RESULTS_PER_QUERY,
       }),
     });
     if (!rsp.ok) {
@@ -2369,31 +2385,56 @@ async function abortRun() {
   const ok = window.confirm("Abort this research session? This cannot be resumed.");
   if (!ok) return;
   abortRequested = true;
+  pauseBtn.disabled = true;
+  resumeBtn.disabled = true;
+  abortBtn.disabled = true;
+  abortBtn.textContent = "Stopping...";
   const runId = String(currentRunId || "").trim();
-  const rsp = await fetch(`/api/runs/${runId}/abort`, {
-    method: "POST",
-    headers: { "Idempotency-Key": newIdempotencyKey("abort") },
-  });
-  if (!rsp.ok) {
+  try {
+    const rsp = await fetch(`/api/runs/${runId}/abort`, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey("abort") },
+    });
+    if (!rsp.ok) {
+      abortRequested = false;
+      throw new Error(await responseDetail(rsp, `Abort failed: ${rsp.status}`));
+    }
+  } catch (err) {
     abortRequested = false;
-    throw new Error(await responseDetail(rsp, `Abort failed: ${rsp.status}`));
+    if (currentSnapshot && typeof currentSnapshot === "object") {
+      applySnapshot(currentSnapshot);
+    }
+    throw err;
   }
 }
 
 async function pauseRun() {
   if (!currentRunId) return;
-  const runId = String(currentRunId || "").trim();
-  const ev = currentExpectedVersion();
-  const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
-  let rsp = await fetch(`/api/runs/${runId}/pause${qs}`, { method: "POST" });
-  if (rsp.status === 409) {
-    await fetchSnapshot(runId);
-    const retryEv = currentExpectedVersion();
-    const retryQs = retryEv ? `?expected_version=${encodeURIComponent(String(retryEv))}` : "";
-    rsp = await fetch(`/api/runs/${runId}/pause${retryQs}`, { method: "POST" });
-  }
-  if (!rsp.ok) {
-    throw new Error(await responseDetail(rsp, `Pause failed: ${rsp.status}`));
+  pauseRequested = true;
+  pauseBtn.disabled = true;
+  resumeBtn.disabled = true;
+  abortBtn.disabled = true;
+  try {
+    const runId = String(currentRunId || "").trim();
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    let rsp = await fetch(`/api/runs/${runId}/pause${qs}`, { method: "POST" });
+    if (rsp.status === 409) {
+      await fetchSnapshot(runId);
+      const retryEv = currentExpectedVersion();
+      const retryQs = retryEv ? `?expected_version=${encodeURIComponent(String(retryEv))}` : "";
+      rsp = await fetch(`/api/runs/${runId}/pause${retryQs}`, { method: "POST" });
+    }
+    if (!rsp.ok) {
+      pauseRequested = false;
+      throw new Error(await responseDetail(rsp, `Pause failed: ${rsp.status}`));
+    }
+  } catch (err) {
+    pauseRequested = false;
+    if (currentSnapshot && typeof currentSnapshot === "object") {
+      applySnapshot(currentSnapshot);
+    }
+    throw err;
   }
 }
 
@@ -2764,7 +2805,7 @@ window.addEventListener("keydown", (evt) => {
 if (sessionListEl) {
   sessionListEl.addEventListener("click", async (evt) => {
     const target = evt.target;
-    if (!(target instanceof HTMLElement)) return;
+    if (!(target instanceof Element)) return;
     const deleteBtn = target.closest("button[data-action='delete']");
     const row = target.closest(".session-row");
     const sid = String(

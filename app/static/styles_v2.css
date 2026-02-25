@@ -165,6 +165,21 @@ textarea.locked {
   flex-wrap: wrap;
   margin: 8px 0;
 }
+.advanced-controls-row {
+  align-items: center;
+}
+.inline-number-control {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.9rem;
+  white-space: nowrap;
+}
+.inline-number-control input {
+  width: 84px;
+  min-width: 84px;
+  padding: 6px 8px;
+}
 button {
   border: 1px solid #7c8e9b;
   background: #f8fafc;
@@ -355,6 +370,10 @@ button:disabled {
 .session-actions .session-delete-btn .icon {
   width: 14px;
   height: 14px;
+}
+.session-actions .session-delete-btn .icon,
+.session-actions .session-delete-btn .icon * {
+  pointer-events: none;
 }
 body.sessions-collapsed .session-toggle-icon {
   transform: rotate(180deg);
@@ -836,6 +855,16 @@ details.node-section {
   .dock-controls button,
   .context-controls button {
     min-height: var(--touch-target-min);
+  }
+  .advanced-controls-row {
+    align-items: flex-start;
+  }
+  .inline-number-control {
+    min-height: var(--touch-target-min);
+  }
+  .inline-number-control input {
+    width: 78px;
+    min-width: 78px;
   }
   .context-controls {
     width: 100%;
