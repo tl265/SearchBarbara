@@ -116,6 +116,7 @@ class RunManager:
             "schema_version": self._SESSIONS_INDEX_SCHEMA_VERSION,
             "title_migration_v1_done": False,
             "execution_state_migration_v1_done": False,
+            "execution_state_backfill_v2_done": False,
         }
         self._bootstrap_sessions_from_disk()
 
@@ -1568,6 +1569,7 @@ class RunManager:
             1, int(getattr(state, "version", existing.get("version", 1)) or 1)
         )
         existing["status"] = state.status
+        existing["execution_state"] = str(state.execution_state or "")
         existing["research_state"] = str(state.research_state or "")
         existing["report_state"] = str(state.report_state or "")
         existing["terminal_reason"] = str(state.terminal_reason or "")
@@ -2721,6 +2723,9 @@ class RunManager:
             "execution_state_migration_v1_done": bool(
                 self._sessions_index_meta.get("execution_state_migration_v1_done", False)
             ),
+            "execution_state_backfill_v2_done": bool(
+                self._sessions_index_meta.get("execution_state_backfill_v2_done", False)
+            ),
             "updated_at": _now().isoformat(),
             "sessions": list(self._sessions.values()),
         }
@@ -2806,6 +2811,9 @@ class RunManager:
         self._sessions_index_meta["execution_state_migration_v1_done"] = bool(
             parsed.get("execution_state_migration_v1_done", False)
         )
+        self._sessions_index_meta["execution_state_backfill_v2_done"] = bool(
+            parsed.get("execution_state_backfill_v2_done", False)
+        )
         raw_sessions = parsed.get("sessions", [])
         if not isinstance(raw_sessions, list):
             return {"sessions": []}
@@ -2824,8 +2832,12 @@ class RunManager:
         execution_state_migration_needed = not bool(
             self._sessions_index_meta.get("execution_state_migration_v1_done", False)
         )
+        execution_state_backfill_v2_needed = not bool(
+            self._sessions_index_meta.get("execution_state_backfill_v2_done", False)
+        )
         migrated_titles = 0
         migrated_execution_states = 0
+        backfilled_execution_state_files = 0
         with self._lock:
             for item in loaded_sessions:
                 sid = str(item.get("session_id", "")).strip()
@@ -2861,6 +2873,21 @@ class RunManager:
                             "has_manual_edits": False,
                         },
                     )
+
+            if execution_state_backfill_v2_needed:
+                visited_state_paths: set[str] = set()
+                for sid, item in list(self._sessions.items()):
+                    state_path = str(item.get("state_file_path", "")).strip()
+                    if not state_path:
+                        inferred = str(self._runs_dir / f"state_web_{sid}.json")
+                        if Path(inferred).exists():
+                            state_path = inferred
+                            item["state_file_path"] = inferred
+                    if not state_path or state_path in visited_state_paths:
+                        continue
+                    visited_state_paths.add(state_path)
+                    if self._backfill_execution_state_in_state_file(state_path):
+                        backfilled_execution_state_files += 1
 
             for sid, item in list(self._sessions.items()):
                 state_path = str(item.get("state_file_path", "")).strip()
@@ -2907,6 +2934,8 @@ class RunManager:
                 self._sessions_index_meta["title_migration_v1_done"] = True
             if execution_state_migration_needed:
                 self._sessions_index_meta["execution_state_migration_v1_done"] = True
+            if execution_state_backfill_v2_needed:
+                self._sessions_index_meta["execution_state_backfill_v2_done"] = True
             self._save_sessions_index_locked()
         if title_migration_needed:
             print(f"[sessions] title migration v1 applied; updated {migrated_titles} session titles.")
@@ -2914,6 +2943,11 @@ class RunManager:
             print(
                 "[sessions] execution-state migration v1 applied; "
                 f"updated {migrated_execution_states} sessions."
+            )
+        if execution_state_backfill_v2_needed:
+            print(
+                "[sessions] execution-state backfill v2 applied; "
+                f"updated {backfilled_execution_state_files} state files."
             )
 
     def _load_run_state_from_files(
@@ -3180,6 +3214,49 @@ class RunManager:
         if s == "failed":
             return "failed"
         return "idle"
+
+    def _is_valid_execution_state(self, value: Any) -> bool:
+        s = str(value or "").strip().lower()
+        return s in {"idle", "running", "paused", "completed", "failed", "aborted"}
+
+    def _derive_execution_state_from_checkpoint(self, raw: Dict[str, Any]) -> str:
+        status = str(raw.get("status", "") or "").strip().lower()
+        trace = raw.get("trace", {})
+        if not isinstance(trace, dict):
+            trace = {}
+        research_state = str(
+            trace.get("research_state", raw.get("research_state", "")) or ""
+        ).strip().lower()
+        terminal_reason = str(
+            trace.get("terminal_reason", raw.get("terminal_reason", "")) or ""
+        ).strip().lower()
+        error = str(raw.get("error", "") or "").strip().lower()
+
+        if research_state == "paused":
+            return "paused"
+        if terminal_reason == "aborted" or error == "run aborted by user":
+            return "aborted"
+        return self._execution_state_from_status(status)
+
+    def _backfill_execution_state_in_state_file(self, state_file_path: str) -> bool:
+        path = Path(str(state_file_path or "").strip())
+        if not path.exists():
+            return False
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return False
+        if not isinstance(raw, dict):
+            return False
+        existing = raw.get("execution_state")
+        if self._is_valid_execution_state(existing):
+            return False
+        raw["execution_state"] = self._derive_execution_state_from_checkpoint(raw)
+        try:
+            path.write_text(json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            return False
+        return True
 
     # ----------------------------
     # Context management subsystem
