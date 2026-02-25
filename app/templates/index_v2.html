@@ -80,14 +80,11 @@
       </div>
       <details>
         <summary>Advanced controls</summary>
-        <div class="dock-controls">
-          <button id="pauseBtn" type="button" disabled>Pause Research</button>
-          <button id="resumeBtn" type="button" disabled>Resume Research</button>
-          <button id="abortBtn" type="button" disabled>Abort Research</button>
-        </div>
-        <div class="advanced-grid">
-          <label>Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
-          <label>Results/query <input id="resultsPerQuery" type="number" value="{{ default_results_per_query }}" min="{{ results_per_query_min }}" max="{{ results_per_query_max }}"></label>
+        <div class="dock-controls advanced-controls-row">
+          <button id="pauseBtn" type="button" disabled>Pause</button>
+          <button id="resumeBtn" type="button" disabled>Resume</button>
+          <button id="abortBtn" type="button" disabled>Abort</button>
+          <label class="inline-number-control">Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
         </div>
         <section class="context context-in-advanced">
           <div class="section-head">
