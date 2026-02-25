@@ -2825,6 +2825,10 @@ if (newSessionBtn) {
       clearStartupParseState(currentRunId);
     }
     resetWorkspaceForNewSession();
+    if (taskEl && window.matchMedia && window.matchMedia("(max-width: 768px)").matches) {
+      taskEl.scrollIntoView({ behavior: "smooth", block: "start" });
+      taskEl.focus({ preventScroll: true });
+    }
     try {
       await scheduleContextRefresh();
       await fetchSessions();
