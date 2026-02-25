@@ -27,17 +27,51 @@
       </div>
     </header>
 
-    <section class="session-dock card">
+    <div class="app-layout">
+    <aside class="session-dock session-rail card">
       <div class="section-head">
         <h2>Sessions</h2>
         <div class="dock-controls">
-          <button id="newSessionBtn" type="button">New Session</button>
-          <button id="refreshSessionsBtn" type="button">Refresh</button>
+          <button
+            id="sessionRailToggleBtn"
+            class="icon-btn session-icon-btn"
+            type="button"
+            aria-label="Collapse sessions panel"
+            title="Collapse sessions panel"
+          >
+            <svg class="icon session-toggle-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="m15 6-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+          <button
+            id="newSessionBtn"
+            class="icon-btn session-icon-btn"
+            type="button"
+            aria-label="New session"
+            title="New session"
+          >
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <button
+            id="refreshSessionsBtn"
+            class="icon-btn session-icon-btn"
+            type="button"
+            aria-label="Refresh sessions"
+            title="Refresh sessions"
+          >
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M20 4v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       </div>
       <div id="sessionList" class="session-list"></div>
-    </section>
+    </aside>
 
+    <div class="app-main">
     <section class="prompt-dock card">
       <label for="task" class="dock-label">Research Task</label>
       <textarea id="task" rows="3" placeholder="Ask a deep research question..."></textarea>
@@ -142,16 +176,16 @@
             <button id="reportPrevBtn" type="button" disabled>&lt;</button>
             <span id="reportVersionLabel" class="muted">-/-</span>
             <button id="reportNextBtn" type="button" disabled>&gt;</button>
-            <label class="raw-toggle"><input id="rawToggle" type="checkbox" /> Raw</label>
           </div>
         </div>
         <div id="coverageNote" class="muted"></div>
-        <pre id="reportRaw" class="report-body hidden"></pre>
         <div id="reportRendered" class="report-body rendered"></div>
         <h3>Token Usage</h3>
         <pre id="usage" class="usage"></pre>
       </section>
     </main>
+    </div>
+    </div>
   </div>
   <script>
     window.APP_CONFIG = {

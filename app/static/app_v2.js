@@ -11,6 +11,7 @@ const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
 const sessionListEl = document.getElementById("sessionList");
+const sessionRailToggleBtn = document.getElementById("sessionRailToggleBtn");
 const newSessionBtn = document.getElementById("newSessionBtn");
 const refreshSessionsBtn = document.getElementById("refreshSessionsBtn");
 const contextMetaEl = document.getElementById("contextMeta");
@@ -37,10 +38,8 @@ const canvasEl = document.getElementById("canvas");
 const thoughtStreamEl = document.getElementById("thoughtStream");
 const latestThoughtEl = document.getElementById("latestThought");
 const coverageNoteEl = document.getElementById("coverageNote");
-const reportRawEl = document.getElementById("reportRaw");
 const reportRenderedEl = document.getElementById("reportRendered");
 const usageEl = document.getElementById("usage");
-const rawToggleEl = document.getElementById("rawToggle");
 const reportPrevBtn = document.getElementById("reportPrevBtn");
 const reportNextBtn = document.getElementById("reportNextBtn");
 const reportVersionLabel = document.getElementById("reportVersionLabel");
@@ -49,6 +48,7 @@ const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
   : {};
 const SESSION_SYNC_CHANNEL = "searchbarbara:sessions:v1";
 const SESSION_SYNC_STORAGE_KEY = "searchbarbara:sessions:signal";
+const SESSION_RAIL_COLLAPSED_KEY = "sb_sessions_rail_collapsed";
 const SESSION_SYNC_TAB_ID = (() => {
   try {
     if (window.crypto && typeof window.crypto.randomUUID === "function") {
@@ -131,6 +131,33 @@ function setReportButtonVisual(generating) {
   reportBtn.setAttribute("aria-label", label);
 }
 
+function setSessionsRailCollapsed(collapsed, persist = true) {
+  const on = !!collapsed;
+  if (document && document.body) {
+    document.body.classList.toggle("sessions-collapsed", on);
+  }
+  if (sessionRailToggleBtn) {
+    sessionRailToggleBtn.classList.toggle("is-collapsed", on);
+    sessionRailToggleBtn.setAttribute("aria-label", on ? "Expand sessions panel" : "Collapse sessions panel");
+    sessionRailToggleBtn.setAttribute("title", on ? "Expand sessions panel" : "Collapse sessions panel");
+  }
+  if (persist) {
+    try {
+      localStorage.setItem(SESSION_RAIL_COLLAPSED_KEY, on ? "1" : "0");
+    } catch (_err) {
+      // no-op
+    }
+  }
+}
+
+function loadSessionsRailCollapsed() {
+  try {
+    return localStorage.getItem(SESSION_RAIL_COLLAPSED_KEY) === "1";
+  } catch (_err) {
+    return false;
+  }
+}
+
 function esc(s) {
   return String(s || "").replace(/[&<>\"]/g, (c) => ({
     "&": "&amp;",
@@ -192,7 +219,6 @@ function resetWorkspaceForNewSession() {
   stopReasonEl.textContent = "";
   latestThoughtEl.textContent = "";
   coverageNoteEl.textContent = "";
-  reportRawEl.textContent = "";
   reportRenderedEl.innerHTML = "";
   tokenSummaryEl.textContent = "-";
   usageEl.textContent = "";
@@ -950,15 +976,27 @@ function renderSessions() {
         ? `Locks: mgr=${esc(String(s.lock_debug.manager_lock || "-"))}${s.lock_debug.manager_lock_owner_section ? `(${esc(String(s.lock_debug.manager_lock_owner_section || ""))})` : ""}${Number(s.lock_debug.manager_lock_held_ms || 0) > 0 ? ` ${Math.round(Number(s.lock_debug.manager_lock_held_ms || 0))}ms` : ""} · session=${esc(String(s.lock_debug.session_lock || "-"))} · index=${esc(String(s.lock_debug.index_write_lock || "-"))}`
         : "";
       return `<div class="session-row${active}" data-session-id="${esc(sid)}">
-        <div>
-          <div class="session-title">${esc(title)}</div>
+        <div class="session-main">
+          <div class="session-title" title="${esc(title)}">${esc(title)}</div>
           <div class="session-meta">Research: ${esc(research)} · Report: ${esc(report)} · ${esc(updated)}</div>
           ${lockDbg ? `<div class="session-meta muted">${lockDbg}</div>` : ""}
         </div>
         <div class="session-actions">
-          <button type="button" data-action="open" data-session-id="${esc(sid)}">Open</button>
-          <button type="button" data-action="rename" data-session-id="${esc(sid)}">Rename</button>
-          <button type="button" data-action="delete" data-session-id="${esc(sid)}">Delete</button>
+          <button
+            type="button"
+            class="session-delete-btn"
+            data-action="delete"
+            data-session-id="${esc(sid)}"
+            aria-label="Delete session"
+            title="Delete session"
+          >
+            <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 7h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M10 11v6M14 11v6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M6 7l1 12h10l1-12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M9 7V5h6v2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
         </div>
       </div>`;
     })
@@ -1320,12 +1358,6 @@ function markdownToHtml(md) {
     out.push("</ul>");
   }
   return out.join("\n");
-}
-
-function toggleReportMode() {
-  const raw = !!rawToggleEl.checked;
-  reportRawEl.classList.toggle("hidden", !raw);
-  reportRenderedEl.classList.toggle("hidden", raw);
 }
 
 function upsertThought(text, meta) {
@@ -2073,9 +2105,7 @@ function applySnapshot(snap) {
     usageEl.textContent = "";
   }
 
-  reportRawEl.textContent = reportText;
   reportRenderedEl.innerHTML = markdownToHtml(reportText);
-  toggleReportMode();
 
   const executionState = String(snap.execution_state || "").toLowerCase();
   const researchState = String(snap.research_state || "").toLowerCase();
@@ -2645,8 +2675,6 @@ reportNextBtn.addEventListener("click", async () => {
   }
 });
 
-rawToggleEl.addEventListener("change", toggleReportMode);
-
 zoomOutBtn.addEventListener("click", () => {
   autoFitCanvas = false;
   canvasZoom = clamp(canvasZoom - 0.05, MIN_CANVAS_ZOOM, MAX_CANVAS_ZOOM);
@@ -2737,29 +2765,16 @@ if (sessionListEl) {
   sessionListEl.addEventListener("click", async (evt) => {
     const target = evt.target;
     if (!(target instanceof HTMLElement)) return;
-    const action = String(target.getAttribute("data-action") || "");
-    const sid = String(target.getAttribute("data-session-id") || "");
-    if (!action || !sid) return;
+    const deleteBtn = target.closest("button[data-action='delete']");
+    const row = target.closest(".session-row");
+    const sid = String(
+      (deleteBtn && deleteBtn.getAttribute("data-session-id"))
+      || (row && row.getAttribute("data-session-id"))
+      || ""
+    );
+    if (!sid) return;
     try {
-      if (action === "open") {
-        await openSession(sid, { updateUrl: true });
-        return;
-      }
-      if (action === "rename") {
-        const current = sessions.find((s) => String(s.session_id || "") === sid);
-        const next = window.prompt("Rename session:", String((current && current.title) || sid));
-        if (!next || !next.trim()) return;
-        const rsp = await fetch(`/api/sessions/${sid}`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ title: next.trim() }),
-        });
-        if (!rsp.ok) throw new Error(`Rename failed: ${rsp.status}`);
-        await fetchSessions();
-        emitSessionMutation("rename", sid);
-        return;
-      }
-      if (action === "delete") {
+      if (deleteBtn) {
         const ok = window.confirm("Delete this session? This removes its saved state.");
         if (!ok) return;
         const rsp = await fetch(`/api/sessions/${sid}`, { method: "DELETE" });
@@ -2774,11 +2789,23 @@ if (sessionListEl) {
         }
         await fetchSessions();
         emitSessionMutation("delete", sid);
+        return;
+      }
+      if (row) {
+        await openSession(sid, { updateUrl: true });
       }
     } catch (err) {
       const detail = err && err.message ? err.message : String(err);
-      showError(`Session ${action} failed: ${detail}`);
+      showError(`Session action failed: ${detail}`);
     }
+  });
+}
+
+setSessionsRailCollapsed(loadSessionsRailCollapsed(), false);
+if (sessionRailToggleBtn) {
+  sessionRailToggleBtn.addEventListener("click", () => {
+    const collapsed = !!(document && document.body && document.body.classList.contains("sessions-collapsed"));
+    setSessionsRailCollapsed(!collapsed, true);
   });
 }
 
