@@ -288,6 +288,30 @@ button:disabled {
   align-items: center;
   gap: 6px;
 }
+.icon-btn {
+  width: 34px;
+  height: 34px;
+  min-width: 34px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.icon-btn .icon {
+  width: 16px;
+  height: 16px;
+}
+.icon-btn:focus-visible {
+  outline: 2px solid #93c5fd;
+  outline-offset: 1px;
+}
+.icon-btn.is-loading .refresh-icon {
+  animation: sb-spin 1s linear infinite;
+}
+@keyframes sb-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
 h2 { margin: 0; font-size: 1.05rem; }
 h3 { margin: 12px 0 6px; font-size: 0.95rem; }
 

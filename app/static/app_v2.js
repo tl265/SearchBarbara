@@ -120,6 +120,17 @@ if (contextDigestPaneEl) {
   contextDigestPaneEl.style.display = "";
 }
 
+function setReportButtonVisual(generating) {
+  if (!reportBtn) return;
+  const isGenerating = !!generating;
+  reportBtn.classList.toggle("is-loading", isGenerating);
+  const label = isGenerating
+    ? "Generating report..."
+    : "Generate report from current findings";
+  reportBtn.setAttribute("title", label);
+  reportBtn.setAttribute("aria-label", label);
+}
+
 function esc(s) {
   return String(s || "").replace(/[&<>\"]/g, (c) => ({
     "&": "&amp;",
@@ -202,7 +213,9 @@ function resetWorkspaceForNewSession() {
   runBtn.classList.add("primary");
   runBtn.disabled = false;
   reportBtn.disabled = true;
-  reportBtn.textContent = "Generate Report From Current Findings";
+  setReportButtonVisual(false);
+  downloadBtn.setAttribute("title", "Download report");
+  downloadBtn.setAttribute("aria-label", "Download report");
   downloadBtn.disabled = true;
   pauseBtn.disabled = true;
   resumeBtn.disabled = true;
@@ -2087,7 +2100,7 @@ function applySnapshot(snap) {
   downloadBtn.disabled = !hasDownloadableReport;
   const allowManualReport = !!sid && !reportBusy && (paused || terminal);
   reportBtn.disabled = !allowManualReport;
-  reportBtn.textContent = reportGeneratingForThisRun ? "Generating Report..." : "Generate Report From Current Findings";
+  setReportButtonVisual(reportGeneratingForThisRun);
   if (versions.length && activeIdx) {
     reportVersionLabel.textContent = `${activeIdx}/${versions.length}`;
   } else {
@@ -2547,7 +2560,7 @@ reportBtn.addEventListener("click", async () => {
   reportGeneratingRunIds.add(reportRunId);
   runBtn.disabled = true;
   reportBtn.disabled = true;
-  reportBtn.textContent = "Generating Report...";
+  setReportButtonVisual(true);
   showError("");
   upsertThought("Generating report from accumulated findings.", "report");
 

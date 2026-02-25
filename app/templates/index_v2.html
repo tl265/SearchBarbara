@@ -43,8 +43,6 @@
       <textarea id="task" rows="3" placeholder="Ask a deep research question..."></textarea>
       <div class="dock-controls">
         <button id="runBtn" class="primary">Start Research</button>
-        <button id="reportBtn" disabled>Generate Report From Current Findings</button>
-        <button id="downloadBtn" disabled>Download Report</button>
       </div>
       <details>
         <summary>Advanced controls</summary>
@@ -114,6 +112,33 @@
         <div class="section-head">
           <h2>Report</h2>
           <div class="report-head-tools">
+            <button
+              id="reportBtn"
+              class="icon-btn"
+              type="button"
+              disabled
+              aria-label="Generate report from current findings"
+              title="Generate report from current findings"
+            >
+              <svg class="icon refresh-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M20 4v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <button
+              id="downloadBtn"
+              class="icon-btn"
+              type="button"
+              disabled
+              aria-label="Download report"
+              title="Download report"
+            >
+              <svg class="icon download-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 3v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M4 21h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </button>
             <button id="reportPrevBtn" type="button" disabled>&lt;</button>
             <span id="reportVersionLabel" class="muted">-/-</span>
             <button id="reportNextBtn" type="button" disabled>&gt;</button>
