@@ -125,6 +125,16 @@ body.sessions-collapsed .session-rail .dock-controls {
   margin-bottom: 0;
 }
 .dock-label { display: block; font-weight: 600; margin-bottom: 6px; }
+.task-run-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: stretch;
+}
+.task-run-row #runBtn {
+  white-space: nowrap;
+  align-self: stretch;
+}
 textarea, input {
   width: 100%;
   border: 1px solid var(--line);
@@ -354,6 +364,12 @@ body.sessions-collapsed .session-toggle-icon {
 @media (max-width: 1100px) {
   .app-layout {
     grid-template-columns: 1fr;
+  }
+  .task-run-row {
+    grid-template-columns: 1fr;
+  }
+  .task-run-row #runBtn {
+    width: 100%;
   }
   .session-rail {
     position: static;
