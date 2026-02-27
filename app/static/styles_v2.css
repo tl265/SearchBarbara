@@ -299,18 +299,22 @@ button:disabled {
   flex-direction: column;
   gap: 6px;
   max-height: 220px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .session-rail .session-list {
   max-height: none;
   min-height: 0;
   flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 .session-row {
   border: 1px solid var(--line);
   border-radius: 8px;
   padding: 8px;
   min-height: 44px;
+  flex: 0 0 auto;
   background: #fcfeff;
   display: grid;
   grid-template-columns: 1fr auto;
