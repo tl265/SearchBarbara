@@ -2284,7 +2284,7 @@ function connectEvents(runId) {
           clearStartupParseState(runId);
           scheduleContextRefreshDebounced(runId);
         }
-        if (UI_DEBUG && parsed.event_type === "context_for_node_ready" && contextAggregateDigestEl) {
+        if (parsed.event_type === "context_for_node_ready" && contextAggregateDigestEl) {
           const ctx = parsed.payload && typeof parsed.payload === "object"
             ? parsed.payload.context_slice
             : null;
@@ -2483,7 +2483,7 @@ async function uploadContextFiles(files) {
   const uploadedNames = list.map((f) => String(f.name || "context.txt"));
   pendingUploadFiles = uploadedNames;
   renderContextPane();
-  if (UI_DEBUG && contextAggregateDigestEl) {
+  if (contextAggregateDigestEl) {
     contextAggregateDigestEl.textContent = `Parsing uploaded files, please wait...\n- ${uploadedNames.join("\n- ")}`;
   }
   setContextBusy(true);
