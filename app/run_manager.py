@@ -1702,6 +1702,9 @@ class RunManager:
             node_id = str(payload.get("node_id", ""))
             rnd = self._ensure_round(tree, round_i)
             qnode = self._ensure_question(rnd, sq)
+            incoming_title = str(payload.get("display_title", "")).strip()
+            if not str(qnode.get("display_title", "")).strip() and incoming_title:
+                qnode["display_title"] = incoming_title
             qnode["depth"] = depth
             qnode["parent"] = parent
             qnode["status"] = "running"
@@ -1714,6 +1717,9 @@ class RunManager:
             queries = payload.get("queries", [])
             rnd = self._ensure_round(tree, round_i)
             qnode = self._ensure_question(rnd, sq)
+            incoming_title = str(payload.get("display_title", "")).strip()
+            if not str(qnode.get("display_title", "")).strip() and incoming_title:
+                qnode["display_title"] = incoming_title
             if "depth" in payload:
                 qnode["depth"] = int(payload.get("depth", 1))
             for query in queries:
@@ -1844,6 +1850,15 @@ class RunManager:
             rnd = self._ensure_round(tree, round_i)
             qnode = self._ensure_question(rnd, sq)
             qnode["children"] = payload.get("children", [])
+            child_titles = payload.get("children_display_titles", {})
+            cleaned_child_titles: Dict[str, str] = {}
+            if isinstance(child_titles, dict):
+                for child, title in child_titles.items():
+                    c = str(child or "").strip()
+                    if not c:
+                        continue
+                    cleaned_child_titles[c] = str(title or "").strip()
+            qnode["children_display_titles"] = cleaned_child_titles
             child_node_ids = payload.get("child_node_ids", [])
             qnode["child_node_ids"] = (
                 child_node_ids if isinstance(child_node_ids, list) else []
@@ -2021,6 +2036,7 @@ class RunManager:
                 return q
         q = {
             "sub_question": sub_question,
+            "display_title": "",
             "node_id": "",
             "depth": 1,
             "parent": "",

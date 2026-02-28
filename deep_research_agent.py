@@ -879,6 +879,7 @@ class DeepResearchAgent:
         question_depths: Dict[str, int] = {}
         question_parents: Dict[str, str] = {}
         question_node_ids: Dict[str, str] = {}
+        question_display_titles: Dict[str, str] = {}
         question_gaps: Dict[str, List[str]] = {}
         decomposed_questions: set[str] = set()
         resolved_questions: set[str] = set()
@@ -945,6 +946,14 @@ class DeepResearchAgent:
                 for q, nid in raw_node_ids.items():
                     if isinstance(q, str) and isinstance(nid, str):
                         question_node_ids[q] = nid
+            raw_display_titles = resume_state.get("question_display_titles", {})
+            if isinstance(raw_display_titles, dict):
+                for q, title in raw_display_titles.items():
+                    if not isinstance(q, str):
+                        continue
+                    question_display_titles[q] = self._normalize_display_title(
+                        title, fallback=q
+                    )
             decomposed_questions = set(
                 self._normalize_llm_list(
                     resume_state.get("decomposed_questions", []),
@@ -1004,6 +1013,9 @@ class DeepResearchAgent:
             self._log("Initializing root task node (no upfront decomposition).")
             root_question = task.strip() or "Research task"
             sub_questions = [root_question]
+            question_display_titles[root_question] = self._normalize_display_title(
+                root_question, fallback=root_question
+            )
             success_criteria = []
             self._emit(
                 "plan_created",
@@ -1076,6 +1088,9 @@ class DeepResearchAgent:
             sub_questions + extra_questions + unresolved_questions
         ):
             get_or_assign_node_id(q, question_parents.get(q, ""))
+            question_display_titles.setdefault(
+                q, self._normalize_display_title(q, fallback=q)
+            )
 
         def save_checkpoint(
             status: str,
@@ -1098,6 +1113,7 @@ class DeepResearchAgent:
                 question_depths=question_depths,
                 question_parents=question_parents,
                 question_node_ids=question_node_ids,
+                question_display_titles=question_display_titles,
                 decomposed_questions=decomposed_questions,
                 resolved_questions=resolved_questions,
                 final_suff=final_suff,
@@ -1215,6 +1231,9 @@ class DeepResearchAgent:
                         {
                             "round": round_i,
                             "sub_question": sq,
+                            "display_title": question_display_titles.get(
+                                sq, self._normalize_display_title(sq, fallback=sq)
+                            ),
                             "depth": depth,
                             "parent": parent,
                             "node_id": node_id,
@@ -1224,6 +1243,9 @@ class DeepResearchAgent:
                     question_trace: Dict[str, Any] = {
                         "node_id": node_id,
                         "sub_question": sq,
+                        "display_title": question_display_titles.get(
+                            sq, self._normalize_display_title(sq, fallback=sq)
+                        ),
                         "depth": depth,
                         "parent": parent,
                         "status": "running",
@@ -1334,6 +1356,15 @@ Runtime context (authoritative):
                     generated_queries = self._normalize_llm_list(
                         qobj.get("queries"), "queries"
                     )
+                    display_title = self._normalize_display_title(
+                        qobj.get("display_title"), fallback=sq
+                    )
+                    existing_title = str(question_display_titles.get(sq, "")).strip()
+                    if not existing_title:
+                        question_display_titles[sq] = display_title
+                    question_trace["display_title"] = question_display_titles.get(
+                        sq, self._normalize_display_title(sq, fallback=sq)
+                    )
                     queries = self._dedupe_preserve_order(
                         generated_queries + round_extra_queries_by_question.get(sq, [])
                     )
@@ -1343,6 +1374,9 @@ Runtime context (authoritative):
                         {
                             "round": round_i,
                             "sub_question": sq,
+                            "display_title": question_display_titles.get(
+                                sq, self._normalize_display_title(sq, fallback=sq)
+                            ),
                             "depth": depth,
                             "queries": queries,
                             "count": len(queries),
@@ -1745,7 +1779,7 @@ Runtime context (authoritative):
                                 },
                             )
                             question_trace["status"] = "decomposing"
-                            children = self._decompose_sub_question(
+                            children, children_display_titles = self._decompose_sub_question(
                                 task=task,
                                 sub_question=sq,
                                 success_criteria=success_criteria,
@@ -1760,6 +1794,10 @@ Runtime context (authoritative):
                             if children:
                                 child_node_ids: List[str] = []
                                 for child in children:
+                                    question_display_titles[child] = self._normalize_display_title(
+                                        children_display_titles.get(child, child),
+                                        fallback=child,
+                                    )
                                     question_depths[child] = min(self.max_depth, depth + 1)
                                     if child not in question_parents or not question_parents.get(child, ""):
                                         question_parents[child] = sq
@@ -1783,10 +1821,28 @@ Runtime context (authoritative):
                                         "sub_question": sq,
                                         "depth": depth,
                                         "children": children,
+                                        "children_display_titles": {
+                                            child: question_display_titles.get(
+                                                child,
+                                                self._normalize_display_title(
+                                                    child, fallback=child
+                                                ),
+                                            )
+                                            for child in children
+                                        },
                                         "child_node_ids": child_node_ids,
                                     },
                                 )
                                 question_trace["children"] = children
+                                question_trace["children_display_titles"] = {
+                                    child: question_display_titles.get(
+                                        child,
+                                        self._normalize_display_title(
+                                            child, fallback=child
+                                        ),
+                                    )
+                                    for child in children
+                                }
                                 question_trace["child_node_ids"] = child_node_ids
                                 child_all_solved = True
                                 for child in children:
@@ -2281,7 +2337,7 @@ Runtime context (authoritative):
         max_depth: int,
         finding: SubQuestionFinding,
         node_context_slice: Dict[str, Any],
-    ) -> List[str]:
+    ) -> tuple[List[str], Dict[str, str]]:
         mode = self._compute_decompose_mode_hint(
             parent_question=sub_question,
             node_gaps=node_gaps,
@@ -2343,13 +2399,18 @@ Runtime context (authoritative):
             )
         except Exception as exc:
             self._log(f"Child decomposition failed: {exc}")
-            return []
+            return [], {}
         children = self._normalize_llm_list(
             plan.get("sub_questions"), "child_sub_questions"
         )
+        display_title_map = self._build_child_display_title_map(
+            children=children,
+            display_titles=plan.get("display_titles"),
+            parent_question=sub_question,
+        )
         filtered = [q for q in children if q.strip() and q.strip() != sub_question.strip()]
         filtered = self._cap_children_by_distinctiveness(filtered, hard_cap)
-        return self._enforce_mece_children(
+        final_children = self._enforce_mece_children(
             task=task,
             parent_question=sub_question,
             success_criteria=success_criteria,
@@ -2360,6 +2421,12 @@ Runtime context (authoritative):
             mode_hint=mode,
             candidates=filtered,
         )
+        final_title_map: Dict[str, str] = {}
+        for child in final_children:
+            final_title_map[child] = self._normalize_display_title(
+                display_title_map.get(child, child), fallback=child
+            )
+        return final_children, final_title_map
 
     def _enforce_mece_children(
         self,
@@ -2737,6 +2804,32 @@ Runtime context (authoritative):
         if len(text) <= max_len:
             return text
         return text[: max_len - 3] + "..."
+
+    def _normalize_display_title(
+        self, value: Any, fallback: str, max_len: int = 56
+    ) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            raw = str(fallback or "").strip()
+        if not raw:
+            return "Untitled task"
+        compact = " ".join(raw.split())
+        if len(compact) <= max_len:
+            return compact
+        return self._trim_text(compact, max_len)
+
+    def _build_child_display_title_map(
+        self, children: List[str], display_titles: Any, parent_question: str
+    ) -> Dict[str, str]:
+        child_list = self._normalize_llm_list(children, "child_sub_questions_for_titles")
+        out: Dict[str, str] = {}
+        raw_titles = display_titles if isinstance(display_titles, list) else []
+        for idx, child in enumerate(child_list):
+            if child.strip() == parent_question.strip():
+                continue
+            candidate = raw_titles[idx] if idx < len(raw_titles) else ""
+            out[child] = self._normalize_display_title(candidate, fallback=child)
+        return out
 
     def _normalize_synth_facts(self, value: Any) -> List[Dict[str, Any]]:
         if not isinstance(value, list):
@@ -3197,6 +3290,7 @@ Runtime context (authoritative):
         question_depths: Dict[str, int],
         question_parents: Dict[str, str],
         question_node_ids: Dict[str, str],
+        question_display_titles: Dict[str, str],
         decomposed_questions: set[str],
         resolved_questions: set[str],
         final_suff: Dict[str, Any],
@@ -3230,6 +3324,7 @@ Runtime context (authoritative):
             "question_depths": question_depths,
             "question_parents": question_parents,
             "question_node_ids": question_node_ids,
+            "question_display_titles": question_display_titles,
             "decomposed_questions": sorted(decomposed_questions),
             "resolved_questions": sorted(resolved_questions),
             "final_sufficiency": final_suff,

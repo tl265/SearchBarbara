@@ -1579,6 +1579,7 @@ function buildQuestionsByDepth(questions) {
           ...prev,
           ...q,
           sub_question: label || prev.sub_question || "",
+          display_title: String(q.display_title || prev.display_title || label || "").trim(),
           status: mergeNodeStatus(prev.status, q.status),
           depth: Number(prev.depth || depth),
           query_steps: Array.isArray(q.query_steps) ? q.query_steps : (prev.query_steps || []),
@@ -1595,6 +1596,7 @@ function buildQuestionsByDepth(questions) {
       : {
           ...q,
           sub_question: label,
+          display_title: String(q.display_title || label || "").trim(),
           depth,
           status: String(q.status || "queued"),
           query_steps: Array.isArray(q.query_steps) ? q.query_steps : [],
@@ -1620,8 +1622,15 @@ function buildQuestionsByDepth(questions) {
       const childNodeIds = Array.isArray(node.child_node_ids) ? node.child_node_ids : [];
       const mappedChildNodeId = String(childNodeIds[childIndex - 1] || "").trim();
       if (!byKey.has(childKey)) {
+        const childDisplayTitleRaw = (
+          node && node.children_display_titles && typeof node.children_display_titles === "object"
+            ? node.children_display_titles[childLabel]
+            : ""
+        );
+        const childDisplayTitle = String(childDisplayTitleRaw || childLabel).trim();
         byKey.set(childKey, {
           sub_question: childLabel,
+          display_title: childDisplayTitle,
           depth: parentDepth + 1,
           parent: String(node.sub_question || ""),
           node_id:
@@ -1637,6 +1646,14 @@ function buildQuestionsByDepth(questions) {
         const existing = byKey.get(childKey);
         if (existing && !existing.parent) {
           existing.parent = String(node.sub_question || "");
+        }
+        if (existing && !String(existing.display_title || "").trim()) {
+          const fromParent = (
+            node && node.children_display_titles && typeof node.children_display_titles === "object"
+              ? node.children_display_titles[childLabel]
+              : ""
+          );
+          existing.display_title = String(fromParent || childLabel).trim();
         }
         if (existing && !existing.node_id) {
           existing.node_id =
@@ -1852,7 +1869,9 @@ function renderCanvas(tree) {
         if (nodeId) {
           html += `<div class="query-mini"><strong>Node ${esc(nodeId)}</strong></div>`;
         }
-        html += `<p class="node-title">${esc(q.sub_question || "")}</p>`;
+        const fullQuestion = String(q.sub_question || "").trim();
+        const displayTitle = String(q.display_title || fullQuestion || "").trim();
+        html += `<p class="node-title" title="${esc(fullQuestion)}">${esc(displayTitle)}</p>`;
         if (q.parent) {
           html += `<p class="node-parent"><span class="parent-link">from</span> ${esc(q.parent)}</p>`;
         }
