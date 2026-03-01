@@ -6,6 +6,10 @@ const downloadBtn = document.getElementById("downloadBtn");
 const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const abortBtn = document.getElementById("abortBtn");
+const swapBatchBtn = document.getElementById("swapBatchBtn");
+const planningPanelEl = document.getElementById("planningPanel");
+const planningMetaEl = document.getElementById("planningMeta");
+const planningChildrenEl = document.getElementById("planningChildren");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
@@ -106,6 +110,7 @@ let selectedContextFileId = "";
 let contextMutationInFlight = false;
 let pendingUploadFiles = [];
 let contextInputLocked = false;
+let planningMutationInFlight = false;
 const contextFetchStateByKey = new Map();
 const contextRefreshDebounceTimerByKey = new Map();
 const contextFetchSeqByKey = new Map();
@@ -235,7 +240,7 @@ function resetWorkspaceForNewSession() {
   runStatusEl.textContent = "idle";
   researchStatusEl.textContent = "idle";
   reportStatusEl.textContent = "pending";
-  runBtn.textContent = "Start Research";
+  runBtn.textContent = "Start Planning";
   runBtn.classList.add("primary");
   runBtn.disabled = false;
   reportBtn.disabled = true;
@@ -251,11 +256,34 @@ function resetWorkspaceForNewSession() {
   reportVersionLabel.textContent = "-/-";
   selectedReportVersionIndex = null;
   currentSnapshot = null;
+  renderPlanningPanel(null);
 }
 
 function isDraftSnapshot(snap) {
   const tree = snap && typeof snap.tree === "object" ? snap.tree : {};
   return !!tree.is_draft;
+}
+
+function planningPhase(snap) {
+  if (!snap || typeof snap !== "object") return "research";
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const phase = String(snap.phase || tree.phase || "research").trim().toLowerCase();
+  return phase === "planning" ? "planning" : "research";
+}
+
+function planningState(snap) {
+  if (!snap || typeof snap !== "object") return "idle";
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const st = String(snap.planning_state || tree.planning_state || "").trim().toLowerCase();
+  return st || "idle";
+}
+
+function planningCandidates(snap) {
+  if (!snap || typeof snap !== "object") return [];
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
+  const rows = Array.isArray(planning.root_children_candidates) ? planning.root_children_candidates : [];
+  return rows.filter((r) => r && typeof r === "object");
 }
 
 function isReportGeneratingForRun(runId) {
@@ -588,6 +616,142 @@ function cloneJson(v) {
     return JSON.parse(JSON.stringify(v));
   } catch (_err) {
     return v;
+  }
+}
+
+function renderPlanningPanel(snap) {
+  if (!planningPanelEl || !planningMetaEl || !planningChildrenEl) return;
+  const phase = planningPhase(snap);
+  const pState = planningState(snap);
+  const rows = planningCandidates(snap);
+  if (phase !== "planning") {
+    planningPanelEl.classList.add("hidden");
+    planningMetaEl.textContent = "Planning not started.";
+    planningChildrenEl.innerHTML = "";
+    if (swapBatchBtn) swapBatchBtn.disabled = true;
+    return;
+  }
+  planningPanelEl.classList.remove("hidden");
+  const canEdit = pState === "review" && !planningMutationInFlight;
+  planningMetaEl.textContent = `State: ${shortStatus(`planning_${pState}`)} · Pins are merged with uploaded files for decomposition.`;
+  if (swapBatchBtn) {
+    swapBatchBtn.disabled = !canEdit;
+    swapBatchBtn.textContent = planningMutationInFlight ? "Working..." : "Swap Batch";
+  }
+  if (!rows.length) {
+    planningChildrenEl.innerHTML = `<div class="muted">No root child candidates yet.</div>`;
+    return;
+  }
+  planningChildrenEl.innerHTML = rows.map((r) => {
+    const nodeId = String(r.node_id || "").trim();
+    const label = String(r.display_title || r.sub_question || "").trim();
+    const full = String(r.sub_question || "").trim();
+    const pinned = !!r.is_pinned;
+    const bonus = Math.max(0, Number(r.pin_depth_bonus || 0));
+    return `<div class="context-file-row" data-node-id="${esc(nodeId)}">
+      <div class="context-file-main">
+        <div class="context-file-name">${esc(label || full || nodeId)}</div>
+        <span class="context-chip ${pinned ? "ready" : "stale"}">${pinned ? "pinned" : "candidate"}</span>
+      </div>
+      <div class="context-file-meta">${esc(full || label)} · depth bonus +${bonus}</div>
+      <div class="context-file-actions">
+        <button type="button" data-action="${pinned ? "unpin" : "pin"}" data-node-id="${esc(nodeId)}" ${canEdit ? "" : "disabled"}>${pinned ? "Unpin" : "Pin"}</button>
+        <button type="button" data-action="depth" data-node-id="${esc(nodeId)}" ${canEdit && pinned ? "" : "disabled"}>Depth +1</button>
+      </div>
+    </div>`;
+  }).join("");
+}
+
+async function planningSwapBatch() {
+  if (!currentRunId || planningMutationInFlight) return;
+  planningMutationInFlight = true;
+  renderPlanningPanel(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/planning/swap_batch${qs}`, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey("planning_swap") },
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Swap batch failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    renderPlanningPanel(currentSnapshot);
+  }
+}
+
+async function planningCommit() {
+  if (!currentRunId || planningMutationInFlight) return;
+  planningMutationInFlight = true;
+  renderPlanningPanel(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/planning/commit${qs}`, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey("planning_commit") },
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Start research failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    renderPlanningPanel(currentSnapshot);
+  }
+}
+
+async function planningSetPin(nodeId, pin) {
+  if (!currentRunId || planningMutationInFlight) return;
+  const nid = String(nodeId || "").trim();
+  if (!nid) return;
+  planningMutationInFlight = true;
+  renderPlanningPanel(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const method = pin ? "POST" : "DELETE";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/nodes/${encodeURIComponent(nid)}/pin${qs}`, {
+      method,
+      headers: { "Idempotency-Key": newIdempotencyKey(pin ? "planning_pin" : "planning_unpin") },
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `${pin ? "Pin" : "Unpin"} failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    renderPlanningPanel(currentSnapshot);
+  }
+}
+
+async function planningDepthPlus(nodeId) {
+  if (!currentRunId || planningMutationInFlight) return;
+  const nid = String(nodeId || "").trim();
+  if (!nid) return;
+  planningMutationInFlight = true;
+  renderPlanningPanel(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/nodes/${encodeURIComponent(nid)}/depth_bonus${qs}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": newIdempotencyKey("planning_depth"),
+      },
+      body: JSON.stringify({ increment: 1 }),
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Depth update failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    renderPlanningPanel(currentSnapshot);
   }
 }
 
@@ -1476,6 +1640,13 @@ function restoreAndTrackDetailState() {
 function eventNarration(ev) {
   const et = String(ev.event_type || "");
   const p = (ev.payload && typeof ev.payload === "object") ? ev.payload : {};
+  if (et === "planning_started") return "Planning started for root decomposition.";
+  if (et === "planning_review_ready") return `Planning ready: ${Array.isArray(p.root_children_candidates) ? p.root_children_candidates.length : 0} root child candidates.`;
+  if (et === "planning_pin_updated") return "Updated pinned planning branches.";
+  if (et === "planning_depth_bonus_updated") return "Updated planning branch depth bonus.";
+  if (et === "planning_committed") return "Planning committed. Starting formal research.";
+  if (et === "planning_failed") return `Planning failed: ${p.error || "unknown error"}`;
+  if (et === "planning_aborted") return "Planning stopped by user request.";
   if (et === "run_started") return "Research started.";
   if (et === "context_binding_parsing_started") return `Parsing uploaded context files (${Number(p.files_total || 0)} total)...`;
   if (et === "context_binding_parsing_file_completed") return `Parsed context file ${Number(p.index || 0)}/${Number(p.total || 0)}: ${p.filename || ""}`;
@@ -2141,9 +2312,27 @@ function applySnapshot(snap) {
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
   const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
   const isNewSessionWorkspace = !currentRunId || isDraft;
-  runBtn.textContent = "Start Research";
+  const phase = planningPhase(snap);
+  const pState = planningState(snap);
+  if (phase === "planning") {
+    if (pState === "review") {
+      runBtn.textContent = "Start Research";
+    } else if (pState === "running" || pState === "idle") {
+      runBtn.textContent = "Planning...";
+    } else {
+      runBtn.textContent = "Start Planning";
+    }
+  } else {
+    runBtn.textContent = "Start Planning";
+  }
   runBtn.classList.add("primary");
-  runBtn.disabled = !isNewSessionWorkspace || reportBusy;
+  if (phase === "planning") {
+    runBtn.disabled = !(
+      pState === "review" && !reportBusy && !transitionPending && !planningMutationInFlight
+    );
+  } else {
+    runBtn.disabled = !isNewSessionWorkspace || reportBusy;
+  }
   if (transitionPending) {
     pauseBtn.disabled = true;
     resumeBtn.disabled = true;
@@ -2167,6 +2356,7 @@ function applySnapshot(snap) {
   }
   reportPrevBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx > 1);
   reportNextBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx < versions.length);
+  renderPlanningPanel(snap);
   renderSessions();
 }
 
@@ -2259,6 +2449,8 @@ function connectEvents(runId) {
   };
 
   const events = [
+    "planning_started", "planning_review_ready", "planning_pin_updated", "planning_depth_bonus_updated",
+    "planning_committed", "planning_failed", "planning_aborted",
     "run_started", "context_binding_started", "context_binding_completed", "context_binding_failed",
     "context_binding_parsing_started", "context_binding_parsing_file_completed", "context_binding_parsing_completed", "context_for_node_ready",
     "plan_created", "round_started", "sub_question_started", "queries_generated",
@@ -2320,7 +2512,13 @@ function connectEvents(runId) {
         if (parsed.event_type === "run_abort_requested" || parsed.event_type === "abort_requested") {
           abortRequested = true;
         }
-        if (parsed.event_type === "run_aborted" || parsed.event_type === "run_completed" || parsed.event_type === "run_failed") {
+        if (
+          parsed.event_type === "run_aborted"
+          || parsed.event_type === "run_completed"
+          || parsed.event_type === "run_failed"
+          || parsed.event_type === "planning_aborted"
+          || parsed.event_type === "planning_failed"
+        ) {
           clearStartupParseState(runId);
           pauseRequested = false;
           abortRequested = false;
@@ -2361,6 +2559,7 @@ async function startRun(idempotencyKey) {
         task,
         max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
         results_per_query: DEFAULT_RESULTS_PER_QUERY,
+        start_mode: "planning",
       }),
     });
     if (!rsp.ok) {
@@ -2627,13 +2826,23 @@ async function deleteContextFile(fileId) {
 }
 
 runBtn.addEventListener("click", async () => {
+  const phase = planningPhase(currentSnapshot);
+  const pState = planningState(currentSnapshot);
+  if (currentRunId && phase === "planning" && pState === "review") {
+    try {
+      await planningCommit();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+    return;
+  }
   if (currentRunId || startRunInFlight) {
     return;
   }
   startRunInFlight = true;
   runBtn.disabled = true;
   try {
-    await startRun(newIdempotencyKey("start_run"));
+    await startRun(newIdempotencyKey("start_planning"));
   } catch (err) {
     showError(err.message || String(err));
   } finally {
@@ -2711,6 +2920,39 @@ abortBtn.addEventListener("click", async () => {
     showError(err.message || String(err));
   }
 });
+
+if (swapBatchBtn) {
+  swapBatchBtn.addEventListener("click", async () => {
+    try {
+      await planningSwapBatch();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+  });
+}
+
+if (planningChildrenEl) {
+  planningChildrenEl.addEventListener("click", async (evt) => {
+    const target = evt && evt.target ? evt.target : null;
+    if (!target || typeof target.closest !== "function") return;
+    const btn = target.closest("button[data-action][data-node-id]");
+    if (!btn) return;
+    const action = String(btn.getAttribute("data-action") || "").trim();
+    const nodeId = String(btn.getAttribute("data-node-id") || "").trim();
+    if (!action || !nodeId) return;
+    try {
+      if (action === "pin") {
+        await planningSetPin(nodeId, true);
+      } else if (action === "unpin") {
+        await planningSetPin(nodeId, false);
+      } else if (action === "depth") {
+        await planningDepthPlus(nodeId);
+      }
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+  });
+}
 
 reportPrevBtn.addEventListener("click", async () => {
   try {

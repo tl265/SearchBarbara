@@ -25,6 +25,7 @@ from app.models import (
     ContextSetResponse,
     CreateRunRequest,
     CreateRunResponse,
+    PlanningDepthBonusRequest,
     PatchSessionRequest,
     RunSnapshotResponse,
     StartFromWorkspaceRequest,
@@ -437,8 +438,20 @@ def index_legacy(request: Request) -> HTMLResponse:
 
 
 def _compute_research_status(
-    status: str, execution_state: str | None, error: str | None
+    status: str,
+    execution_state: str | None,
+    error: str | None,
+    phase: str | None = None,
+    planning_state: str | None = None,
 ) -> str:
+    ph = str(phase or "").strip().lower()
+    ps = str(planning_state or "").strip().lower()
+    if ph == "planning":
+        if ps in {"running", "review", "idle", "committed"}:
+            return f"planning_{ps}"
+        if ps in {"failed", "aborted"}:
+            return ps
+        return "planning_idle"
     es = str(execution_state or "").strip().lower()
     if es == "paused":
         return "paused"
@@ -654,6 +667,7 @@ def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
         run_id = run_manager.create_run(
             task=req.task,
             max_depth=req.max_depth,
+            max_depth_cap_snapshot=max_depth_max,
             max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
             results_per_query=req.results_per_query,
             model=model,
@@ -704,6 +718,7 @@ def create_run_from_workspace(
         "task": req.task,
         "max_depth": int(req.max_depth),
         "results_per_query": int(req.results_per_query),
+        "start_mode": str(req.start_mode or "planning"),
         "model": model,
         "report_model": report_model,
     }
@@ -723,11 +738,13 @@ def create_run_from_workspace(
             workspace_id=workspace_id,
             task=req.task,
             max_depth=req.max_depth,
+            max_depth_cap_snapshot=max_depth_max,
             max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
             results_per_query=req.results_per_query,
             model=model,
             report_model=report_model,
             owner_id=user.user_id,
+            start_mode=req.start_mode,
         )
     except Exception:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
@@ -747,6 +764,7 @@ def create_draft_session(request: Request) -> CreateRunResponse:
     user = _require_user(request)
     run_id = run_manager.create_draft_session(
         max_depth=int(WEB_CONFIG.get("default_max_depth", 3)),
+        max_depth_cap_snapshot=int(WEB_CONFIG.get("max_depth_max", 8)),
         max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
         results_per_query=int(WEB_CONFIG.get("default_results_per_query", 3)),
         model=str(WEB_CONFIG.get("model", "gpt-4.1")),
@@ -803,6 +821,7 @@ def start_draft_session_run(
         run_id=session_id,
         task=req.task,
         max_depth=req.max_depth,
+        max_depth_cap_snapshot=max_depth_max,
         max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
         results_per_query=req.results_per_query,
         model=model,
@@ -840,11 +859,17 @@ def get_run(run_id: str, request: Request) -> RunSnapshotResponse:
         status=state.status,
         version=max(1, int(getattr(state, "version", 1) or 1)),
         execution_state=state.execution_state,
+        phase=state.phase,
+        planning_state=state.planning_state,
         research_state=state.research_state,
         report_state=state.report_state,
         terminal_reason=state.terminal_reason,
         research_status=_compute_research_status(
-            state.status, state.execution_state, state.error
+            state.status,
+            state.execution_state,
+            state.error,
+            state.phase,
+            state.planning_state,
         ),
         report_status=report_status,
         created_at=state.created_at,
@@ -898,11 +923,17 @@ def get_session(session_id: str, request: Request) -> RunSnapshotResponse:
         status=state.status,
         version=max(1, int(getattr(state, "version", 1) or 1)),
         execution_state=state.execution_state,
+        phase=state.phase,
+        planning_state=state.planning_state,
         research_state=state.research_state,
         report_state=state.report_state,
         terminal_reason=state.terminal_reason,
         research_status=_compute_research_status(
-            state.status, state.execution_state, state.error
+            state.status,
+            state.execution_state,
+            state.error,
+            state.phase,
+            state.planning_state,
         ),
         report_status=report_status,
         created_at=state.created_at,
@@ -1501,6 +1532,150 @@ def resume_run(
             raise HTTPException(status_code=409, detail=detail)
         raise HTTPException(status_code=500, detail=detail)
     return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/planning/start")
+def planning_start(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.start_planning(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/planning/swap_batch")
+def planning_swap_batch(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.planning_swap_batch(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/planning/commit")
+def planning_commit(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.planning_commit(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/nodes/{node_id}/pin")
+def pin_planning_node(
+    run_id: str,
+    node_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.pin_planning_node(
+        run_id, node_id=node_id, expected_version=expected_version
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run/node not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state", "invalid_node"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, "node_id": node_id, **result}
+
+
+@app.delete("/api/runs/{run_id}/nodes/{node_id}/pin")
+def unpin_planning_node(
+    run_id: str,
+    node_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.unpin_planning_node(
+        run_id, node_id=node_id, expected_version=expected_version
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run/node not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state", "invalid_node"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, "node_id": node_id, **result}
+
+
+@app.post("/api/runs/{run_id}/nodes/{node_id}/depth_bonus")
+def increment_planning_depth_bonus(
+    run_id: str,
+    node_id: str,
+    req: PlanningDepthBonusRequest,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.planning_increment_depth_bonus(
+        run_id,
+        node_id=node_id,
+        increment=int(req.increment),
+        expected_version=expected_version,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run/node not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {
+            "conflict_state_version",
+            "invalid_state",
+            "invalid_node",
+            "invalid_depth_cap",
+        }:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, "node_id": node_id, **result}
 
 
 @app.post("/api/runs/{run_id}/report/partial")
