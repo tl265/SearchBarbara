@@ -65,12 +65,13 @@ class RunManager:
         self._idempotency_lock = threading.Lock()
         self._idempotency_records: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
-        self._index_write_lock = threading.Lock()
         self._index_flush_event = threading.Event()
-        self._index_flush_pending_by_owner: Dict[str, Dict[str, Any]] = {}
+        self._index_flush_pending_by_owner: Dict[str, bool] = {}
         self._index_flush_pending_lock = threading.Lock()
+        self._index_flush_inflight_owners: set[str] = set()
         self._index_owner_locks: Dict[str, threading.Lock] = {}
         self._index_owner_locks_guard = threading.Lock()
+        self._manifest_write_lock = threading.Lock()
         self._dirty_owner_keys: set[str] = set()
         self._index_writer_thread = threading.Thread(
             target=self._sessions_index_writer_loop,
@@ -819,9 +820,7 @@ class RunManager:
                 if session_lock is None
                 else ("locked" if self._is_lock_locked(session_lock) else "free")
             ),
-            "index_write_lock": "locked"
-            if self._is_lock_locked(self._index_write_lock)
-            else "free",
+            "index_flush_inflight": len(self._index_flush_inflight_owners),
         }
 
     def list_sessions(
@@ -2849,89 +2848,111 @@ class RunManager:
         self._sessions_index_meta["schema_version"] = self._SESSIONS_INDEX_SCHEMA_VERSION
         owner_keys = set(self._dirty_owner_keys)
         if not owner_keys:
-            owner_keys = {
-                self._owner_index_key(it.get("owner_id"))
-                for it in self._sessions.values()
-                if isinstance(it, dict)
-            }
+            owner_keys = set(self._sessions_by_owner.keys())
         now_ts = time.time()
         queued_owner_keys: set[str] = set()
         for owner_key in owner_keys:
             last_ts = float(self._last_index_flush_ts_by_owner.get(owner_key, 0.0))
             if not force and (now_ts - last_ts) < self._index_flush_min_interval_sec:
                 continue
-            owner_id = self._owner_key_to_owner_id(owner_key)
-            sessions = [
-                dict(it)
-                for it in self._sessions.values()
-                if isinstance(it, dict)
-                and self._owner_index_key(it.get("owner_id")) == owner_key
-            ]
-            payload = {
-                "schema_version": int(
-                    self._sessions_index_meta.get(
-                        "schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION
-                    )
-                ),
-                "title_migration_v1_done": bool(
-                    self._sessions_index_meta.get("title_migration_v1_done", False)
-                ),
-                "execution_state_migration_v1_done": bool(
-                    self._sessions_index_meta.get(
-                        "execution_state_migration_v1_done", False
-                    )
-                ),
-                "execution_state_backfill_v2_done": bool(
-                    self._sessions_index_meta.get(
-                        "execution_state_backfill_v2_done", False
-                    )
-                ),
-                "sharding_migration_done": bool(
-                    self._sessions_index_meta.get("sharding_migration_done", False)
-                ),
-                "updated_at": _now().isoformat(),
-                "owner_id": owner_id,
-                "sessions": sessions,
-            }
-            with self._index_flush_pending_lock:
-                self._index_flush_pending_by_owner[owner_key] = payload
             self._last_index_flush_ts_by_owner[owner_key] = now_ts
             queued_owner_keys.add(owner_key)
         self._dirty_owner_keys.difference_update(queued_owner_keys)
         if queued_owner_keys:
+            with self._index_flush_pending_lock:
+                for owner_key in queued_owner_keys:
+                    self._index_flush_pending_by_owner[owner_key] = True
             self._index_flush_event.set()
 
     def _sessions_index_writer_loop(self) -> None:
         while True:
             self._index_flush_event.wait()
-            owner_key = ""
-            payload: Dict[str, Any] = {}
             with self._index_flush_pending_lock:
-                if self._index_flush_pending_by_owner:
-                    owner_key, payload = next(iter(self._index_flush_pending_by_owner.items()))
-                    self._index_flush_pending_by_owner.pop(owner_key, None)
-            if not owner_key:
-                self._index_flush_event.clear()
-                continue
-            owner_lock = self._owner_index_lock(owner_key)
-            with self._index_write_lock:
-                with owner_lock:
-                    try:
-                        path = self._owner_index_path(owner_key)
-                        path.parent.mkdir(parents=True, exist_ok=True)
-                        tmp_path = path.with_suffix(".json.tmp")
-                        tmp_path.write_text(
-                            json.dumps(payload, ensure_ascii=False, indent=2),
-                            encoding="utf-8",
-                        )
-                        tmp_path.replace(path)
-                        self._save_sessions_index_manifest()
-                    except Exception as exc:
-                        # Keep session/runs in memory even if persistence is temporarily unavailable.
-                        print(f"[sessions] index flush failed: {exc}")
-            with self._index_flush_pending_lock:
-                if not self._index_flush_pending_by_owner:
+                launch: List[str] = []
+                for owner_key, pending in list(self._index_flush_pending_by_owner.items()):
+                    if not pending:
+                        continue
+                    if owner_key in self._index_flush_inflight_owners:
+                        continue
+                    self._index_flush_inflight_owners.add(owner_key)
+                    launch.append(owner_key)
+                if not launch:
                     self._index_flush_event.clear()
+            if not launch:
+                continue
+            for owner_key in launch:
+                threading.Thread(
+                    target=self._flush_owner_index_loop,
+                    args=(owner_key,),
+                    daemon=True,
+                ).start()
+
+    def _build_owner_index_payload(self, owner_key: str) -> Dict[str, Any]:
+        with self._lock:
+            session_row_refs = [
+                it
+                for it in self._sessions_by_owner.get(owner_key, {}).values()
+                if isinstance(it, dict)
+            ]
+            schema_version = int(
+                self._sessions_index_meta.get(
+                    "schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION
+                )
+            )
+            title_migration_v1_done = bool(
+                self._sessions_index_meta.get("title_migration_v1_done", False)
+            )
+            execution_state_migration_v1_done = bool(
+                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
+            )
+            execution_state_backfill_v2_done = bool(
+                self._sessions_index_meta.get("execution_state_backfill_v2_done", False)
+            )
+            sharding_migration_done = bool(
+                self._sessions_index_meta.get("sharding_migration_done", False)
+            )
+        session_rows = [dict(it) for it in session_row_refs]
+        return {
+            "schema_version": schema_version,
+            "title_migration_v1_done": title_migration_v1_done,
+            "execution_state_migration_v1_done": execution_state_migration_v1_done,
+            "execution_state_backfill_v2_done": execution_state_backfill_v2_done,
+            "sharding_migration_done": sharding_migration_done,
+            "updated_at": _now().isoformat(),
+            "owner_id": self._owner_key_to_owner_id(owner_key),
+            "sessions": session_rows,
+        }
+
+    def _flush_owner_index_loop(self, owner_key: str) -> None:
+        while True:
+            with self._index_flush_pending_lock:
+                pending = bool(self._index_flush_pending_by_owner.get(owner_key, False))
+                if not pending:
+                    self._index_flush_inflight_owners.discard(owner_key)
+                    self._index_flush_pending_by_owner.pop(owner_key, None)
+                    if any(bool(v) for v in self._index_flush_pending_by_owner.values()):
+                        self._index_flush_event.set()
+                    elif not self._index_flush_inflight_owners:
+                        self._index_flush_event.clear()
+                    return
+                self._index_flush_pending_by_owner[owner_key] = False
+            payload = self._build_owner_index_payload(owner_key)
+            owner_lock = self._owner_index_lock(owner_key)
+            with owner_lock:
+                try:
+                    path = self._owner_index_path(owner_key)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path = path.with_suffix(".json.tmp")
+                    tmp_path.write_text(
+                        json.dumps(payload, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    tmp_path.replace(path)
+                    with self._manifest_write_lock:
+                        self._save_sessions_index_manifest()
+                except Exception as exc:
+                    # Keep session/runs in memory even if persistence is temporarily unavailable.
+                    print(f"[sessions] index flush failed owner={owner_key}: {exc}")
 
     def _should_flush_sessions_index(self, event_type: str) -> bool:
         if event_type in {
