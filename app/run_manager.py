@@ -2432,6 +2432,8 @@ class RunManager:
             if isinstance(tree, dict):
                 tree["phase"] = "planning"
                 tree["planning_state"] = "running"
+                tree["rounds"] = []
+                tree.pop("final_sufficiency", None)
             return
         if et == "planning_review_ready":
             state.status = "queued"
@@ -2462,6 +2464,17 @@ class RunManager:
                     if isinstance(payload.get("root_lazy_evidence", []), list)
                     else planning.get("root_lazy_evidence", [])
                 )
+                planning["root_query_steps"] = (
+                    payload.get("root_query_steps", planning.get("root_query_steps", []))
+                    if isinstance(payload.get("root_query_steps", []), list)
+                    else planning.get("root_query_steps", [])
+                )
+                root_node_suff = payload.get("root_node_sufficiency", planning.get("root_node_sufficiency", {}))
+                if isinstance(root_node_suff, dict):
+                    planning["root_node_sufficiency"] = root_node_suff
+                root_finding = payload.get("root_finding", planning.get("root_finding", {}))
+                if isinstance(root_finding, dict):
+                    planning["root_finding"] = root_finding
                 children = payload.get("root_children_candidates", [])
                 if isinstance(children, list):
                     planning["root_children_candidates"] = children
@@ -3393,6 +3406,7 @@ class RunManager:
             try:
                 pinned_children: List[Dict[str, Any]] = []
                 exclusions: List[str] = []
+                cached_root_analysis: Optional[Dict[str, Any]] = None
                 root_question = str(task or "").strip() or "Research task"
                 batch_id = 0
                 default_max_depth = max(1, int(snapshot.max_depth or 1))
@@ -3448,11 +3462,40 @@ class RunManager:
                                         if isinstance(v, str) and str(v).strip()
                                     ]
                                 )
+                            if planning_pending_action.startswith("swap_batch"):
+                                cached_root_analysis = {
+                                    "queries": copy.deepcopy(
+                                        planning_obj.get("root_lazy_queries", [])
+                                        if isinstance(planning_obj.get("root_lazy_queries", []), list)
+                                        else []
+                                    ),
+                                    "evidence": copy.deepcopy(
+                                        planning_obj.get("root_lazy_evidence", [])
+                                        if isinstance(planning_obj.get("root_lazy_evidence", []), list)
+                                        else []
+                                    ),
+                                    "query_steps": copy.deepcopy(
+                                        planning_obj.get("root_query_steps", [])
+                                        if isinstance(planning_obj.get("root_query_steps", []), list)
+                                        else []
+                                    ),
+                                    "node_sufficiency": copy.deepcopy(
+                                        planning_obj.get("root_node_sufficiency", {})
+                                        if isinstance(planning_obj.get("root_node_sufficiency", {}), dict)
+                                        else {}
+                                    ),
+                                    "finding": copy.deepcopy(
+                                        planning_obj.get("root_finding", {})
+                                        if isinstance(planning_obj.get("root_finding", {}), dict)
+                                        else {}
+                                    ),
+                                }
                 planning_result = agent.plan_root_batch(
                     task=root_question,
                     pinned_children=pinned_children,
                     exclude_children=exclusions,
                     action=planning_pending_action or "start",
+                    cached_root=cached_root_analysis,
                 )
                 if planning_pending_action == "swap_batch":
                     first_children = (
@@ -3481,6 +3524,7 @@ class RunManager:
                             pinned_children=pinned_children,
                             exclude_children=exclusions + list(first_norm),
                             action="swap_batch_retry",
+                            cached_root=cached_root_analysis,
                         )
                 if is_cancel_requested():
                     emit_worker_event("planning_aborted", {"error": "Run aborted by user"})
@@ -3592,6 +3636,25 @@ class RunManager:
                             if isinstance(planning_result.get("evidence", []), list)
                             else []
                         )
+                        planning_obj["root_query_steps"] = copy.deepcopy(
+                            planning_result.get("query_steps", [])
+                            if isinstance(planning_result.get("query_steps", []), list)
+                            else []
+                        )
+                        planning_obj["root_node_sufficiency"] = {
+                            "is_sufficient": bool(planning_result.get("is_sufficient", False)),
+                            "reasoning": str(planning_result.get("node_reasoning", "")).strip(),
+                            "gaps": copy.deepcopy(
+                                planning_result.get("node_gaps", [])
+                                if isinstance(planning_result.get("node_gaps", []), list)
+                                else []
+                            ),
+                        }
+                        planning_obj["root_finding"] = copy.deepcopy(
+                            planning_result.get("finding", {})
+                            if isinstance(planning_result.get("finding", {}), dict)
+                            else {}
+                        )
                         planning_obj["root_children_candidates"] = copy.deepcopy(final_rows)
                         planning_obj["pinned_root_child_ids"] = [
                             r["node_id"] for r in final_rows if bool(r.get("is_pinned", False))
@@ -3701,6 +3764,25 @@ class RunManager:
                         planning_result.get("evidence", [])
                         if isinstance(planning_result.get("evidence", []), list)
                         else []
+                    ),
+                    "root_query_steps": copy.deepcopy(
+                        planning_result.get("query_steps", [])
+                        if isinstance(planning_result.get("query_steps", []), list)
+                        else []
+                    ),
+                    "root_node_sufficiency": {
+                        "is_sufficient": bool(planning_result.get("is_sufficient", False)),
+                        "reasoning": str(planning_result.get("node_reasoning", "")).strip(),
+                        "gaps": copy.deepcopy(
+                            planning_result.get("node_gaps", [])
+                            if isinstance(planning_result.get("node_gaps", []), list)
+                            else []
+                        ),
+                    },
+                    "root_finding": copy.deepcopy(
+                        planning_result.get("finding", {})
+                        if isinstance(planning_result.get("finding", {}), dict)
+                        else {}
                     ),
                     "root_children_candidates": copy.deepcopy(final_rows),
                     "pinned_root_child_ids": [r["node_id"] for r in final_rows if bool(r.get("is_pinned", False))],
@@ -4025,6 +4107,17 @@ class RunManager:
             "pin_depth_bonus_semantics": 2,
             "root_lazy_queries": [],
             "root_lazy_evidence": [],
+            "root_query_steps": [],
+            "root_node_sufficiency": {
+                "is_sufficient": False,
+                "reasoning": "",
+                "gaps": [],
+            },
+            "root_finding": {
+                "summaries": [],
+                "facts": [],
+                "uncertainties": [],
+            },
             "root_children_candidates": [],
             "pinned_root_child_ids": [],
             "active_pin_records": [],

@@ -119,6 +119,8 @@ const stagedContextBySessionId = new Map();
 const startupParseStateByRunId = new Map();
 let currentContextSource = "session";
 let errorBannerTimer = null;
+let contextAggregateViewBase = null;
+let contextAggregateViewMode = "";
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
 }
@@ -461,6 +463,8 @@ function clearContextPane(msg = "No context files uploaded.") {
   currentContextSet = null;
   currentContextSource = "session";
   selectedContextFileId = "";
+  contextAggregateViewBase = null;
+  contextAggregateViewMode = "";
   contextMetaEl.textContent = msg;
   contextDiffBannerEl.textContent = "";
   contextFilesEl.innerHTML = `<div class="muted">No files.</div>`;
@@ -653,6 +657,74 @@ function cloneJson(v) {
   } catch (_err) {
     return v;
   }
+}
+
+function normalizeActivePinRecords(rows) {
+  const src = Array.isArray(rows) ? rows : [];
+  const out = [];
+  for (const row of src) {
+    if (!row || typeof row !== "object") continue;
+    const subQuestion = String(row.sub_question || "").trim();
+    const displayTitle = String(row.display_title || "").trim();
+    const nodeId = String(row.node_id || "").trim();
+    if (!subQuestion && !displayTitle && !nodeId) continue;
+    out.push({
+      node_id: nodeId,
+      sub_question: subQuestion,
+      display_title: displayTitle || subQuestion,
+      pin_depth_bonus: Math.max(0, Number(row.pin_depth_bonus || 0)),
+      updated_at: String(row.updated_at || "").trim(),
+    });
+  }
+  return out;
+}
+
+function activePinRecordsFromSnapshot() {
+  const tree = currentSnapshot && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
+  const planning = tree && typeof tree.planning === "object" ? tree.planning : {};
+  return normalizeActivePinRecords(planning.active_pin_records || []);
+}
+
+function buildContextAggregateView(basePayload, mode = "digest") {
+  const payload = basePayload && typeof basePayload === "object" ? basePayload : {};
+  if (mode === "context_slice") {
+    const out = {};
+    out.context_slice = payload;
+    const inlinePinRows = normalizeActivePinRecords(payload.active_pin_records || []);
+    if (inlinePinRows.length) {
+      return out;
+    }
+    const fallbackPinRows = activePinRecordsFromSnapshot();
+    out.active_pin_records = fallbackPinRows;
+    out.active_pin_records_count = fallbackPinRows.length;
+    return out;
+  }
+  const pinRows = activePinRecordsFromSnapshot();
+  const out = { digest: payload };
+  out.active_pin_records = pinRows;
+  out.active_pin_records_count = pinRows.length;
+  return out;
+}
+
+function renderContextAggregateView(basePayload, mode = "digest") {
+  if (!contextAggregateDigestEl) return;
+  contextAggregateViewBase = cloneJson(basePayload && typeof basePayload === "object" ? basePayload : {});
+  contextAggregateViewMode = String(mode || "digest");
+  contextAggregateDigestEl.textContent = JSON.stringify(
+    buildContextAggregateView(contextAggregateViewBase, contextAggregateViewMode),
+    null,
+    2
+  );
+}
+
+function refreshContextAggregateViewFromSnapshot() {
+  if (!contextAggregateDigestEl) return;
+  if (!contextAggregateViewBase || typeof contextAggregateViewBase !== "object") return;
+  contextAggregateDigestEl.textContent = JSON.stringify(
+    buildContextAggregateView(contextAggregateViewBase, contextAggregateViewMode || "digest"),
+    null,
+    2
+  );
 }
 
 function renderPlanningPanel(snap) {
@@ -873,6 +945,8 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
   const set = currentContextSet && typeof currentContextSet === "object" ? currentContextSet : {};
   const files = Array.isArray(set.files) ? set.files.filter((f) => f && typeof f === "object") : [];
   if (files.length === 0) {
+    contextAggregateViewBase = null;
+    contextAggregateViewMode = "";
     contextAggregateDigestEl.textContent = "";
     return;
   }
@@ -890,16 +964,17 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
       statusLower !== "failed" &&
       !err
     ) {
+      contextAggregateViewBase = null;
+      contextAggregateViewMode = "";
       contextAggregateDigestEl.textContent = "";
       return;
     }
-    contextAggregateDigestEl.textContent = JSON.stringify(
+    renderContextAggregateView(
       {
         status: status || "missing",
         error: err || `${label} not ready (${statusCode}).`,
       },
-      null,
-      2
+      "digest"
     );
   };
 
@@ -916,7 +991,7 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
     }
     const data = await rsp.json();
     const digest = data && typeof data === "object" ? data.digest : null;
-    contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+    renderContextAggregateView(digest || {}, "digest");
     return;
   }
 
@@ -927,7 +1002,7 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
   }
   const data = await rsp.json();
   const digest = data && typeof data === "object" ? data.digest : null;
-  contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+  renderContextAggregateView(digest || {}, "digest");
 }
 
 async function fetchContextFileDigest(fileId, runIdOverride = "", workspaceIdOverride = "") {
@@ -2315,6 +2390,7 @@ function refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap) {
 
 function applySnapshot(snap) {
   currentSnapshot = snap;
+  refreshContextAggregateViewFromSnapshot();
   const sid = String(snap.session_id || snap.run_id || "").trim();
   setContextEnabled(!!sid);
   if (contextDigestPaneEl) {
@@ -2590,7 +2666,7 @@ function connectEvents(runId) {
             ? parsed.payload.context_slice
             : null;
           if (ctx && typeof ctx === "object") {
-            contextAggregateDigestEl.textContent = JSON.stringify(ctx, null, 2);
+            renderContextAggregateView(ctx, "context_slice");
           }
         }
         if (parsed.event_type === "report_generation_completed" || parsed.event_type === "report_generation_failed") {
@@ -2792,6 +2868,8 @@ async function uploadContextFiles(files) {
   pendingUploadFiles = uploadedNames;
   renderContextPane();
   if (contextAggregateDigestEl) {
+    contextAggregateViewBase = null;
+    contextAggregateViewMode = "";
     contextAggregateDigestEl.textContent = `Parsing uploaded files, please wait...\n- ${uploadedNames.join("\n- ")}`;
   }
   setContextBusy(true);

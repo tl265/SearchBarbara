@@ -85,7 +85,7 @@
           <button id="pauseBtn" type="button" disabled>Pause</button>
           <button id="resumeBtn" type="button" disabled>Resume</button>
           <button id="abortBtn" type="button" disabled>Abort</button>
-          <label class="inline-number-control">Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
+          <label class="inline-number-control">Baseline depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
         </div>
         <section id="planningPanel" class="planning-panel hidden">
           <div class="section-head">
@@ -115,7 +115,7 @@
               <div id="contextFiles" class="context-files-list"></div>
             </div>
             <div class="context-digest-pane">
-              <h3>Aggregated File Digest</h3>
+              <h3>User Context Digest</h3>
               <pre id="contextAggregateDigest" class="usage"></pre>
             </div>
           </div>

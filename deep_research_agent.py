@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 import time
@@ -862,9 +863,24 @@ class DeepResearchAgent:
         pinned_children: Optional[List[Dict[str, Any]]] = None,
         exclude_children: Optional[List[str]] = None,
         action: str = "start",
+        cached_root: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         self._abort_if_requested("planning_start")
         root_question = str(task or "").strip() or "Research task"
+        round_i = 1
+        root_node_id = "1"
+        self._emit("round_started", {"round": round_i})
+        self._emit(
+            "sub_question_started",
+            {
+                "round": round_i,
+                "sub_question": root_question,
+                "display_title": root_question,
+                "depth": 1,
+                "parent": "",
+                "node_id": root_node_id,
+            },
+        )
         pinned_rows = pinned_children if isinstance(pinned_children, list) else []
         pinned_map: Dict[str, Dict[str, Any]] = {}
         for row in pinned_rows:
@@ -900,6 +916,22 @@ class DeepResearchAgent:
             ),
             "active_pin_records": active_pin_records if isinstance(active_pin_records, list) else [],
         }
+        self._emit(
+            "context_for_node_ready",
+            {
+                "round": round_i,
+                "sub_question": root_question,
+                "depth": 1,
+                "node_id": root_node_id,
+                "mode": str(node_context_slice.get("mode", "")),
+                "selected_items_count": len(
+                    node_context_slice.get("selected_items", [])
+                    if isinstance(node_context_slice.get("selected_items", []), list)
+                    else []
+                ),
+                "context_slice": node_context_slice,
+            },
+        )
 
         now_utc = datetime.now(timezone.utc)
         query_prompt = f"""Original task:
@@ -919,102 +951,250 @@ Runtime context (authoritative):
 - Current date (UTC): {now_utc.date().isoformat()}
 - Current year (UTC): {now_utc.year}
 """
-        qobj = self.llm.json(
-            SYSTEM_QUERY_GEN,
-            query_prompt,
-            stage="planning_query_gen",
-            metadata={"sub_question": self._trim_text(root_question, 120)},
-        )
-        queries = self._dedupe_preserve_order(
-            self._normalize_llm_list(qobj.get("queries"), "planning_queries")
-        )
         finding = SubQuestionFinding(sub_question=root_question)
+        queries: List[str] = []
         evidence: List[Dict[str, Any]] = []
         query_steps: List[Dict[str, Any]] = []
-        question_has_evidence = False
-        for query in queries:
-            self._abort_if_requested("planning_query_loop")
-            raw_results = self.search.search(query, self.results_per_query)
-            search_error = self.search.last_error
-            selected_results = self._select_high_quality_results(
-                raw_results, self.results_per_query
-            )
-            primary_count = sum(
-                1 for r in selected_results if r.quality_tier == "primary_or_official"
-            )
-            step_data: Dict[str, Any] = {
-                "query": query,
-                "status": "failed" if search_error and not selected_results else "success",
-                "search_error": search_error,
-                "selected_results_count": len(selected_results),
-                "primary_count": primary_count,
-                "selected_sources": [
-                    {"title": r.title, "url": r.url} for r in selected_results
-                ],
-            }
-            if not selected_results:
-                query_steps.append(step_data)
-                if search_error:
-                    finding.uncertainties.append(
-                        f"Search failed for query '{query}': {search_error}"
-                    )
-                else:
-                    finding.uncertainties.append(
-                        f"No usable evidence retrieved for query '{query}'."
-                    )
-                continue
-            question_has_evidence = True
-            sobj = self.llm.json(
-                SYSTEM_SYNTHESIZE,
-                self._format_synthesis_prompt(root_question, query, selected_results),
-                stage="planning_synthesize",
-                metadata={
-                    "sub_question": self._trim_text(root_question, 120),
-                    "query": self._trim_text(query, 140),
-                },
-            )
-            summary = str(sobj.get("summary", "")).strip()
-            if summary:
-                finding.summaries.append(summary)
-                step_data["synthesis_summary"] = summary
-            finding.facts.extend(self._normalize_synth_facts(sobj.get("facts", [])))
-            finding.uncertainties.extend(
-                self._normalize_llm_list(sobj.get("uncertainties"), "planning_uncertainties")
-            )
-            evidence.extend(
-                [
-                    {
-                        "query": query,
-                        "title": r.title,
-                        "url": r.url,
-                        "snippet": r.snippet,
-                        "quality_tier": r.quality_tier,
-                        "quality_score": r.quality_score,
-                    }
-                    for r in selected_results
-                ]
-            )
-            query_steps.append(step_data)
-
         node_suff: Dict[str, Any] = {
             "is_sufficient": False,
             "reasoning": "No node-level sufficiency run.",
             "gaps": [],
         }
-        if question_has_evidence:
-            node_suff = self.llm.json(
-                SYSTEM_SUFFICIENCY_NODE,
-                self._format_node_sufficiency_prompt(
-                    task=root_question,
-                    sub_question=root_question,
-                    success_criteria=[],
-                    finding=finding,
-                    depth=1,
-                    node_context_slice=node_context_slice,
-                ),
-                stage="planning_node_sufficiency",
+        cached = cached_root if isinstance(cached_root, dict) else {}
+        use_cached_root = False
+        if str(action or "").startswith("swap_batch") and cached:
+            cached_node_suff = (
+                cached.get("node_sufficiency", {})
+                if isinstance(cached.get("node_sufficiency", {}), dict)
+                else {}
+            )
+            if "is_sufficient" in cached_node_suff:
+                use_cached_root = True
+                queries = self._dedupe_preserve_order(
+                    self._normalize_llm_list(
+                        cached.get("queries", []), "planning_cached_queries"
+                    )
+                )
+                query_steps = copy.deepcopy(
+                    cached.get("query_steps", [])
+                    if isinstance(cached.get("query_steps", []), list)
+                    else []
+                )
+                evidence = copy.deepcopy(
+                    cached.get("evidence", [])
+                    if isinstance(cached.get("evidence", []), list)
+                    else []
+                )
+                cached_finding = (
+                    cached.get("finding", {})
+                    if isinstance(cached.get("finding", {}), dict)
+                    else {}
+                )
+                finding.summaries = self._normalize_llm_list(
+                    cached_finding.get("summaries", []), "planning_cached_summaries"
+                )
+                finding.facts = self._normalize_synth_facts(
+                    cached_finding.get("facts", [])
+                )
+                finding.uncertainties = self._normalize_llm_list(
+                    cached_finding.get("uncertainties", []),
+                    "planning_cached_uncertainties",
+                )
+                self._emit(
+                    "queries_generated",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "display_title": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                        "queries": queries,
+                    },
+                )
+                node_suff = {
+                    "is_sufficient": bool(cached_node_suff.get("is_sufficient", False)),
+                    "reasoning": str(cached_node_suff.get("reasoning", "")).strip(),
+                    "gaps": self._normalize_llm_list(
+                        cached_node_suff.get("gaps", []), "planning_cached_node_gaps"
+                    ),
+                }
+                self._emit(
+                    "node_sufficiency_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                        "is_sufficient": bool(node_suff.get("is_sufficient", False)),
+                        "reasoning": str(node_suff.get("reasoning", "")).strip(),
+                        "gaps": copy.deepcopy(
+                            node_suff.get("gaps", [])
+                            if isinstance(node_suff.get("gaps", []), list)
+                            else []
+                        ),
+                    },
+                )
+
+        if not use_cached_root:
+            qobj = self.llm.json(
+                SYSTEM_QUERY_GEN,
+                query_prompt,
+                stage="planning_query_gen",
                 metadata={"sub_question": self._trim_text(root_question, 120)},
             )
+            queries = self._dedupe_preserve_order(
+                self._normalize_llm_list(qobj.get("queries"), "planning_queries")
+            )
+            self._emit(
+                "queries_generated",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "display_title": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "queries": queries,
+                },
+            )
+            question_has_evidence = False
+            for query in queries:
+                self._abort_if_requested("planning_query_loop")
+                self._emit(
+                    "query_started",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "query": query,
+                    },
+                )
+                raw_results = self.search.search(query, self.results_per_query)
+                search_error = self.search.last_error
+                selected_results = self._select_high_quality_results(
+                    raw_results, self.results_per_query
+                )
+                primary_count = sum(
+                    1 for r in selected_results if r.quality_tier == "primary_or_official"
+                )
+                step_data: Dict[str, Any] = {
+                    "query": query,
+                    "status": "failed" if search_error and not selected_results else "success",
+                    "search_error": search_error,
+                    "selected_results_count": len(selected_results),
+                    "primary_count": primary_count,
+                    "selected_sources": [
+                        {"title": r.title, "url": r.url} for r in selected_results
+                    ],
+                }
+                self._emit(
+                    "search_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "query": query,
+                        "search_error": search_error,
+                        "raw_results_count": len(raw_results),
+                        "selected_results_count": len(selected_results),
+                        "primary_count": primary_count,
+                        "selected_sources": [
+                            {"title": r.title, "url": r.url} for r in selected_results
+                        ],
+                    },
+                )
+                if not selected_results:
+                    query_steps.append(step_data)
+                    if search_error:
+                        finding.uncertainties.append(
+                            f"Search failed for query '{query}': {search_error}"
+                        )
+                    else:
+                        finding.uncertainties.append(
+                            f"No usable evidence retrieved for query '{query}'."
+                        )
+                    continue
+                question_has_evidence = True
+                sobj = self.llm.json(
+                    SYSTEM_SYNTHESIZE,
+                    self._format_synthesis_prompt(root_question, query, selected_results),
+                    stage="planning_synthesize",
+                    metadata={
+                        "sub_question": self._trim_text(root_question, 120),
+                        "query": self._trim_text(query, 140),
+                    },
+                )
+                summary = str(sobj.get("summary", "")).strip()
+                if summary:
+                    finding.summaries.append(summary)
+                    step_data["synthesis_summary"] = summary
+                self._emit(
+                    "synthesis_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "query": query,
+                        "summary": self._trim_text(summary, 300),
+                    },
+                )
+                finding.facts.extend(self._normalize_synth_facts(sobj.get("facts", [])))
+                finding.uncertainties.extend(
+                    self._normalize_llm_list(
+                        sobj.get("uncertainties"), "planning_uncertainties"
+                    )
+                )
+                evidence.extend(
+                    [
+                        {
+                            "query": query,
+                            "title": r.title,
+                            "url": r.url,
+                            "snippet": r.snippet,
+                            "quality_tier": r.quality_tier,
+                            "quality_score": r.quality_score,
+                        }
+                        for r in selected_results
+                    ]
+                )
+                query_steps.append(step_data)
+
+            if question_has_evidence:
+                self._emit(
+                    "node_sufficiency_started",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                    },
+                )
+                node_suff = self.llm.json(
+                    SYSTEM_SUFFICIENCY_NODE,
+                    self._format_node_sufficiency_prompt(
+                        task=root_question,
+                        sub_question=root_question,
+                        success_criteria=[],
+                        finding=finding,
+                        depth=1,
+                        node_context_slice=node_context_slice,
+                    ),
+                    stage="planning_node_sufficiency",
+                    metadata={"sub_question": self._trim_text(root_question, 120)},
+                )
+                self._emit(
+                    "node_sufficiency_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                        "is_sufficient": bool(node_suff.get("is_sufficient", False)),
+                        "reasoning": str(node_suff.get("reasoning", "")).strip(),
+                        "gaps": self._normalize_llm_list(
+                            node_suff.get("gaps"), "planning_node_gaps"
+                        ),
+                    },
+                )
         node_is_sufficient = bool(node_suff.get("is_sufficient", False))
         node_reasoning = str(node_suff.get("reasoning", "")).strip()
         node_gaps = self._normalize_llm_list(node_suff.get("gaps"), "planning_node_gaps")
@@ -1031,6 +1211,15 @@ Runtime context (authoritative):
         children: List[str] = []
         children_display_titles: Dict[str, str] = {}
         if (not node_is_sufficient) and self.max_depth > 1:
+            self._emit(
+                "node_decomposition_started",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                },
+            )
             children, children_display_titles = self._decompose_sub_question(
                 task=root_question,
                 sub_question=root_question,
@@ -1054,6 +1243,41 @@ Runtime context (authoritative):
             if sq not in children_display_titles:
                 pin_title = str(pinned_map.get(sq, {}).get("display_title", "")).strip()
                 children_display_titles[sq] = pin_title or sq
+        if node_is_sufficient:
+            self._emit(
+                "node_completed",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "derived_from_children": False,
+                },
+            )
+        elif merged_children:
+            self._emit(
+                "node_decomposed",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "children": merged_children,
+                    "children_display_titles": children_display_titles,
+                    "child_node_ids": [f"1.{i}" for i in range(1, len(merged_children) + 1)],
+                },
+            )
+        else:
+            self._emit(
+                "node_unresolved",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "reason": node_reasoning or "No further decomposition candidates available.",
+                },
+            )
         return {
             "root_question": root_question,
             "queries": queries,
@@ -1062,6 +1286,11 @@ Runtime context (authoritative):
             "is_sufficient": node_is_sufficient,
             "node_reasoning": node_reasoning,
             "node_gaps": node_gaps,
+            "finding": {
+                "summaries": copy.deepcopy(finding.summaries),
+                "facts": copy.deepcopy(finding.facts),
+                "uncertainties": copy.deepcopy(finding.uncertainties),
+            },
             "children": merged_children,
             "children_display_titles": children_display_titles,
         }
@@ -1461,6 +1690,11 @@ Runtime context (authoritative):
                 full_context_items = self._context_items_from_digest(
                     full_context_digest if isinstance(full_context_digest, dict) else {}
                 )
+                active_pin_records = (
+                    self.user_context_bundle.get("active_pin_records", [])
+                    if isinstance(self.user_context_bundle, dict)
+                    else []
+                )
                 node_context_slices: Dict[str, Dict[str, Any]] = {}
                 next_unresolved: List[str] = []
                 processed_questions_in_pass: set[str] = set()
@@ -1552,6 +1786,7 @@ Runtime context (authoritative):
                             "selected_items": self._compact_context_items(
                                 full_context_items, max_items=40, char_budget=9000
                             ),
+                            "active_pin_records": active_pin_records if isinstance(active_pin_records, list) else [],
                         }
                     else:
                         preset_slice = node_context_slices.get(sq, {})
@@ -1573,6 +1808,11 @@ Runtime context (authoritative):
                                     max_items=24,
                                     char_budget=7000,
                                 ),
+                                "active_pin_records": (
+                                    preset_slice.get("active_pin_records", active_pin_records)
+                                    if isinstance(preset_slice.get("active_pin_records", active_pin_records), list)
+                                    else (active_pin_records if isinstance(active_pin_records, list) else [])
+                                ),
                             }
                         else:
                             parent_slice = node_context_slices.get(parent, {})
@@ -1588,6 +1828,11 @@ Runtime context (authoritative):
                                     "selected_items": self._compact_context_items(
                                         parent_items, max_items=24, char_budget=7000
                                     ),
+                                    "active_pin_records": (
+                                        parent_slice.get("active_pin_records", active_pin_records)
+                                        if isinstance(parent_slice.get("active_pin_records", active_pin_records), list)
+                                        else (active_pin_records if isinstance(active_pin_records, list) else [])
+                                    ),
                                 }
                             else:
                                 node_context_slice = {
@@ -1598,6 +1843,7 @@ Runtime context (authoritative):
                                     "selected_items": self._compact_context_items(
                                         full_context_items, max_items=24, char_budget=7000
                                     ),
+                                    "active_pin_records": active_pin_records if isinstance(active_pin_records, list) else [],
                                 }
                     node_context_slices[sq] = node_context_slice
                     question_trace["context_slice"] = node_context_slice
