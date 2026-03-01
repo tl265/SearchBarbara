@@ -81,11 +81,22 @@
       <details>
         <summary>Advanced controls</summary>
         <div class="dock-controls advanced-controls-row">
+          <button id="planningActionBtn" type="button">Start Planning</button>
           <button id="pauseBtn" type="button" disabled>Pause</button>
           <button id="resumeBtn" type="button" disabled>Resume</button>
           <button id="abortBtn" type="button" disabled>Abort</button>
           <label class="inline-number-control">Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
         </div>
+        <section id="planningPanel" class="planning-panel hidden">
+          <div class="section-head">
+            <h2>Planning Controls</h2>
+            <span id="planningMeta" class="muted">Planning not started.</span>
+          </div>
+          <div class="dock-controls">
+            <button id="swapBatchBtn" type="button" disabled>Swap Batch</button>
+          </div>
+          <div id="planningChildren" class="context-files-list muted"></div>
+        </section>
         <section class="context context-in-advanced">
           <div class="section-head">
             <h2>Context</h2>

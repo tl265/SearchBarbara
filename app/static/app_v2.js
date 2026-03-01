@@ -3,6 +3,7 @@ const maxDepthEl = document.getElementById("maxDepth");
 const runBtn = document.getElementById("runBtn");
 const reportBtn = document.getElementById("reportBtn");
 const downloadBtn = document.getElementById("downloadBtn");
+const planningActionBtn = document.getElementById("planningActionBtn");
 const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const abortBtn = document.getElementById("abortBtn");
@@ -240,9 +241,13 @@ function resetWorkspaceForNewSession() {
   runStatusEl.textContent = "idle";
   researchStatusEl.textContent = "idle";
   reportStatusEl.textContent = "pending";
-  runBtn.textContent = "Start Planning";
+  runBtn.textContent = "Start Research";
   runBtn.classList.add("primary");
   runBtn.disabled = false;
+  if (planningActionBtn) {
+    planningActionBtn.textContent = "Start Planning";
+    planningActionBtn.disabled = false;
+  }
   reportBtn.disabled = true;
   setReportButtonVisual(false);
   downloadBtn.setAttribute("title", "Download report");
@@ -284,6 +289,37 @@ function planningCandidates(snap) {
   const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
   const rows = Array.isArray(planning.root_children_candidates) ? planning.root_children_candidates : [];
   return rows.filter((r) => r && typeof r === "object");
+}
+
+function derivePlanningUiState(phase, pState, opts = {}) {
+  const inPlanning = phase === "planning";
+  const isReview = inPlanning && pState === "review";
+  const isMutating = !!planningMutationInFlight;
+  const reportBusy = !!opts.reportBusy;
+  const transitionPending = !!opts.transitionPending;
+  const startRunBusy = !!opts.startRunBusy;
+  const canEdit = isReview && !isMutating;
+  const swapBatchText = isMutating ? "Working..." : "Swap Batch";
+  let planningActionText = "Start Planning";
+  let planningActionDisabled = true;
+
+  if (!inPlanning) {
+    planningActionDisabled = true;
+  } else if (isReview) {
+    planningActionText = isMutating ? "Working..." : "Go for a full run";
+    planningActionDisabled = !!(reportBusy || transitionPending || isMutating || startRunBusy);
+  } else if (pState === "running" || pState === "idle") {
+    planningActionText = "Planning...";
+    planningActionDisabled = true;
+  }
+
+  return {
+    inPlanning,
+    canEdit,
+    swapBatchText,
+    planningActionText,
+    planningActionDisabled,
+  };
 }
 
 function isReportGeneratingForRun(runId) {
@@ -623,21 +659,21 @@ function renderPlanningPanel(snap) {
   if (!planningPanelEl || !planningMetaEl || !planningChildrenEl) return;
   const phase = planningPhase(snap);
   const pState = planningState(snap);
+  const planningUi = derivePlanningUiState(phase, pState);
   const rows = planningCandidates(snap);
-  if (phase !== "planning") {
+  if (swapBatchBtn) {
+    swapBatchBtn.disabled = !planningUi.canEdit;
+    swapBatchBtn.textContent = planningUi.swapBatchText;
+  }
+  if (!planningUi.inPlanning) {
     planningPanelEl.classList.add("hidden");
     planningMetaEl.textContent = "Planning not started.";
     planningChildrenEl.innerHTML = "";
-    if (swapBatchBtn) swapBatchBtn.disabled = true;
     return;
   }
   planningPanelEl.classList.remove("hidden");
-  const canEdit = pState === "review" && !planningMutationInFlight;
+  const canEdit = planningUi.canEdit;
   planningMetaEl.textContent = `State: ${shortStatus(`planning_${pState}`)} · Pins are merged with uploaded files for decomposition.`;
-  if (swapBatchBtn) {
-    swapBatchBtn.disabled = !canEdit;
-    swapBatchBtn.textContent = planningMutationInFlight ? "Working..." : "Swap Batch";
-  }
   if (!rows.length) {
     planningChildrenEl.innerHTML = `<div class="muted">No root child candidates yet.</div>`;
     return;
@@ -662,10 +698,15 @@ function renderPlanningPanel(snap) {
   }).join("");
 }
 
+function refreshPlanningUi(snap) {
+  renderPlanningPanel(snap);
+  refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap);
+}
+
 async function planningSwapBatch() {
   if (!currentRunId || planningMutationInFlight) return;
   planningMutationInFlight = true;
-  renderPlanningPanel(currentSnapshot);
+  refreshPlanningUi(currentSnapshot);
   try {
     const ev = currentExpectedVersion();
     const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
@@ -679,14 +720,14 @@ async function planningSwapBatch() {
     await fetchSnapshot(currentRunId);
   } finally {
     planningMutationInFlight = false;
-    renderPlanningPanel(currentSnapshot);
+    refreshPlanningUi(currentSnapshot);
   }
 }
 
 async function planningCommit() {
   if (!currentRunId || planningMutationInFlight) return;
   planningMutationInFlight = true;
-  renderPlanningPanel(currentSnapshot);
+  refreshPlanningUi(currentSnapshot);
   try {
     const ev = currentExpectedVersion();
     const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
@@ -700,7 +741,7 @@ async function planningCommit() {
     await fetchSnapshot(currentRunId);
   } finally {
     planningMutationInFlight = false;
-    renderPlanningPanel(currentSnapshot);
+    refreshPlanningUi(currentSnapshot);
   }
 }
 
@@ -709,7 +750,7 @@ async function planningSetPin(nodeId, pin) {
   const nid = String(nodeId || "").trim();
   if (!nid) return;
   planningMutationInFlight = true;
-  renderPlanningPanel(currentSnapshot);
+  refreshPlanningUi(currentSnapshot);
   try {
     const ev = currentExpectedVersion();
     const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
@@ -724,7 +765,7 @@ async function planningSetPin(nodeId, pin) {
     await fetchSnapshot(currentRunId);
   } finally {
     planningMutationInFlight = false;
-    renderPlanningPanel(currentSnapshot);
+    refreshPlanningUi(currentSnapshot);
   }
 }
 
@@ -733,7 +774,7 @@ async function planningDepthPlus(nodeId) {
   const nid = String(nodeId || "").trim();
   if (!nid) return;
   planningMutationInFlight = true;
-  renderPlanningPanel(currentSnapshot);
+  refreshPlanningUi(currentSnapshot);
   try {
     const ev = currentExpectedVersion();
     const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
@@ -751,7 +792,7 @@ async function planningDepthPlus(nodeId) {
     await fetchSnapshot(currentRunId);
   } finally {
     planningMutationInFlight = false;
-    renderPlanningPanel(currentSnapshot);
+    refreshPlanningUi(currentSnapshot);
   }
 }
 
@@ -2211,6 +2252,67 @@ function isAbortPendingSnapshot(snap) {
   return !!tree.abort_pending;
 }
 
+function setPrimaryAndPlanningActionButtons({
+  isNewSessionWorkspace,
+  reportBusy,
+  transitionPending,
+  phase,
+  pState,
+}) {
+  runBtn.textContent = "Start Research";
+  runBtn.classList.add("primary");
+  runBtn.disabled = !!(!isNewSessionWorkspace || reportBusy || startRunInFlight);
+  if (!planningActionBtn) return;
+  if (!currentRunId) {
+    planningActionBtn.textContent = "Start Planning";
+    planningActionBtn.disabled = !!(reportBusy || startRunInFlight);
+    return;
+  }
+  const planningUi = derivePlanningUiState(phase, pState, {
+    reportBusy,
+    transitionPending,
+    startRunBusy: startRunInFlight,
+  });
+  if (planningUi.inPlanning) {
+    planningActionBtn.textContent = planningUi.planningActionText;
+    planningActionBtn.disabled = planningUi.planningActionDisabled;
+    return;
+  }
+  planningActionBtn.textContent = "Start Planning";
+  planningActionBtn.disabled = true;
+}
+
+function refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap) {
+  if (!snap || typeof snap !== "object") return;
+  const sid = String(snap.session_id || snap.run_id || "").trim();
+  const isDraft = isDraftSnapshot(snap);
+  const executionState = String(snap.execution_state || "").toLowerCase();
+  const researchState = String(snap.research_state || "").toLowerCase();
+  const paused = researchState ? researchState === "paused" : executionState === "paused";
+  const terminal = researchState
+    ? researchState === "terminal"
+    : ["completed", "aborted", "failed"].includes(executionState);
+  const pausePending = pauseRequested && !paused && !terminal;
+  const abortPending = abortRequested || isAbortPendingSnapshot(snap);
+  const transitionPending = pausePending || abortPending;
+  const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+  const reportState = String(snap.report_state || "").toLowerCase();
+  const reportPhase = String(
+    snap.report_status || (snap.tree && snap.tree.report_status) || "pending"
+  ).toLowerCase();
+  const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
+  const isNewSessionWorkspace = !currentRunId || isDraft;
+  const phase = planningPhase(snap);
+  const pState = planningState(snap);
+  setPrimaryAndPlanningActionButtons({
+    isNewSessionWorkspace,
+    reportBusy,
+    transitionPending,
+    phase,
+    pState,
+  });
+}
+
 function applySnapshot(snap) {
   currentSnapshot = snap;
   const sid = String(snap.session_id || snap.run_id || "").trim();
@@ -2314,25 +2416,13 @@ function applySnapshot(snap) {
   const isNewSessionWorkspace = !currentRunId || isDraft;
   const phase = planningPhase(snap);
   const pState = planningState(snap);
-  if (phase === "planning") {
-    if (pState === "review") {
-      runBtn.textContent = "Start Research";
-    } else if (pState === "running" || pState === "idle") {
-      runBtn.textContent = "Planning...";
-    } else {
-      runBtn.textContent = "Start Planning";
-    }
-  } else {
-    runBtn.textContent = "Start Planning";
-  }
-  runBtn.classList.add("primary");
-  if (phase === "planning") {
-    runBtn.disabled = !(
-      pState === "review" && !reportBusy && !transitionPending && !planningMutationInFlight
-    );
-  } else {
-    runBtn.disabled = !isNewSessionWorkspace || reportBusy;
-  }
+  setPrimaryAndPlanningActionButtons({
+    isNewSessionWorkspace,
+    reportBusy,
+    transitionPending,
+    phase,
+    pState,
+  });
   if (transitionPending) {
     pauseBtn.disabled = true;
     resumeBtn.disabled = true;
@@ -2531,7 +2621,7 @@ function connectEvents(runId) {
   }
 }
 
-async function startRun(idempotencyKey) {
+async function startRun(idempotencyKey, startMode = "research") {
   const task = taskEl.value.trim();
   if (!task) {
     showError("Task is required.");
@@ -2559,7 +2649,7 @@ async function startRun(idempotencyKey) {
         task,
         max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
         results_per_query: DEFAULT_RESULTS_PER_QUERY,
-        start_mode: "planning",
+        start_mode: String(startMode || "research"),
       }),
     });
     if (!rsp.ok) {
@@ -2826,38 +2916,69 @@ async function deleteContextFile(fileId) {
 }
 
 runBtn.addEventListener("click", async () => {
-  const phase = planningPhase(currentSnapshot);
-  const pState = planningState(currentSnapshot);
-  if (currentRunId && phase === "planning" && pState === "review") {
-    try {
-      await planningCommit();
-    } catch (err) {
-      showError(err.message || String(err));
-    }
-    return;
-  }
   if (currentRunId || startRunInFlight) {
     return;
   }
   startRunInFlight = true;
   runBtn.disabled = true;
+  if (planningActionBtn) {
+    planningActionBtn.disabled = true;
+  }
   try {
-    await startRun(newIdempotencyKey("start_planning"));
+    await startRun(newIdempotencyKey("start_research"), "research");
   } catch (err) {
     showError(err.message || String(err));
   } finally {
     startRunInFlight = false;
     if (!currentRunId) {
       runBtn.disabled = false;
+      if (planningActionBtn) {
+        planningActionBtn.disabled = false;
+      }
     }
   }
 });
+
+if (planningActionBtn) {
+  planningActionBtn.addEventListener("click", async () => {
+    const phase = planningPhase(currentSnapshot);
+    const pState = planningState(currentSnapshot);
+    if (currentRunId && phase === "planning" && pState === "review") {
+      try {
+        await planningCommit();
+      } catch (err) {
+        showError(err.message || String(err));
+      }
+      return;
+    }
+    if (currentRunId || startRunInFlight) {
+      return;
+    }
+    startRunInFlight = true;
+    runBtn.disabled = true;
+    planningActionBtn.disabled = true;
+    try {
+      await startRun(newIdempotencyKey("start_planning"), "planning");
+    } catch (err) {
+      showError(err.message || String(err));
+    } finally {
+      startRunInFlight = false;
+      if (!currentRunId) {
+        runBtn.disabled = false;
+        planningActionBtn.disabled = false;
+      }
+    }
+  });
+}
 
 reportBtn.addEventListener("click", async () => {
   const reportRunId = String(currentRunId || "").trim();
   if (!reportRunId || isReportGeneratingForRun(reportRunId)) return;
   reportGeneratingRunIds.add(reportRunId);
   runBtn.disabled = true;
+  if (planningActionBtn) {
+    planningActionBtn.disabled = true;
+  }
   reportBtn.disabled = true;
   setReportButtonVisual(true);
   showError("");
