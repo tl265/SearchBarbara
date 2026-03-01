@@ -52,6 +52,7 @@ class RunManager:
     ) -> None:
         self._runs: Dict[str, RunState] = {}
         self._sessions: Dict[str, Dict[str, Any]] = {}
+        self._sessions_by_owner: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._subscribers: Dict[str, List[Queue]] = {}
         self._context_subscribers: Dict[str, List[Queue]] = {}
         self._session_locks: Dict[str, threading.RLock] = {}
@@ -64,10 +65,14 @@ class RunManager:
         self._idempotency_lock = threading.Lock()
         self._idempotency_records: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
-        self._index_write_lock = threading.Lock()
         self._index_flush_event = threading.Event()
-        self._index_flush_seq = 0
-        self._index_flush_pending: Optional[tuple[int, Dict[str, Any]]] = None
+        self._index_flush_pending_by_owner: Dict[str, bool] = {}
+        self._index_flush_pending_lock = threading.Lock()
+        self._index_flush_inflight_owners: set[str] = set()
+        self._index_owner_locks: Dict[str, threading.Lock] = {}
+        self._index_owner_locks_guard = threading.Lock()
+        self._manifest_write_lock = threading.Lock()
+        self._dirty_owner_keys: set[str] = set()
         self._index_writer_thread = threading.Thread(
             target=self._sessions_index_writer_loop,
             daemon=True,
@@ -101,7 +106,7 @@ class RunManager:
         self._context_chunking_version = str(context_chunking_version or "context_chunk.v1")
         self._context_prompt_cache: Dict[str, str] = {}
         self._index_flush_min_interval_sec = 2.0
-        self._last_index_flush_ts = 0.0
+        self._last_index_flush_ts_by_owner: Dict[str, float] = {}
         self._runs_dir = Path("runs")
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._contexts_dir = self._runs_dir / "contexts"
@@ -111,13 +116,20 @@ class RunManager:
         self._context_digests_dir = self._contexts_dir / "digests"
         (self._context_digests_dir / "per_file").mkdir(parents=True, exist_ok=True)
         (self._context_digests_dir / "aggregate").mkdir(parents=True, exist_ok=True)
+        self._sessions_index_dir = self._runs_dir / "index"
+        self._sessions_index_users_dir = self._sessions_index_dir / "users"
+        self._sessions_index_users_dir.mkdir(parents=True, exist_ok=True)
+        self._sessions_index_legacy_path = self._sessions_index_dir / "legacy.json"
+        self._sessions_index_manifest_path = self._sessions_index_dir / "manifest.json"
         self._sessions_index_path = self._runs_dir / "sessions_index.json"
         self._sessions_index_meta: Dict[str, Any] = {
             "schema_version": self._SESSIONS_INDEX_SCHEMA_VERSION,
             "title_migration_v1_done": False,
             "execution_state_migration_v1_done": False,
             "execution_state_backfill_v2_done": False,
+            "sharding_migration_done": False,
         }
+        self._maybe_migrate_legacy_sessions_index_to_shards()
         self._bootstrap_sessions_from_disk()
 
     def create_run(
@@ -216,6 +228,7 @@ class RunManager:
             state_file_path=str(state_path),
             tree=tree,
         )
+        state_to_persist: Optional[RunState] = None
         with self._lock:
             self._refresh_lifecycle_fields_locked(state)
             self._runs[run_id] = state
@@ -225,8 +238,10 @@ class RunManager:
             self._cancel_flags[run_id] = False
             self._pause_flags[run_id] = False
             self._sync_session_from_state_locked(state)
-            self._persist_run_state_locked(state)
             self._save_sessions_index_locked(force=True)
+            state_to_persist = state
+        if state_to_persist:
+            self._persist_run_state_locked(state_to_persist)
         if start_worker:
             self._start_run_worker(run_id)
         return run_id
@@ -257,10 +272,11 @@ class RunManager:
         )
         wid = str(workspace_id or "").strip()
         session_lock = self._session_lock_for(run_id)
+        state_to_persist: Optional[RunState] = None
         with session_lock:
-            with self._lock:
-                state = self._ensure_run_loaded_locked(run_id)
-                if state and isinstance(state.tree, dict):
+            state = self._ensure_run_loaded_session_locked(run_id)
+            if state and isinstance(state.tree, dict):
+                with self._lock:
                     state.tree["pending_workspace_id"] = wid
                     state.tree["pending_workspace_owner_id"] = str(owner_id or "").strip()
                     state.tree["startup_phase"] = "queued_for_binding"
@@ -268,8 +284,10 @@ class RunManager:
                     self._refresh_lifecycle_fields_locked(state)
                     self._next_state_version_locked(state)
                     self._sync_session_from_state_locked(state)
-                    self._persist_run_state_locked(state)
                     self._save_sessions_index_locked(force=True)
+                    state_to_persist = state
+            if state_to_persist:
+                self._persist_run_state_locked(state_to_persist)
         self._start_run_worker(run_id)
         return run_id
 
@@ -298,11 +316,12 @@ class RunManager:
         if not rid:
             return None
         session_lock = self._session_lock_for(rid)
+        state_to_persist: Optional[RunState] = None
         with session_lock:
+            state = self._ensure_run_loaded_session_locked(rid)
+            if not state:
+                return None
             with self._lock:
-                state = self._ensure_run_loaded_locked(rid)
-                if not state:
-                    return None
                 if not self._owner_matches(state.owner_id, owner_id):
                     return None
                 if state.execution_state in {"running", "paused"} or state.status == "running":
@@ -343,8 +362,10 @@ class RunManager:
                 self._refresh_lifecycle_fields_locked(state)
                 self._next_state_version_locked(state)
                 self._sync_session_from_state_locked(state)
-                self._persist_run_state_locked(state)
                 self._save_sessions_index_locked(force=True)
+                state_to_persist = state
+            if state_to_persist:
+                self._persist_run_state_locked(state_to_persist)
             self._start_run_worker(rid)
             return {"run_id": rid, "status": "queued"}
 
@@ -464,6 +485,132 @@ class RunManager:
             return bool(self._auth_allow_legacy)
         return owner == req
 
+    def _owner_index_key(self, owner_id: Optional[str]) -> str:
+        oid = str(owner_id or "").strip()
+        return oid if oid else "__legacy__"
+
+    def _owner_key_to_owner_id(self, owner_key: str) -> Optional[str]:
+        k = str(owner_key or "").strip()
+        if not k or k == "__legacy__":
+            return None
+        return k
+
+    def _owner_index_path(self, owner_key: str) -> Path:
+        key = str(owner_key or "").strip()
+        if not key or key == "__legacy__":
+            return self._sessions_index_legacy_path
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        return self._sessions_index_users_dir / f"{digest}.json"
+
+    def _owner_index_lock(self, owner_key: str) -> threading.Lock:
+        key = str(owner_key or "__legacy__").strip() or "__legacy__"
+        with self._index_owner_locks_guard:
+            return self._index_owner_locks.setdefault(key, threading.Lock())
+
+    def _mark_owner_dirty_locked(self, owner_id: Optional[str]) -> None:
+        self._dirty_owner_keys.add(self._owner_index_key(owner_id))
+
+    def _set_session_item_locked(self, session_id: str, item: Dict[str, Any]) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        prev = self._sessions.get(sid)
+        new_owner_key = self._owner_index_key(item.get("owner_id"))
+        if isinstance(prev, dict):
+            prev_owner_key = self._owner_index_key(prev.get("owner_id"))
+            owner_bucket_prev = self._sessions_by_owner.get(prev_owner_key)
+            if isinstance(owner_bucket_prev, dict):
+                owner_bucket_prev.pop(sid, None)
+                if not owner_bucket_prev:
+                    self._sessions_by_owner.pop(prev_owner_key, None)
+            if prev_owner_key != new_owner_key:
+                self._dirty_owner_keys.add(prev_owner_key)
+        self._sessions[sid] = item
+        bucket = self._sessions_by_owner.setdefault(new_owner_key, {})
+        bucket[sid] = item
+
+    def _delete_session_item_locked(self, session_id: str) -> None:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return
+        prev = self._sessions.pop(sid, None)
+        if isinstance(prev, dict):
+            owner_key = self._owner_index_key(prev.get("owner_id"))
+            bucket = self._sessions_by_owner.get(owner_key)
+            if isinstance(bucket, dict):
+                bucket.pop(sid, None)
+                if not bucket:
+                    self._sessions_by_owner.pop(owner_key, None)
+
+    def _parse_sessions_index_payload(self, parsed: Any) -> Dict[str, Any]:
+        if not isinstance(parsed, dict):
+            return {"sessions": []}
+        try:
+            schema_version = int(
+                parsed.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+            )
+        except (TypeError, ValueError):
+            schema_version = self._SESSIONS_INDEX_SCHEMA_VERSION
+        raw_sessions = parsed.get("sessions", [])
+        if not isinstance(raw_sessions, list):
+            raw_sessions = []
+        out: List[Dict[str, Any]] = []
+        for item in raw_sessions:
+            if isinstance(item, dict):
+                out.append(item)
+        return {
+            "schema_version": schema_version,
+            "title_migration_v1_done": bool(parsed.get("title_migration_v1_done", False)),
+            "execution_state_migration_v1_done": bool(
+                parsed.get("execution_state_migration_v1_done", False)
+            ),
+            "execution_state_backfill_v2_done": bool(
+                parsed.get("execution_state_backfill_v2_done", False)
+            ),
+            "sharding_migration_done": bool(parsed.get("sharding_migration_done", False)),
+            "sessions": out,
+        }
+
+    def _load_sessions_index_manifest(self) -> Dict[str, Any]:
+        if not self._sessions_index_manifest_path.exists():
+            return {}
+        try:
+            parsed = json.loads(
+                self._sessions_index_manifest_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+
+    def _save_sessions_index_manifest(self) -> None:
+        payload = {
+            "schema_version": int(
+                self._sessions_index_meta.get(
+                    "schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION
+                )
+            ),
+            "title_migration_v1_done": bool(
+                self._sessions_index_meta.get("title_migration_v1_done", False)
+            ),
+            "execution_state_migration_v1_done": bool(
+                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
+            ),
+            "execution_state_backfill_v2_done": bool(
+                self._sessions_index_meta.get(
+                    "execution_state_backfill_v2_done", False
+                )
+            ),
+            "sharding_migration_done": bool(
+                self._sessions_index_meta.get("sharding_migration_done", False)
+            ),
+            "updated_at": _now().isoformat(),
+        }
+        tmp_path = self._sessions_index_manifest_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(self._sessions_index_manifest_path)
+
     def _filter_owned_items(
         self, items: List[Dict[str, Any]], owner_id: Optional[str]
     ) -> List[Dict[str, Any]]:
@@ -543,56 +690,9 @@ class RunManager:
         }
 
     def _ensure_run_loaded_locked(self, run_id: str) -> Optional[RunState]:
-        state = self._runs.get(run_id)
-        if state:
-            return state
-        session_item = self._sessions.get(run_id)
-        if not session_item:
-            loaded = self._load_sessions_index()
-            for item in loaded.get("sessions", []):
-                if isinstance(item, dict) and str(item.get("session_id", "")).strip() == run_id:
-                    session_item = item
-                    self._sessions[run_id] = item
-                    break
-        if not session_item:
-            # Treat authoritative state checkpoint as source of truth even when
-            # sessions_index is missing/stale.
-            fallback_path = str(self._runs_dir / f"state_web_{run_id}.json")
-            if Path(fallback_path).exists():
-                session_item = {
-                    "session_id": run_id,
-                    "state_file_path": fallback_path,
-                    "title": "Recovered session",
-                    "owner_id": None,
-                }
-                self._sessions[run_id] = session_item
-            else:
-                return None
-        state_path = str(session_item.get("state_file_path", "")).strip()
-        state = self._load_run_state_from_files(
-            run_id,
-            state_path,
-            session_item,
-            normalize_interrupted_non_terminal=False,
-        )
-        if not state:
-            return None
-        recovered = self._recover_stale_report_generation_on_load_locked(state, run_id=run_id)
-        self._runs[run_id] = state
-        self._session_locks.setdefault(run_id, threading.RLock())
-        self._subscribers.setdefault(run_id, [])
-        self._context_subscribers.setdefault(run_id, [])
-        self._cancel_flags.setdefault(run_id, False)
-        self._pause_flags.setdefault(run_id, False)
-        self._refresh_lifecycle_fields_locked(state)
-        self._sync_session_from_state_locked(state)
-        if recovered:
-            try:
-                self._persist_run_state_locked(state)
-            except Exception:
-                pass
-            self._save_sessions_index_locked(force=True)
-        return state
+        # Legacy entrypoint kept for compatibility. The implementation is
+        # delegated to the session-lock path so global lock scope stays narrow.
+        return self._ensure_run_loaded_session_locked(run_id)
 
     def _ensure_run_loaded_session_locked(self, run_id: str) -> Optional[RunState]:
         state = self._runs.get(run_id)
@@ -645,7 +745,7 @@ class RunManager:
             self._cancel_flags.setdefault(run_id, False)
             self._pause_flags.setdefault(run_id, False)
             if run_id not in self._sessions:
-                self._sessions[run_id] = dict(session_item)
+                self._set_session_item_locked(run_id, dict(session_item))
             self._refresh_lifecycle_fields_locked(loaded_state)
             self._sync_session_from_state_locked(loaded_state)
             if recovered:
@@ -722,9 +822,7 @@ class RunManager:
                 if session_lock is None
                 else ("locked" if self._is_lock_locked(session_lock) else "free")
             ),
-            "index_write_lock": "locked"
-            if self._is_lock_locked(self._index_write_lock)
-            else "free",
+            "index_flush_inflight": len(self._index_flush_inflight_owners),
         }
 
     def list_sessions(
@@ -735,12 +833,23 @@ class RunManager:
         acquired, acquired_at = self._lock_acquire("list_sessions", timeout=0.5)
         if acquired:
             try:
-                items = list(self._sessions.values())
+                req = str(owner_id or "").strip()
+                if req:
+                    items = list(self._sessions_by_owner.get(req, {}).values())
+                    if self._auth_allow_legacy:
+                        items.extend(
+                            list(self._sessions_by_owner.get("__legacy__", {}).values())
+                        )
+                else:
+                    items = list(self._sessions.values())
             finally:
                 self._lock_release("list_sessions", acquired_at)
         else:
             # Fallback path: avoid hanging API calls when lock is contended.
-            loaded = self._load_sessions_index()
+            include_legacy = bool(self._auth_allow_legacy and str(owner_id or "").strip())
+            loaded = self._load_sessions_index_for_owner(
+                owner_id=owner_id, include_legacy=include_legacy
+            )
             raw_items = loaded.get("sessions", [])
             items = [it for it in raw_items if isinstance(it, dict)]
             from_disk_fallback = True
@@ -783,12 +892,15 @@ class RunManager:
             item = self._sessions.get(session_id)
             if not item:
                 return None
+            owner_id = item.get("owner_id")
             item["title"] = clean
             item["updated_at"] = _now().isoformat()
             state = self._runs.get(session_id)
             if state:
                 state.title = clean
                 state.updated_at = _now()
+                owner_id = state.owner_id
+            self._mark_owner_dirty_locked(owner_id)
             self._save_sessions_index_locked(force=True)
             try:
                 return SessionSummary.model_validate(item)
@@ -817,14 +929,16 @@ class RunManager:
             sess = self._sessions.get(session_id)
             if not sess:
                 return None
+            owner_id = sess.get("owner_id")
             state_file_path = str(sess.get("state_file_path", "")).strip()
-            self._sessions.pop(session_id, None)
+            self._delete_session_item_locked(session_id)
             self._runs.pop(session_id, None)
             self._session_locks.pop(session_id, None)
             self._subscribers.pop(session_id, None)
             self._context_subscribers.pop(session_id, None)
             self._cancel_flags.pop(session_id, None)
             self._pause_flags.pop(session_id, None)
+            self._mark_owner_dirty_locked(owner_id)
             self._save_sessions_index_locked(force=True)
         if state_file_path:
             try:
@@ -2071,8 +2185,8 @@ class RunManager:
         runs_dir.mkdir(parents=True, exist_ok=True)
         state_path = runs_dir / f"state_web_{run_id}.json"
         with session_lock:
+            state_for_path = self._ensure_run_loaded_session_locked(run_id)
             with self._lock:
-                state_for_path = self._ensure_run_loaded_locked(run_id)
                 if state_for_path:
                     state_for_path.state_file_path = str(state_path)
                     state_for_path.updated_at = _now()
@@ -2241,9 +2355,10 @@ class RunManager:
                 "run_aborted" if error_text == "Run aborted by user" else "run_failed"
             )
             emit_terminal_event = False
+            state_to_persist: Optional[RunState] = None
             with session_lock:
+                state = self._ensure_run_loaded_session_locked(run_id)
                 with self._lock:
-                    state = self._ensure_run_loaded_locked(run_id)
                     if not state:
                         return
                     state.status = "failed"
@@ -2263,12 +2378,9 @@ class RunManager:
                     )
                     self._next_state_version_locked(state)
                     self._sync_session_from_state_locked(state)
-                    try:
-                        self._persist_run_state_locked(state)
-                    except Exception:
-                        pass
                     self._save_sessions_index_locked(force=True)
                     self._run_workers.pop(run_id, None)
+                    state_to_persist = state
                     last_event_type = (
                         state.events[-1].get("event_type", "") if state.events else ""
                     )
@@ -2277,6 +2389,11 @@ class RunManager:
                         "run_failed",
                         "run_aborted",
                     }
+                if state_to_persist is not None:
+                    try:
+                        self._persist_run_state_locked(state_to_persist)
+                    except Exception:
+                        pass
             if emit_terminal_event:
                 self._publish_event(
                     run_id,
@@ -2291,8 +2408,8 @@ class RunManager:
         pending_workspace_id = ""
         pending_workspace_owner_id = ""
         with session_lock:
+            state_for_binding = self._ensure_run_loaded_session_locked(run_id)
             with self._lock:
-                state_for_binding = self._ensure_run_loaded_locked(run_id)
                 if state_for_binding and isinstance(state_for_binding.tree, dict):
                     pending_workspace_id = str(
                         state_for_binding.tree.get("pending_workspace_id", "") or ""
@@ -2419,8 +2536,8 @@ class RunManager:
             report = agent.run(task)
             report_path.write_text(report, encoding="utf-8")
             with session_lock:
+                state = self._ensure_run_loaded_session_locked(run_id)
                 with self._lock:
-                    state = self._ensure_run_loaded_locked(run_id)
                     if not state:
                         return
                     state.token_usage = agent.usage_tracker.to_dict()
@@ -2708,7 +2825,7 @@ class RunManager:
             latest = report_versions[-1]
             if isinstance(latest, dict):
                 latest_report_at = str(latest.get("created_at", "") or "") or None
-        self._sessions[sid] = {
+        self._set_session_item_locked(sid, {
             "session_id": sid,
             "owner_id": state.owner_id,
             "title": state.title,
@@ -2726,57 +2843,118 @@ class RunManager:
             "latest_report_at": latest_report_at,
             "current_report_version_index": state.current_report_version_index,
             "has_manual_edits": bool(state.has_manual_edits),
-        }
+        })
+        self._mark_owner_dirty_locked(state.owner_id)
 
     def _save_sessions_index_locked(self, force: bool = False) -> None:
-        now_ts = time.time()
-        if not force and (now_ts - self._last_index_flush_ts) < self._index_flush_min_interval_sec:
-            return
         self._sessions_index_meta["schema_version"] = self._SESSIONS_INDEX_SCHEMA_VERSION
-        payload = {
-            "schema_version": int(self._sessions_index_meta.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)),
-            "title_migration_v1_done": bool(self._sessions_index_meta.get("title_migration_v1_done", False)),
-            "execution_state_migration_v1_done": bool(
-                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
-            ),
-            "execution_state_backfill_v2_done": bool(
-                self._sessions_index_meta.get("execution_state_backfill_v2_done", False)
-            ),
-            "updated_at": _now().isoformat(),
-            "sessions": list(self._sessions.values()),
-        }
-        self._last_index_flush_ts = now_ts
-
-        # Queue latest payload for the single writer thread; this preserves write ordering
-        # while keeping filesystem I/O out of hot lock paths.
-        self._index_flush_seq += 1
-        self._index_flush_pending = (self._index_flush_seq, payload)
-        self._index_flush_event.set()
+        owner_keys = set(self._dirty_owner_keys)
+        if not owner_keys:
+            owner_keys = set(self._sessions_by_owner.keys())
+        now_ts = time.time()
+        queued_owner_keys: set[str] = set()
+        for owner_key in owner_keys:
+            last_ts = float(self._last_index_flush_ts_by_owner.get(owner_key, 0.0))
+            if not force and (now_ts - last_ts) < self._index_flush_min_interval_sec:
+                continue
+            self._last_index_flush_ts_by_owner[owner_key] = now_ts
+            queued_owner_keys.add(owner_key)
+        self._dirty_owner_keys.difference_update(queued_owner_keys)
+        if queued_owner_keys:
+            with self._index_flush_pending_lock:
+                for owner_key in queued_owner_keys:
+                    self._index_flush_pending_by_owner[owner_key] = True
+            self._index_flush_event.set()
 
     def _sessions_index_writer_loop(self) -> None:
         while True:
             self._index_flush_event.wait()
-            pending = self._index_flush_pending
-            if not pending:
-                self._index_flush_event.clear()
+            with self._index_flush_pending_lock:
+                launch: List[str] = []
+                for owner_key, pending in list(self._index_flush_pending_by_owner.items()):
+                    if not pending:
+                        continue
+                    if owner_key in self._index_flush_inflight_owners:
+                        continue
+                    self._index_flush_inflight_owners.add(owner_key)
+                    launch.append(owner_key)
+                if not launch:
+                    self._index_flush_event.clear()
+            if not launch:
                 continue
-            seq, payload = pending
-            with self._index_write_lock:
+            for owner_key in launch:
+                threading.Thread(
+                    target=self._flush_owner_index_loop,
+                    args=(owner_key,),
+                    daemon=True,
+                ).start()
+
+    def _build_owner_index_payload(self, owner_key: str) -> Dict[str, Any]:
+        with self._lock:
+            session_row_refs = [
+                it
+                for it in self._sessions_by_owner.get(owner_key, {}).values()
+                if isinstance(it, dict)
+            ]
+            schema_version = int(
+                self._sessions_index_meta.get(
+                    "schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION
+                )
+            )
+            title_migration_v1_done = bool(
+                self._sessions_index_meta.get("title_migration_v1_done", False)
+            )
+            execution_state_migration_v1_done = bool(
+                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
+            )
+            execution_state_backfill_v2_done = bool(
+                self._sessions_index_meta.get("execution_state_backfill_v2_done", False)
+            )
+            sharding_migration_done = bool(
+                self._sessions_index_meta.get("sharding_migration_done", False)
+            )
+        session_rows = [dict(it) for it in session_row_refs]
+        return {
+            "schema_version": schema_version,
+            "title_migration_v1_done": title_migration_v1_done,
+            "execution_state_migration_v1_done": execution_state_migration_v1_done,
+            "execution_state_backfill_v2_done": execution_state_backfill_v2_done,
+            "sharding_migration_done": sharding_migration_done,
+            "updated_at": _now().isoformat(),
+            "owner_id": self._owner_key_to_owner_id(owner_key),
+            "sessions": session_rows,
+        }
+
+    def _flush_owner_index_loop(self, owner_key: str) -> None:
+        while True:
+            with self._index_flush_pending_lock:
+                pending = bool(self._index_flush_pending_by_owner.get(owner_key, False))
+                if not pending:
+                    self._index_flush_inflight_owners.discard(owner_key)
+                    self._index_flush_pending_by_owner.pop(owner_key, None)
+                    if any(bool(v) for v in self._index_flush_pending_by_owner.values()):
+                        self._index_flush_event.set()
+                    elif not self._index_flush_inflight_owners:
+                        self._index_flush_event.clear()
+                    return
+                self._index_flush_pending_by_owner[owner_key] = False
+            payload = self._build_owner_index_payload(owner_key)
+            owner_lock = self._owner_index_lock(owner_key)
+            with owner_lock:
                 try:
-                    tmp_path = self._sessions_index_path.with_suffix(".json.tmp")
+                    path = self._owner_index_path(owner_key)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path = path.with_suffix(".json.tmp")
                     tmp_path.write_text(
                         json.dumps(payload, ensure_ascii=False, indent=2),
                         encoding="utf-8",
                     )
-                    tmp_path.replace(self._sessions_index_path)
+                    tmp_path.replace(path)
+                    with self._manifest_write_lock:
+                        self._save_sessions_index_manifest()
                 except Exception as exc:
                     # Keep session/runs in memory even if persistence is temporarily unavailable.
-                    print(f"[sessions] index flush failed: {exc}")
-            # If no newer payload arrived while writing, clear pending + sleep gate.
-            latest = self._index_flush_pending
-            if latest and latest[0] == seq:
-                self._index_flush_pending = None
-                self._index_flush_event.clear()
+                    print(f"[sessions] index flush failed owner={owner_key}: {exc}")
 
     def _should_flush_sessions_index(self, event_type: str) -> bool:
         if event_type in {
@@ -2805,39 +2983,190 @@ class RunManager:
             return True
         return False
 
-    def _load_sessions_index(self) -> Dict[str, Any]:
-        if not self._sessions_index_path.exists():
+    def _load_sessions_index_file(self, path: Path) -> Dict[str, Any]:
+        if not path.exists():
             return {"sessions": []}
         try:
-            parsed = json.loads(self._sessions_index_path.read_text(encoding="utf-8"))
+            parsed = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {"sessions": []}
-        if not isinstance(parsed, dict):
-            return {"sessions": []}
-        try:
-            schema_version = int(
-                parsed.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+        return self._parse_sessions_index_payload(parsed)
+
+    def _load_sessions_index_for_owner(
+        self, owner_id: Optional[str], include_legacy: bool = False
+    ) -> Dict[str, Any]:
+        if not str(owner_id or "").strip():
+            return self._load_sessions_index()
+        merged: Dict[str, Dict[str, Any]] = {}
+        owner_keys = [self._owner_index_key(owner_id)]
+        if include_legacy and owner_keys[0] != "__legacy__":
+            owner_keys.append("__legacy__")
+        for owner_key in owner_keys:
+            path = self._owner_index_path(owner_key)
+            loaded = self._load_sessions_index_file(path)
+            for item in loaded.get("sessions", []):
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("session_id", "")).strip()
+                if not sid:
+                    continue
+                merged[sid] = item
+        # When sharding migration is incomplete/disabled, merge from legacy global index
+        # as fallback so lock-contention list calls don't lose visibility.
+        if (
+            not bool(self._sessions_index_meta.get("sharding_migration_done", False))
+            and self._sessions_index_path.exists()
+        ):
+            fallback = self._load_sessions_index_file(self._sessions_index_path)
+            req = str(owner_id or "").strip()
+            for item in fallback.get("sessions", []):
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("session_id", "")).strip()
+                if not sid:
+                    continue
+                own = str(item.get("owner_id", "") or "").strip()
+                if own == req or (include_legacy and not own):
+                    merged.setdefault(sid, item)
+        return {"sessions": list(merged.values())}
+
+    def _load_sessions_index(self) -> Dict[str, Any]:
+        manifest = self._load_sessions_index_manifest()
+        if manifest:
+            try:
+                self._sessions_index_meta["schema_version"] = int(
+                    manifest.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+                )
+            except (TypeError, ValueError):
+                self._sessions_index_meta["schema_version"] = self._SESSIONS_INDEX_SCHEMA_VERSION
+            self._sessions_index_meta["title_migration_v1_done"] = bool(
+                manifest.get("title_migration_v1_done", False)
             )
-        except (TypeError, ValueError):
-            schema_version = self._SESSIONS_INDEX_SCHEMA_VERSION
-        self._sessions_index_meta["schema_version"] = schema_version
+            self._sessions_index_meta["execution_state_migration_v1_done"] = bool(
+                manifest.get("execution_state_migration_v1_done", False)
+            )
+            self._sessions_index_meta["execution_state_backfill_v2_done"] = bool(
+                manifest.get("execution_state_backfill_v2_done", False)
+            )
+            self._sessions_index_meta["sharding_migration_done"] = bool(
+                manifest.get("sharding_migration_done", False)
+            )
+        merged: Dict[str, Dict[str, Any]] = {}
+        # Legacy/ownerless shard.
+        legacy = self._load_sessions_index_file(self._sessions_index_legacy_path)
+        for item in legacy.get("sessions", []):
+            sid = str(item.get("session_id", "")).strip()
+            if sid:
+                merged[sid] = item
+        # User shards.
+        for p in self._sessions_index_users_dir.glob("*.json"):
+            loaded = self._load_sessions_index_file(p)
+            for item in loaded.get("sessions", []):
+                sid = str(item.get("session_id", "")).strip()
+                if sid:
+                    merged[sid] = item
+        # Backward-compat fallback for unmigrated or partially-migrated deployments.
+        if (
+            not bool(self._sessions_index_meta.get("sharding_migration_done", False))
+            and self._sessions_index_path.exists()
+        ):
+            fallback = self._load_sessions_index_file(self._sessions_index_path)
+            for item in fallback.get("sessions", []):
+                sid = str(item.get("session_id", "")).strip()
+                if sid:
+                    merged.setdefault(sid, item)
+        return {"sessions": list(merged.values())}
+
+    def _maybe_migrate_legacy_sessions_index_to_shards(self) -> None:
+        if not self._sessions_index_path.exists():
+            return
+        manifest = self._load_sessions_index_manifest()
+        if bool(manifest.get("sharding_migration_done", False)):
+            self._sessions_index_meta["sharding_migration_done"] = True
+            return
+        loaded = self._load_sessions_index_file(self._sessions_index_path)
+        rows = loaded.get("sessions", [])
+        if not isinstance(rows, list):
+            rows = []
+        by_owner: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("session_id", "")).strip()
+            if not sid:
+                continue
+            owner_key = self._owner_index_key(item.get("owner_id"))
+            by_owner.setdefault(owner_key, {})[sid] = item
+        migration_failed = False
+        for owner_key, items in by_owner.items():
+            path = self._owner_index_path(owner_key)
+            existing = self._load_sessions_index_file(path)
+            merged: Dict[str, Dict[str, Any]] = {}
+            for it in existing.get("sessions", []):
+                if not isinstance(it, dict):
+                    continue
+                sid = str(it.get("session_id", "")).strip()
+                if sid:
+                    merged[sid] = it
+            merged.update(items)
+            payload = {
+                "schema_version": int(
+                    loaded.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+                ),
+                "title_migration_v1_done": bool(
+                    loaded.get("title_migration_v1_done", False)
+                ),
+                "execution_state_migration_v1_done": bool(
+                    loaded.get("execution_state_migration_v1_done", False)
+                ),
+                "execution_state_backfill_v2_done": bool(
+                    loaded.get("execution_state_backfill_v2_done", False)
+                ),
+                "sharding_migration_done": True,
+                "updated_at": _now().isoformat(),
+                "owner_id": self._owner_key_to_owner_id(owner_key),
+                "sessions": list(merged.values()),
+            }
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp.replace(path)
+            except Exception as exc:
+                migration_failed = True
+                print(f"[sessions] shard migration write failed owner={owner_key}: {exc}")
+        if migration_failed:
+            self._sessions_index_meta["sharding_migration_done"] = False
+            print(
+                "[sessions] shard migration incomplete; keeping legacy sessions_index.json as fallback."
+            )
+            return
+        self._sessions_index_meta["schema_version"] = int(
+            loaded.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+        )
         self._sessions_index_meta["title_migration_v1_done"] = bool(
-            parsed.get("title_migration_v1_done", False)
+            loaded.get("title_migration_v1_done", False)
         )
         self._sessions_index_meta["execution_state_migration_v1_done"] = bool(
-            parsed.get("execution_state_migration_v1_done", False)
+            loaded.get("execution_state_migration_v1_done", False)
         )
         self._sessions_index_meta["execution_state_backfill_v2_done"] = bool(
-            parsed.get("execution_state_backfill_v2_done", False)
+            loaded.get("execution_state_backfill_v2_done", False)
         )
-        raw_sessions = parsed.get("sessions", [])
-        if not isinstance(raw_sessions, list):
-            return {"sessions": []}
-        out: List[Dict[str, Any]] = []
-        for item in raw_sessions:
-            if isinstance(item, dict):
-                out.append(item)
-        return {"sessions": out}
+        self._sessions_index_meta["sharding_migration_done"] = True
+        try:
+            self._save_sessions_index_manifest()
+        except Exception as exc:
+            print(f"[sessions] manifest write failed during migration: {exc}")
+            self._sessions_index_meta["sharding_migration_done"] = False
+            return
+        bak = self._sessions_index_path.with_suffix(".json.bak")
+        try:
+            if not bak.exists():
+                self._sessions_index_path.replace(bak)
+        except Exception:
+            # Non-fatal: keep old global index if backup/rename fails.
+            pass
 
     def _bootstrap_sessions_from_disk(self) -> None:
         loaded = self._load_sessions_index()
@@ -2854,97 +3183,103 @@ class RunManager:
         migrated_titles = 0
         migrated_execution_states = 0
         backfilled_execution_state_files = 0
-        with self._lock:
-            for item in loaded_sessions:
-                sid = str(item.get("session_id", "")).strip()
-                if not sid:
+        recovered_states_to_persist: List[RunState] = []
+        boot_items_by_sid: Dict[str, Dict[str, Any]] = {}
+        for raw in loaded_sessions:
+            if not isinstance(raw, dict):
+                continue
+            sid = str(raw.get("session_id", "")).strip()
+            if not sid:
+                continue
+            boot_items_by_sid[sid] = dict(raw)
+
+        known_state_paths = {
+            str(v.get("state_file_path", "")).strip()
+            for v in boot_items_by_sid.values()
+            if isinstance(v, dict)
+        }
+        for sp in glob(str(self._runs_dir / "state_web_*.json")):
+            if sp in known_state_paths:
+                continue
+            run_id = Path(sp).stem.replace("state_web_", "")
+            if run_id in boot_items_by_sid:
+                continue
+            boot_items_by_sid[run_id] = {
+                "session_id": run_id,
+                "owner_id": None,
+                "title": "Recovered session",
+                "status": "failed",
+                "execution_state": "failed",
+                "created_at": _now().isoformat(),
+                "updated_at": _now().isoformat(),
+                "state_file_path": sp,
+                "report_file_path": None,
+                "has_manual_edits": False,
+            }
+
+        if execution_state_backfill_v2_needed:
+            visited_state_paths: set[str] = set()
+            for sid, item in boot_items_by_sid.items():
+                state_path = str(item.get("state_file_path", "")).strip()
+                if not state_path:
+                    inferred = str(self._runs_dir / f"state_web_{sid}.json")
+                    if Path(inferred).exists():
+                        state_path = inferred
+                        item["state_file_path"] = inferred
+                if not state_path or state_path in visited_state_paths:
                     continue
-                self._sessions[sid] = item
+                visited_state_paths.add(state_path)
+                if self._backfill_execution_state_in_state_file(state_path):
+                    backfilled_execution_state_files += 1
+
+        loaded_states: Dict[str, tuple[RunState, str, str, bool]] = {}
+        for sid, item in list(boot_items_by_sid.items()):
+            state_path = str(item.get("state_file_path", "")).strip()
+            state = self._load_run_state_from_files(
+                sid,
+                state_path,
+                item,
+                force_execution_state_recompute=execution_state_migration_needed,
+            )
+            if not state:
+                continue
+            recovered = self._recover_stale_report_generation_on_load_locked(state, run_id=sid)
+            prior_title = str(item.get("title", "")).strip()
+            prior_exec = str(item.get("execution_state", "")).strip().lower()
+            loaded_states[sid] = (state, prior_title, prior_exec, recovered)
+
+        with self._lock:
+            for sid, item in boot_items_by_sid.items():
+                self._set_session_item_locked(sid, item)
                 self._session_locks.setdefault(sid, threading.RLock())
                 self._subscribers.setdefault(sid, [])
                 self._context_subscribers.setdefault(sid, [])
                 self._cancel_flags.setdefault(sid, False)
                 self._pause_flags.setdefault(sid, False)
 
-            known_state_paths = {
-                str(v.get("state_file_path", "")).strip()
-                for v in self._sessions.values()
-                if isinstance(v, dict)
-            }
-            for sp in glob(str(self._runs_dir / "state_web_*.json")):
-                if sp not in known_state_paths:
-                    run_id = Path(sp).stem.replace("state_web_", "")
-                    self._sessions.setdefault(
-                        run_id,
-                        {
-                            "session_id": run_id,
-                            "owner_id": None,
-                            "title": "Recovered session",
-                            "status": "failed",
-                            "execution_state": "failed",
-                            "created_at": _now().isoformat(),
-                            "updated_at": _now().isoformat(),
-                            "state_file_path": sp,
-                            "report_file_path": None,
-                            "has_manual_edits": False,
-                        },
-                    )
-
-            if execution_state_backfill_v2_needed:
-                visited_state_paths: set[str] = set()
-                for sid, item in list(self._sessions.items()):
-                    state_path = str(item.get("state_file_path", "")).strip()
-                    if not state_path:
-                        inferred = str(self._runs_dir / f"state_web_{sid}.json")
-                        if Path(inferred).exists():
-                            state_path = inferred
-                            item["state_file_path"] = inferred
-                    if not state_path or state_path in visited_state_paths:
-                        continue
-                    visited_state_paths.add(state_path)
-                    if self._backfill_execution_state_in_state_file(state_path):
-                        backfilled_execution_state_files += 1
-
-            for sid, item in list(self._sessions.items()):
-                state_path = str(item.get("state_file_path", "")).strip()
-                state = self._load_run_state_from_files(
-                    sid,
-                    state_path,
-                    item,
-                    force_execution_state_recompute=execution_state_migration_needed,
-                )
-                if state:
-                    recovered = self._recover_stale_report_generation_on_load_locked(
-                        state, run_id=sid
-                    )
-                    prior_title = str(item.get("title", "")).strip()
-                    prior_exec = str(item.get("execution_state", "")).strip().lower()
-                    self._refresh_lifecycle_fields_locked(state)
-                    self._runs[sid] = state
-                    self._session_locks.setdefault(sid, threading.RLock())
-                    self._subscribers.setdefault(sid, [])
-                    self._context_subscribers.setdefault(sid, [])
-                    self._cancel_flags.setdefault(sid, False)
-                    self._pause_flags.setdefault(sid, False)
-                    self._sync_session_from_state_locked(state)
-                    new_title = str(self._sessions.get(sid, {}).get("title", "")).strip()
-                    if (
-                        title_migration_needed
-                        and prior_title.lower() == "recovered session"
-                        and new_title
-                        and new_title.lower() != "recovered session"
-                    ):
-                        migrated_titles += 1
-                    new_exec = str(
-                        self._sessions.get(sid, {}).get("execution_state", "")
-                    ).strip().lower()
-                    if execution_state_migration_needed and prior_exec and prior_exec != new_exec:
-                        migrated_execution_states += 1
-                    if recovered:
-                        try:
-                            self._persist_run_state_locked(state)
-                        except Exception:
-                            pass
+            for sid, loaded_entry in loaded_states.items():
+                state, prior_title, prior_exec, recovered = loaded_entry
+                self._refresh_lifecycle_fields_locked(state)
+                self._runs[sid] = state
+                self._session_locks.setdefault(sid, threading.RLock())
+                self._subscribers.setdefault(sid, [])
+                self._context_subscribers.setdefault(sid, [])
+                self._cancel_flags.setdefault(sid, False)
+                self._pause_flags.setdefault(sid, False)
+                self._sync_session_from_state_locked(state)
+                new_title = str(self._sessions.get(sid, {}).get("title", "")).strip()
+                if (
+                    title_migration_needed
+                    and prior_title.lower() == "recovered session"
+                    and new_title
+                    and new_title.lower() != "recovered session"
+                ):
+                    migrated_titles += 1
+                new_exec = str(self._sessions.get(sid, {}).get("execution_state", "")).strip().lower()
+                if execution_state_migration_needed and prior_exec and prior_exec != new_exec:
+                    migrated_execution_states += 1
+                if recovered:
+                    recovered_states_to_persist.append(state)
 
             if title_migration_needed:
                 self._sessions_index_meta["title_migration_v1_done"] = True
@@ -2953,6 +3288,11 @@ class RunManager:
             if execution_state_backfill_v2_needed:
                 self._sessions_index_meta["execution_state_backfill_v2_done"] = True
             self._save_sessions_index_locked()
+        for state in recovered_states_to_persist:
+            try:
+                self._persist_run_state_locked(state)
+            except Exception:
+                pass
         if title_migration_needed:
             print(f"[sessions] title migration v1 applied; updated {migrated_titles} session titles.")
         if execution_state_migration_needed:
