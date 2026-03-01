@@ -515,6 +515,7 @@ class RunManager:
         if not sid:
             return
         prev = self._sessions.get(sid)
+        new_owner_key = self._owner_index_key(item.get("owner_id"))
         if isinstance(prev, dict):
             prev_owner_key = self._owner_index_key(prev.get("owner_id"))
             owner_bucket_prev = self._sessions_by_owner.get(prev_owner_key)
@@ -522,9 +523,10 @@ class RunManager:
                 owner_bucket_prev.pop(sid, None)
                 if not owner_bucket_prev:
                     self._sessions_by_owner.pop(prev_owner_key, None)
+            if prev_owner_key != new_owner_key:
+                self._dirty_owner_keys.add(prev_owner_key)
         self._sessions[sid] = item
-        owner_key = self._owner_index_key(item.get("owner_id"))
-        bucket = self._sessions_by_owner.setdefault(owner_key, {})
+        bucket = self._sessions_by_owner.setdefault(new_owner_key, {})
         bucket[sid] = item
 
     def _delete_session_item_locked(self, session_id: str) -> None:
