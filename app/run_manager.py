@@ -66,8 +66,11 @@ class RunManager:
         self._lock = threading.Lock()
         self._index_write_lock = threading.Lock()
         self._index_flush_event = threading.Event()
-        self._index_flush_seq = 0
-        self._index_flush_pending: Optional[tuple[int, Dict[str, Any]]] = None
+        self._index_flush_pending_by_owner: Dict[str, Dict[str, Any]] = {}
+        self._index_flush_pending_lock = threading.Lock()
+        self._index_owner_locks: Dict[str, threading.Lock] = {}
+        self._index_owner_locks_guard = threading.Lock()
+        self._dirty_owner_keys: set[str] = set()
         self._index_writer_thread = threading.Thread(
             target=self._sessions_index_writer_loop,
             daemon=True,
@@ -101,7 +104,7 @@ class RunManager:
         self._context_chunking_version = str(context_chunking_version or "context_chunk.v1")
         self._context_prompt_cache: Dict[str, str] = {}
         self._index_flush_min_interval_sec = 2.0
-        self._last_index_flush_ts = 0.0
+        self._last_index_flush_ts_by_owner: Dict[str, float] = {}
         self._runs_dir = Path("runs")
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._contexts_dir = self._runs_dir / "contexts"
@@ -111,13 +114,20 @@ class RunManager:
         self._context_digests_dir = self._contexts_dir / "digests"
         (self._context_digests_dir / "per_file").mkdir(parents=True, exist_ok=True)
         (self._context_digests_dir / "aggregate").mkdir(parents=True, exist_ok=True)
+        self._sessions_index_dir = self._runs_dir / "index"
+        self._sessions_index_users_dir = self._sessions_index_dir / "users"
+        self._sessions_index_users_dir.mkdir(parents=True, exist_ok=True)
+        self._sessions_index_legacy_path = self._sessions_index_dir / "legacy.json"
+        self._sessions_index_manifest_path = self._sessions_index_dir / "manifest.json"
         self._sessions_index_path = self._runs_dir / "sessions_index.json"
         self._sessions_index_meta: Dict[str, Any] = {
             "schema_version": self._SESSIONS_INDEX_SCHEMA_VERSION,
             "title_migration_v1_done": False,
             "execution_state_migration_v1_done": False,
             "execution_state_backfill_v2_done": False,
+            "sharding_migration_done": False,
         }
+        self._maybe_migrate_legacy_sessions_index_to_shards()
         self._bootstrap_sessions_from_disk()
 
     def create_run(
@@ -464,6 +474,100 @@ class RunManager:
             return bool(self._auth_allow_legacy)
         return owner == req
 
+    def _owner_index_key(self, owner_id: Optional[str]) -> str:
+        oid = str(owner_id or "").strip()
+        return oid if oid else "__legacy__"
+
+    def _owner_key_to_owner_id(self, owner_key: str) -> Optional[str]:
+        k = str(owner_key or "").strip()
+        if not k or k == "__legacy__":
+            return None
+        return k
+
+    def _owner_index_path(self, owner_key: str) -> Path:
+        key = str(owner_key or "").strip()
+        if not key or key == "__legacy__":
+            return self._sessions_index_legacy_path
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        return self._sessions_index_users_dir / f"{digest}.json"
+
+    def _owner_index_lock(self, owner_key: str) -> threading.Lock:
+        key = str(owner_key or "__legacy__").strip() or "__legacy__"
+        with self._index_owner_locks_guard:
+            return self._index_owner_locks.setdefault(key, threading.Lock())
+
+    def _mark_owner_dirty_locked(self, owner_id: Optional[str]) -> None:
+        self._dirty_owner_keys.add(self._owner_index_key(owner_id))
+
+    def _parse_sessions_index_payload(self, parsed: Any) -> Dict[str, Any]:
+        if not isinstance(parsed, dict):
+            return {"sessions": []}
+        try:
+            schema_version = int(
+                parsed.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+            )
+        except (TypeError, ValueError):
+            schema_version = self._SESSIONS_INDEX_SCHEMA_VERSION
+        raw_sessions = parsed.get("sessions", [])
+        if not isinstance(raw_sessions, list):
+            raw_sessions = []
+        out: List[Dict[str, Any]] = []
+        for item in raw_sessions:
+            if isinstance(item, dict):
+                out.append(item)
+        return {
+            "schema_version": schema_version,
+            "title_migration_v1_done": bool(parsed.get("title_migration_v1_done", False)),
+            "execution_state_migration_v1_done": bool(
+                parsed.get("execution_state_migration_v1_done", False)
+            ),
+            "execution_state_backfill_v2_done": bool(
+                parsed.get("execution_state_backfill_v2_done", False)
+            ),
+            "sharding_migration_done": bool(parsed.get("sharding_migration_done", False)),
+            "sessions": out,
+        }
+
+    def _load_sessions_index_manifest(self) -> Dict[str, Any]:
+        if not self._sessions_index_manifest_path.exists():
+            return {}
+        try:
+            parsed = json.loads(
+                self._sessions_index_manifest_path.read_text(encoding="utf-8")
+            )
+        except Exception:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return parsed
+
+    def _save_sessions_index_manifest(self) -> None:
+        payload = {
+            "schema_version": int(
+                self._sessions_index_meta.get(
+                    "schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION
+                )
+            ),
+            "title_migration_v1_done": bool(
+                self._sessions_index_meta.get("title_migration_v1_done", False)
+            ),
+            "execution_state_migration_v1_done": bool(
+                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
+            ),
+            "execution_state_backfill_v2_done": bool(
+                self._sessions_index_meta.get(
+                    "execution_state_backfill_v2_done", False
+                )
+            ),
+            "sharding_migration_done": bool(
+                self._sessions_index_meta.get("sharding_migration_done", False)
+            ),
+            "updated_at": _now().isoformat(),
+        }
+        tmp_path = self._sessions_index_manifest_path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(self._sessions_index_manifest_path)
+
     def _filter_owned_items(
         self, items: List[Dict[str, Any]], owner_id: Optional[str]
     ) -> List[Dict[str, Any]]:
@@ -740,7 +844,10 @@ class RunManager:
                 self._lock_release("list_sessions", acquired_at)
         else:
             # Fallback path: avoid hanging API calls when lock is contended.
-            loaded = self._load_sessions_index()
+            include_legacy = bool(self._auth_allow_legacy and str(owner_id or "").strip())
+            loaded = self._load_sessions_index_for_owner(
+                owner_id=owner_id, include_legacy=include_legacy
+            )
             raw_items = loaded.get("sessions", [])
             items = [it for it in raw_items if isinstance(it, dict)]
             from_disk_fallback = True
@@ -783,12 +890,15 @@ class RunManager:
             item = self._sessions.get(session_id)
             if not item:
                 return None
+            owner_id = item.get("owner_id")
             item["title"] = clean
             item["updated_at"] = _now().isoformat()
             state = self._runs.get(session_id)
             if state:
                 state.title = clean
                 state.updated_at = _now()
+                owner_id = state.owner_id
+            self._mark_owner_dirty_locked(owner_id)
             self._save_sessions_index_locked(force=True)
             try:
                 return SessionSummary.model_validate(item)
@@ -817,6 +927,7 @@ class RunManager:
             sess = self._sessions.get(session_id)
             if not sess:
                 return None
+            owner_id = sess.get("owner_id")
             state_file_path = str(sess.get("state_file_path", "")).strip()
             self._sessions.pop(session_id, None)
             self._runs.pop(session_id, None)
@@ -825,6 +936,7 @@ class RunManager:
             self._context_subscribers.pop(session_id, None)
             self._cancel_flags.pop(session_id, None)
             self._pause_flags.pop(session_id, None)
+            self._mark_owner_dirty_locked(owner_id)
             self._save_sessions_index_locked(force=True)
         if state_file_path:
             try:
@@ -2727,56 +2839,92 @@ class RunManager:
             "current_report_version_index": state.current_report_version_index,
             "has_manual_edits": bool(state.has_manual_edits),
         }
+        self._mark_owner_dirty_locked(state.owner_id)
 
     def _save_sessions_index_locked(self, force: bool = False) -> None:
-        now_ts = time.time()
-        if not force and (now_ts - self._last_index_flush_ts) < self._index_flush_min_interval_sec:
-            return
         self._sessions_index_meta["schema_version"] = self._SESSIONS_INDEX_SCHEMA_VERSION
-        payload = {
-            "schema_version": int(self._sessions_index_meta.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)),
-            "title_migration_v1_done": bool(self._sessions_index_meta.get("title_migration_v1_done", False)),
-            "execution_state_migration_v1_done": bool(
-                self._sessions_index_meta.get("execution_state_migration_v1_done", False)
-            ),
-            "execution_state_backfill_v2_done": bool(
-                self._sessions_index_meta.get("execution_state_backfill_v2_done", False)
-            ),
-            "updated_at": _now().isoformat(),
-            "sessions": list(self._sessions.values()),
-        }
-        self._last_index_flush_ts = now_ts
-
-        # Queue latest payload for the single writer thread; this preserves write ordering
-        # while keeping filesystem I/O out of hot lock paths.
-        self._index_flush_seq += 1
-        self._index_flush_pending = (self._index_flush_seq, payload)
+        owner_keys = set(self._dirty_owner_keys)
+        if not owner_keys:
+            owner_keys = {
+                self._owner_index_key(it.get("owner_id"))
+                for it in self._sessions.values()
+                if isinstance(it, dict)
+            }
+        now_ts = time.time()
+        for owner_key in owner_keys:
+            last_ts = float(self._last_index_flush_ts_by_owner.get(owner_key, 0.0))
+            if not force and (now_ts - last_ts) < self._index_flush_min_interval_sec:
+                continue
+            owner_id = self._owner_key_to_owner_id(owner_key)
+            sessions = [
+                dict(it)
+                for it in self._sessions.values()
+                if isinstance(it, dict)
+                and self._owner_index_key(it.get("owner_id")) == owner_key
+            ]
+            payload = {
+                "schema_version": int(
+                    self._sessions_index_meta.get(
+                        "schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION
+                    )
+                ),
+                "title_migration_v1_done": bool(
+                    self._sessions_index_meta.get("title_migration_v1_done", False)
+                ),
+                "execution_state_migration_v1_done": bool(
+                    self._sessions_index_meta.get(
+                        "execution_state_migration_v1_done", False
+                    )
+                ),
+                "execution_state_backfill_v2_done": bool(
+                    self._sessions_index_meta.get(
+                        "execution_state_backfill_v2_done", False
+                    )
+                ),
+                "sharding_migration_done": bool(
+                    self._sessions_index_meta.get("sharding_migration_done", False)
+                ),
+                "updated_at": _now().isoformat(),
+                "owner_id": owner_id,
+                "sessions": sessions,
+            }
+            with self._index_flush_pending_lock:
+                self._index_flush_pending_by_owner[owner_key] = payload
+            self._last_index_flush_ts_by_owner[owner_key] = now_ts
+        self._dirty_owner_keys.difference_update(owner_keys)
         self._index_flush_event.set()
 
     def _sessions_index_writer_loop(self) -> None:
         while True:
             self._index_flush_event.wait()
-            pending = self._index_flush_pending
-            if not pending:
+            owner_key = ""
+            payload: Dict[str, Any] = {}
+            with self._index_flush_pending_lock:
+                if self._index_flush_pending_by_owner:
+                    owner_key, payload = next(iter(self._index_flush_pending_by_owner.items()))
+                    self._index_flush_pending_by_owner.pop(owner_key, None)
+            if not owner_key:
                 self._index_flush_event.clear()
                 continue
-            seq, payload = pending
+            owner_lock = self._owner_index_lock(owner_key)
             with self._index_write_lock:
-                try:
-                    tmp_path = self._sessions_index_path.with_suffix(".json.tmp")
-                    tmp_path.write_text(
-                        json.dumps(payload, ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                    tmp_path.replace(self._sessions_index_path)
-                except Exception as exc:
-                    # Keep session/runs in memory even if persistence is temporarily unavailable.
-                    print(f"[sessions] index flush failed: {exc}")
-            # If no newer payload arrived while writing, clear pending + sleep gate.
-            latest = self._index_flush_pending
-            if latest and latest[0] == seq:
-                self._index_flush_pending = None
-                self._index_flush_event.clear()
+                with owner_lock:
+                    try:
+                        path = self._owner_index_path(owner_key)
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        tmp_path = path.with_suffix(".json.tmp")
+                        tmp_path.write_text(
+                            json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        tmp_path.replace(path)
+                        self._save_sessions_index_manifest()
+                    except Exception as exc:
+                        # Keep session/runs in memory even if persistence is temporarily unavailable.
+                        print(f"[sessions] index flush failed: {exc}")
+            with self._index_flush_pending_lock:
+                if not self._index_flush_pending_by_owner:
+                    self._index_flush_event.clear()
 
     def _should_flush_sessions_index(self, event_type: str) -> bool:
         if event_type in {
@@ -2805,39 +2953,170 @@ class RunManager:
             return True
         return False
 
-    def _load_sessions_index(self) -> Dict[str, Any]:
-        if not self._sessions_index_path.exists():
+    def _load_sessions_index_file(self, path: Path) -> Dict[str, Any]:
+        if not path.exists():
             return {"sessions": []}
         try:
-            parsed = json.loads(self._sessions_index_path.read_text(encoding="utf-8"))
+            parsed = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return {"sessions": []}
-        if not isinstance(parsed, dict):
-            return {"sessions": []}
-        try:
-            schema_version = int(
-                parsed.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+        return self._parse_sessions_index_payload(parsed)
+
+    def _load_sessions_index_for_owner(
+        self, owner_id: Optional[str], include_legacy: bool = False
+    ) -> Dict[str, Any]:
+        if not str(owner_id or "").strip():
+            return self._load_sessions_index()
+        merged: Dict[str, Dict[str, Any]] = {}
+        owner_keys = [self._owner_index_key(owner_id)]
+        if include_legacy and owner_keys[0] != "__legacy__":
+            owner_keys.append("__legacy__")
+        for owner_key in owner_keys:
+            path = self._owner_index_path(owner_key)
+            loaded = self._load_sessions_index_file(path)
+            for item in loaded.get("sessions", []):
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("session_id", "")).strip()
+                if not sid:
+                    continue
+                merged[sid] = item
+        return {"sessions": list(merged.values())}
+
+    def _load_sessions_index(self) -> Dict[str, Any]:
+        manifest = self._load_sessions_index_manifest()
+        if manifest:
+            try:
+                self._sessions_index_meta["schema_version"] = int(
+                    manifest.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+                )
+            except (TypeError, ValueError):
+                self._sessions_index_meta["schema_version"] = self._SESSIONS_INDEX_SCHEMA_VERSION
+            self._sessions_index_meta["title_migration_v1_done"] = bool(
+                manifest.get("title_migration_v1_done", False)
             )
-        except (TypeError, ValueError):
-            schema_version = self._SESSIONS_INDEX_SCHEMA_VERSION
-        self._sessions_index_meta["schema_version"] = schema_version
+            self._sessions_index_meta["execution_state_migration_v1_done"] = bool(
+                manifest.get("execution_state_migration_v1_done", False)
+            )
+            self._sessions_index_meta["execution_state_backfill_v2_done"] = bool(
+                manifest.get("execution_state_backfill_v2_done", False)
+            )
+            self._sessions_index_meta["sharding_migration_done"] = bool(
+                manifest.get("sharding_migration_done", False)
+            )
+        merged: Dict[str, Dict[str, Any]] = {}
+        # Legacy/ownerless shard.
+        legacy = self._load_sessions_index_file(self._sessions_index_legacy_path)
+        for item in legacy.get("sessions", []):
+            sid = str(item.get("session_id", "")).strip()
+            if sid:
+                merged[sid] = item
+        # User shards.
+        for p in self._sessions_index_users_dir.glob("*.json"):
+            loaded = self._load_sessions_index_file(p)
+            for item in loaded.get("sessions", []):
+                sid = str(item.get("session_id", "")).strip()
+                if sid:
+                    merged[sid] = item
+        # Backward-compat fallback for unmigrated deployments.
+        if not merged and self._sessions_index_path.exists():
+            fallback = self._load_sessions_index_file(self._sessions_index_path)
+            for item in fallback.get("sessions", []):
+                sid = str(item.get("session_id", "")).strip()
+                if sid:
+                    merged[sid] = item
+        return {"sessions": list(merged.values())}
+
+    def _maybe_migrate_legacy_sessions_index_to_shards(self) -> None:
+        if not self._sessions_index_path.exists():
+            return
+        manifest = self._load_sessions_index_manifest()
+        if bool(manifest.get("sharding_migration_done", False)):
+            self._sessions_index_meta["sharding_migration_done"] = True
+            return
+        loaded = self._load_sessions_index_file(self._sessions_index_path)
+        rows = loaded.get("sessions", [])
+        if not isinstance(rows, list):
+            rows = []
+        by_owner: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            sid = str(item.get("session_id", "")).strip()
+            if not sid:
+                continue
+            owner_key = self._owner_index_key(item.get("owner_id"))
+            by_owner.setdefault(owner_key, {})[sid] = item
+        migration_failed = False
+        for owner_key, items in by_owner.items():
+            path = self._owner_index_path(owner_key)
+            existing = self._load_sessions_index_file(path)
+            merged: Dict[str, Dict[str, Any]] = {}
+            for it in existing.get("sessions", []):
+                if not isinstance(it, dict):
+                    continue
+                sid = str(it.get("session_id", "")).strip()
+                if sid:
+                    merged[sid] = it
+            merged.update(items)
+            payload = {
+                "schema_version": int(
+                    loaded.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+                ),
+                "title_migration_v1_done": bool(
+                    loaded.get("title_migration_v1_done", False)
+                ),
+                "execution_state_migration_v1_done": bool(
+                    loaded.get("execution_state_migration_v1_done", False)
+                ),
+                "execution_state_backfill_v2_done": bool(
+                    loaded.get("execution_state_backfill_v2_done", False)
+                ),
+                "sharding_migration_done": True,
+                "updated_at": _now().isoformat(),
+                "owner_id": self._owner_key_to_owner_id(owner_key),
+                "sessions": list(merged.values()),
+            }
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+                tmp.replace(path)
+            except Exception as exc:
+                migration_failed = True
+                print(f"[sessions] shard migration write failed owner={owner_key}: {exc}")
+        if migration_failed:
+            self._sessions_index_meta["sharding_migration_done"] = False
+            print(
+                "[sessions] shard migration incomplete; keeping legacy sessions_index.json as fallback."
+            )
+            return
+        self._sessions_index_meta["schema_version"] = int(
+            loaded.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
+        )
         self._sessions_index_meta["title_migration_v1_done"] = bool(
-            parsed.get("title_migration_v1_done", False)
+            loaded.get("title_migration_v1_done", False)
         )
         self._sessions_index_meta["execution_state_migration_v1_done"] = bool(
-            parsed.get("execution_state_migration_v1_done", False)
+            loaded.get("execution_state_migration_v1_done", False)
         )
         self._sessions_index_meta["execution_state_backfill_v2_done"] = bool(
-            parsed.get("execution_state_backfill_v2_done", False)
+            loaded.get("execution_state_backfill_v2_done", False)
         )
-        raw_sessions = parsed.get("sessions", [])
-        if not isinstance(raw_sessions, list):
-            return {"sessions": []}
-        out: List[Dict[str, Any]] = []
-        for item in raw_sessions:
-            if isinstance(item, dict):
-                out.append(item)
-        return {"sessions": out}
+        self._sessions_index_meta["sharding_migration_done"] = True
+        try:
+            self._save_sessions_index_manifest()
+        except Exception as exc:
+            print(f"[sessions] manifest write failed during migration: {exc}")
+            self._sessions_index_meta["sharding_migration_done"] = False
+            return
+        bak = self._sessions_index_path.with_suffix(".json.bak")
+        try:
+            if not bak.exists():
+                self._sessions_index_path.replace(bak)
+        except Exception:
+            # Non-fatal: keep old global index if backup/rename fails.
+            pass
 
     def _bootstrap_sessions_from_disk(self) -> None:
         loaded = self._load_sessions_index()
