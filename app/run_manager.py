@@ -2851,6 +2851,7 @@ class RunManager:
                 if isinstance(it, dict)
             }
         now_ts = time.time()
+        queued_owner_keys: set[str] = set()
         for owner_key in owner_keys:
             last_ts = float(self._last_index_flush_ts_by_owner.get(owner_key, 0.0))
             if not force and (now_ts - last_ts) < self._index_flush_min_interval_sec:
@@ -2891,8 +2892,10 @@ class RunManager:
             with self._index_flush_pending_lock:
                 self._index_flush_pending_by_owner[owner_key] = payload
             self._last_index_flush_ts_by_owner[owner_key] = now_ts
-        self._dirty_owner_keys.difference_update(owner_keys)
-        self._index_flush_event.set()
+            queued_owner_keys.add(owner_key)
+        self._dirty_owner_keys.difference_update(queued_owner_keys)
+        if queued_owner_keys:
+            self._index_flush_event.set()
 
     def _sessions_index_writer_loop(self) -> None:
         while True:
@@ -2981,6 +2984,23 @@ class RunManager:
                 if not sid:
                     continue
                 merged[sid] = item
+        # When sharding migration is incomplete/disabled, merge from legacy global index
+        # as fallback so lock-contention list calls don't lose visibility.
+        if (
+            not bool(self._sessions_index_meta.get("sharding_migration_done", False))
+            and self._sessions_index_path.exists()
+        ):
+            fallback = self._load_sessions_index_file(self._sessions_index_path)
+            req = str(owner_id or "").strip()
+            for item in fallback.get("sessions", []):
+                if not isinstance(item, dict):
+                    continue
+                sid = str(item.get("session_id", "")).strip()
+                if not sid:
+                    continue
+                own = str(item.get("owner_id", "") or "").strip()
+                if own == req or (include_legacy and not own):
+                    merged.setdefault(sid, item)
         return {"sessions": list(merged.values())}
 
     def _load_sessions_index(self) -> Dict[str, Any]:
@@ -3018,13 +3038,16 @@ class RunManager:
                 sid = str(item.get("session_id", "")).strip()
                 if sid:
                     merged[sid] = item
-        # Backward-compat fallback for unmigrated deployments.
-        if not merged and self._sessions_index_path.exists():
+        # Backward-compat fallback for unmigrated or partially-migrated deployments.
+        if (
+            not bool(self._sessions_index_meta.get("sharding_migration_done", False))
+            and self._sessions_index_path.exists()
+        ):
             fallback = self._load_sessions_index_file(self._sessions_index_path)
             for item in fallback.get("sessions", []):
                 sid = str(item.get("session_id", "")).strip()
                 if sid:
-                    merged[sid] = item
+                    merged.setdefault(sid, item)
         return {"sessions": list(merged.values())}
 
     def _maybe_migrate_legacy_sessions_index_to_shards(self) -> None:
