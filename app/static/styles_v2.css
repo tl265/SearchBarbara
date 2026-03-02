@@ -425,10 +425,21 @@ body.sessions-collapsed .session-toggle-icon {
   justify-content: space-between;
   margin-bottom: 8px;
 }
+.canvas-title-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
 .report-head-tools {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+.debug-only-control {
+  display: none;
+}
+body.ui-debug-on .debug-only-control {
+  display: inline-block;
 }
 .icon-btn {
   width: 34px;
@@ -972,6 +983,9 @@ details.node-section {
 @media (max-width: 480px) {
   .topbar {
     gap: 8px;
+  }
+  .canvas-title-group {
+    gap: 6px;
   }
   .auth-box {
     width: 100%;

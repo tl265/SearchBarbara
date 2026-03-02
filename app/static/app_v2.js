@@ -8,8 +8,6 @@ const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const abortBtn = document.getElementById("abortBtn");
 const swapBatchCanvasBtn = document.getElementById("swapBatchCanvasBtn");
-const planningPanelEl = document.getElementById("planningPanel");
-const planningMetaEl = document.getElementById("planningMeta");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
@@ -49,6 +47,7 @@ const reportVersionLabel = document.getElementById("reportVersionLabel");
 const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
   ? window.APP_CONFIG
   : {};
+const SWAP_BATCH_LABEL = "Refresh the lineup";
 const SESSION_SYNC_CHANNEL = "searchbarbara:sessions:v1";
 const SESSION_SYNC_STORAGE_KEY = "searchbarbara:sessions:signal";
 const SESSION_RAIL_COLLAPSED_KEY = "sb_sessions_rail_collapsed";
@@ -706,51 +705,12 @@ function cloneJson(v) {
   }
 }
 
-function normalizeActivePinRecords(rows) {
-  const src = Array.isArray(rows) ? rows : [];
-  const out = [];
-  for (const row of src) {
-    if (!row || typeof row !== "object") continue;
-    const subQuestion = String(row.sub_question || "").trim();
-    const displayTitle = String(row.display_title || "").trim();
-    const nodeId = String(row.node_id || "").trim();
-    if (!subQuestion && !displayTitle && !nodeId) continue;
-    out.push({
-      node_id: nodeId,
-      sub_question: subQuestion,
-      display_title: displayTitle || subQuestion,
-      pin_depth_bonus: Math.max(0, Number(row.pin_depth_bonus || 0)),
-      updated_at: String(row.updated_at || "").trim(),
-    });
-  }
-  return out;
-}
-
-function activePinRecordsFromSnapshot() {
-  const tree = currentSnapshot && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
-  const planning = tree && typeof tree.planning === "object" ? tree.planning : {};
-  return normalizeActivePinRecords(planning.active_pin_records || []);
-}
-
 function buildContextAggregateView(basePayload, mode = "digest") {
   const payload = basePayload && typeof basePayload === "object" ? basePayload : {};
-  if (mode === "context_slice") {
-    const out = {};
-    out.context_slice = payload;
-    const inlinePinRows = normalizeActivePinRecords(payload.active_pin_records || []);
-    if (inlinePinRows.length) {
-      return out;
-    }
-    const fallbackPinRows = activePinRecordsFromSnapshot();
-    out.active_pin_records = fallbackPinRows;
-    out.active_pin_records_count = fallbackPinRows.length;
-    return out;
-  }
-  const pinRows = activePinRecordsFromSnapshot();
-  const out = { digest: payload };
-  out.active_pin_records = pinRows;
-  out.active_pin_records_count = pinRows.length;
-  return out;
+  const viewMode = String(mode || "digest");
+  return viewMode === "context_slice"
+    ? { context_slice: payload }
+    : { digest: payload };
 }
 
 function renderContextAggregateView(basePayload, mode = "digest") {
@@ -775,37 +735,16 @@ function refreshContextAggregateViewFromSnapshot() {
 }
 
 function renderPlanningPanel(snap) {
-  if (!planningPanelEl || !planningMetaEl) return;
   const phase = planningPhase(snap);
   const pState = planningState(snap);
-  const bonusCap = planningDepthBonusLimit(snap);
-  const bonusHint = Number.isFinite(bonusCap) ? `Depth bonus (<=${bonusCap}). ` : "Depth bonus. ";
   const swapInProgress = isPlanningSwapInProgress(snap);
   const planningUi = derivePlanningUiState(phase, pState, { swapInProgress });
-  const rows = planningCandidates(snap);
-  const pinnedCount = rows.filter((r) => !!r.is_pinned).length;
   if (swapBatchCanvasBtn) {
     swapBatchCanvasBtn.classList.toggle("hidden", !planningUi.inPlanning);
     swapBatchCanvasBtn.disabled = !planningUi.canEdit;
-    swapBatchCanvasBtn.setAttribute("title", planningUi.swapBatchText);
-    swapBatchCanvasBtn.setAttribute("aria-label", planningUi.swapBatchText);
+    swapBatchCanvasBtn.setAttribute("title", SWAP_BATCH_LABEL);
+    swapBatchCanvasBtn.setAttribute("aria-label", SWAP_BATCH_LABEL);
   }
-  if (!planningUi.inPlanning) {
-    planningPanelEl.classList.add("hidden");
-    planningMetaEl.textContent = "Planning not started.";
-    return;
-  }
-  planningPanelEl.classList.remove("hidden");
-  const stateLabel = shortStatus(`planning_${pState}`);
-  if (swapInProgress) {
-    planningMetaEl.textContent =
-      `Swapping batch... Current candidates stay visible until replacement is ready. ` +
-      `State: ${stateLabel} · ${pinnedCount}/${rows.length} pinned. ${bonusHint}`;
-    return;
-  }
-  planningMetaEl.textContent =
-    `State: ${stateLabel} · ` +
-    `${pinnedCount}/${rows.length} pinned. ${bonusHint}Use node-card icons in Research Canvas to pin and adjust depth.`;
 }
 
 function refreshPlanningUi(snap) {
