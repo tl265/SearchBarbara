@@ -1,4 +1,5 @@
 import argparse
+import copy
 import json
 import os
 import time
@@ -778,6 +779,7 @@ class DeepResearchAgent:
         run_id: str = "",
         should_abort: Optional[Callable[[], bool]] = None,
         user_context_bundle: Optional[Dict[str, Any]] = None,
+        planning_seed: Optional[Dict[str, Any]] = None,
     ) -> None:
         pricing_error = ""
         if cost_estimate_enabled:
@@ -849,10 +851,449 @@ class DeepResearchAgent:
             if isinstance(user_context_bundle, dict)
             else {"available": False, "aggregate_digest": {}, "files": []}
         )
+        self.planning_seed = planning_seed if isinstance(planning_seed, dict) else {}
         self.source_policy = load_source_policy()
         self.search_policy = load_search_policy()
         self.decompose_policy = load_decompose_policy()
         self.query_memory: Dict[str, Dict[str, Any]] = {}
+
+    def plan_root_batch(
+        self,
+        task: str,
+        pinned_children: Optional[List[Dict[str, Any]]] = None,
+        exclude_children: Optional[List[str]] = None,
+        action: str = "start",
+        cached_root: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        self._abort_if_requested("planning_start")
+        root_question = str(task or "").strip() or "Research task"
+        round_i = 1
+        root_node_id = "1"
+        self._emit("round_started", {"round": round_i})
+        self._emit(
+            "sub_question_started",
+            {
+                "round": round_i,
+                "sub_question": root_question,
+                "display_title": root_question,
+                "depth": 1,
+                "parent": "",
+                "node_id": root_node_id,
+            },
+        )
+        pinned_rows = pinned_children if isinstance(pinned_children, list) else []
+        pinned_map: Dict[str, Dict[str, Any]] = {}
+        for row in pinned_rows:
+            if not isinstance(row, dict):
+                continue
+            sq = str(row.get("sub_question", "")).strip()
+            if not sq:
+                continue
+            pinned_map[sq] = row
+        excluded = [
+            str(v).strip()
+            for v in (exclude_children if isinstance(exclude_children, list) else [])
+            if isinstance(v, str) and str(v).strip()
+        ]
+        full_context_digest = (
+            self.user_context_bundle.get("aggregate_digest", {})
+            if isinstance(self.user_context_bundle, dict)
+            else {}
+        )
+        full_context_items = self._context_items_from_digest(
+            full_context_digest if isinstance(full_context_digest, dict) else {}
+        )
+        active_pin_records = (
+            self.user_context_bundle.get("active_pin_records", [])
+            if isinstance(self.user_context_bundle, dict)
+            else []
+        )
+        node_context_slice = {
+            "mode": "root_full",
+            "selection_reason": "Root planning uses full parsed user context.",
+            "selected_items": self._compact_context_items(
+                full_context_items, max_items=40, char_budget=9000
+            ),
+            "active_pin_records": active_pin_records if isinstance(active_pin_records, list) else [],
+        }
+        self._emit(
+            "context_for_node_ready",
+            {
+                "round": round_i,
+                "sub_question": root_question,
+                "depth": 1,
+                "node_id": root_node_id,
+                "mode": str(node_context_slice.get("mode", "")),
+                "selected_items_count": len(
+                    node_context_slice.get("selected_items", [])
+                    if isinstance(node_context_slice.get("selected_items", []), list)
+                    else []
+                ),
+                "context_slice": node_context_slice,
+            },
+        )
+
+        now_utc = datetime.now(timezone.utc)
+        query_prompt = f"""Original task:
+{root_question}
+
+Sub-question:
+{root_question}
+
+Question depth:
+1
+
+Known success criteria:
+[]
+
+Runtime context (authoritative):
+- Current datetime (UTC): {now_utc.isoformat()}
+- Current date (UTC): {now_utc.date().isoformat()}
+- Current year (UTC): {now_utc.year}
+"""
+        finding = SubQuestionFinding(sub_question=root_question)
+        queries: List[str] = []
+        evidence: List[Dict[str, Any]] = []
+        query_steps: List[Dict[str, Any]] = []
+        node_suff: Dict[str, Any] = {
+            "is_sufficient": False,
+            "reasoning": "No node-level sufficiency run.",
+            "gaps": [],
+        }
+        cached = cached_root if isinstance(cached_root, dict) else {}
+        use_cached_root = False
+        if str(action or "").startswith("swap_batch") and cached:
+            cached_node_suff = (
+                cached.get("node_sufficiency", {})
+                if isinstance(cached.get("node_sufficiency", {}), dict)
+                else {}
+            )
+            if "is_sufficient" in cached_node_suff:
+                use_cached_root = True
+                queries = self._dedupe_preserve_order(
+                    self._normalize_llm_list(
+                        cached.get("queries", []), "planning_cached_queries"
+                    )
+                )
+                query_steps = copy.deepcopy(
+                    cached.get("query_steps", [])
+                    if isinstance(cached.get("query_steps", []), list)
+                    else []
+                )
+                evidence = copy.deepcopy(
+                    cached.get("evidence", [])
+                    if isinstance(cached.get("evidence", []), list)
+                    else []
+                )
+                cached_finding = (
+                    cached.get("finding", {})
+                    if isinstance(cached.get("finding", {}), dict)
+                    else {}
+                )
+                finding.summaries = self._normalize_llm_list(
+                    cached_finding.get("summaries", []), "planning_cached_summaries"
+                )
+                finding.facts = self._normalize_synth_facts(
+                    cached_finding.get("facts", [])
+                )
+                finding.uncertainties = self._normalize_llm_list(
+                    cached_finding.get("uncertainties", []),
+                    "planning_cached_uncertainties",
+                )
+                self._emit(
+                    "queries_generated",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "display_title": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                        "queries": queries,
+                    },
+                )
+                node_suff = {
+                    "is_sufficient": bool(cached_node_suff.get("is_sufficient", False)),
+                    "reasoning": str(cached_node_suff.get("reasoning", "")).strip(),
+                    "gaps": self._normalize_llm_list(
+                        cached_node_suff.get("gaps", []), "planning_cached_node_gaps"
+                    ),
+                }
+                self._emit(
+                    "node_sufficiency_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                        "is_sufficient": bool(node_suff.get("is_sufficient", False)),
+                        "reasoning": str(node_suff.get("reasoning", "")).strip(),
+                        "gaps": copy.deepcopy(
+                            node_suff.get("gaps", [])
+                            if isinstance(node_suff.get("gaps", []), list)
+                            else []
+                        ),
+                    },
+                )
+
+        if not use_cached_root:
+            qobj = self.llm.json(
+                SYSTEM_QUERY_GEN,
+                query_prompt,
+                stage="planning_query_gen",
+                metadata={"sub_question": self._trim_text(root_question, 120)},
+            )
+            queries = self._dedupe_preserve_order(
+                self._normalize_llm_list(qobj.get("queries"), "planning_queries")
+            )
+            self._emit(
+                "queries_generated",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "display_title": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "queries": queries,
+                },
+            )
+            question_has_evidence = False
+            for query in queries:
+                self._abort_if_requested("planning_query_loop")
+                self._emit(
+                    "query_started",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "query": query,
+                    },
+                )
+                raw_results = self.search.search(query, self.results_per_query)
+                search_error = self.search.last_error
+                selected_results = self._select_high_quality_results(
+                    raw_results, self.results_per_query
+                )
+                primary_count = sum(
+                    1 for r in selected_results if r.quality_tier == "primary_or_official"
+                )
+                step_data: Dict[str, Any] = {
+                    "query": query,
+                    "status": "failed" if search_error and not selected_results else "success",
+                    "search_error": search_error,
+                    "selected_results_count": len(selected_results),
+                    "primary_count": primary_count,
+                    "selected_sources": [
+                        {"title": r.title, "url": r.url} for r in selected_results
+                    ],
+                }
+                self._emit(
+                    "search_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "query": query,
+                        "search_error": search_error,
+                        "raw_results_count": len(raw_results),
+                        "selected_results_count": len(selected_results),
+                        "primary_count": primary_count,
+                        "selected_sources": [
+                            {"title": r.title, "url": r.url} for r in selected_results
+                        ],
+                    },
+                )
+                if not selected_results:
+                    query_steps.append(step_data)
+                    if search_error:
+                        finding.uncertainties.append(
+                            f"Search failed for query '{query}': {search_error}"
+                        )
+                    else:
+                        finding.uncertainties.append(
+                            f"No usable evidence retrieved for query '{query}'."
+                        )
+                    continue
+                question_has_evidence = True
+                sobj = self.llm.json(
+                    SYSTEM_SYNTHESIZE,
+                    self._format_synthesis_prompt(root_question, query, selected_results),
+                    stage="planning_synthesize",
+                    metadata={
+                        "sub_question": self._trim_text(root_question, 120),
+                        "query": self._trim_text(query, 140),
+                    },
+                )
+                summary = str(sobj.get("summary", "")).strip()
+                if summary:
+                    finding.summaries.append(summary)
+                    step_data["synthesis_summary"] = summary
+                self._emit(
+                    "synthesis_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "query": query,
+                        "summary": self._trim_text(summary, 300),
+                    },
+                )
+                finding.facts.extend(self._normalize_synth_facts(sobj.get("facts", [])))
+                finding.uncertainties.extend(
+                    self._normalize_llm_list(
+                        sobj.get("uncertainties"), "planning_uncertainties"
+                    )
+                )
+                evidence.extend(
+                    [
+                        {
+                            "query": query,
+                            "title": r.title,
+                            "url": r.url,
+                            "snippet": r.snippet,
+                            "quality_tier": r.quality_tier,
+                            "quality_score": r.quality_score,
+                        }
+                        for r in selected_results
+                    ]
+                )
+                query_steps.append(step_data)
+
+            if question_has_evidence:
+                self._emit(
+                    "node_sufficiency_started",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                    },
+                )
+                node_suff = self.llm.json(
+                    SYSTEM_SUFFICIENCY_NODE,
+                    self._format_node_sufficiency_prompt(
+                        task=root_question,
+                        sub_question=root_question,
+                        success_criteria=[],
+                        finding=finding,
+                        depth=1,
+                        node_context_slice=node_context_slice,
+                    ),
+                    stage="planning_node_sufficiency",
+                    metadata={"sub_question": self._trim_text(root_question, 120)},
+                )
+                self._emit(
+                    "node_sufficiency_completed",
+                    {
+                        "round": round_i,
+                        "sub_question": root_question,
+                        "depth": 1,
+                        "node_id": root_node_id,
+                        "is_sufficient": bool(node_suff.get("is_sufficient", False)),
+                        "reasoning": str(node_suff.get("reasoning", "")).strip(),
+                        "gaps": self._normalize_llm_list(
+                            node_suff.get("gaps"), "planning_node_gaps"
+                        ),
+                    },
+                )
+        node_is_sufficient = bool(node_suff.get("is_sufficient", False))
+        node_reasoning = str(node_suff.get("reasoning", "")).strip()
+        node_gaps = self._normalize_llm_list(node_suff.get("gaps"), "planning_node_gaps")
+        decompose_directive = ""
+        if excluded:
+            decompose_directive = (
+                "Planning swap constraints:\n"
+                f"- Current action: {str(action or 'start').strip() or 'start'}\n"
+                "- Preserve all pinned children unchanged.\n"
+                "- Avoid reusing previously rejected unpinned candidates whenever possible.\n"
+                f"- Previously rejected candidates (avoid): {json.dumps(excluded, ensure_ascii=False)}\n"
+                "- Prefer new angles with meaningfully different wording and scope.\n"
+            )
+        children: List[str] = []
+        children_display_titles: Dict[str, str] = {}
+        if (not node_is_sufficient) and self.max_depth > 1:
+            self._emit(
+                "node_decomposition_started",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                },
+            )
+            children, children_display_titles = self._decompose_sub_question(
+                task=root_question,
+                sub_question=root_question,
+                success_criteria=[],
+                node_gaps=node_gaps,
+                node_reasoning=node_reasoning,
+                depth=1,
+                max_depth=max(2, self.max_depth),
+                finding=finding,
+                node_context_slice=node_context_slice,
+                planning_directive=decompose_directive,
+            )
+        merged_children: List[str] = []
+        for sq in pinned_map.keys():
+            if sq not in merged_children:
+                merged_children.append(sq)
+        for sq in children:
+            if sq not in merged_children:
+                merged_children.append(sq)
+        for sq in merged_children:
+            if sq not in children_display_titles:
+                pin_title = str(pinned_map.get(sq, {}).get("display_title", "")).strip()
+                children_display_titles[sq] = pin_title or sq
+        if node_is_sufficient:
+            self._emit(
+                "node_completed",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "derived_from_children": False,
+                },
+            )
+        elif merged_children:
+            self._emit(
+                "node_decomposed",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "children": merged_children,
+                    "children_display_titles": children_display_titles,
+                    "child_node_ids": [f"1.{i}" for i in range(1, len(merged_children) + 1)],
+                },
+            )
+        else:
+            self._emit(
+                "node_unresolved",
+                {
+                    "round": round_i,
+                    "sub_question": root_question,
+                    "depth": 1,
+                    "node_id": root_node_id,
+                    "reason": node_reasoning or "No further decomposition candidates available.",
+                },
+            )
+        return {
+            "root_question": root_question,
+            "queries": queries,
+            "query_steps": query_steps,
+            "evidence": evidence,
+            "is_sufficient": node_is_sufficient,
+            "node_reasoning": node_reasoning,
+            "node_gaps": node_gaps,
+            "finding": {
+                "summaries": copy.deepcopy(finding.summaries),
+                "facts": copy.deepcopy(finding.facts),
+                "uncertainties": copy.deepcopy(finding.uncertainties),
+            },
+            "children": merged_children,
+            "children_display_titles": children_display_titles,
+        }
 
     def run(self, task: str) -> str:
         self._log("Starting deep research run.")
@@ -877,6 +1318,7 @@ class DeepResearchAgent:
         extra_queries: List[str] = []
         unresolved_questions: List[str] = []
         question_depths: Dict[str, int] = {}
+        question_max_depths: Dict[str, int] = {}
         question_parents: Dict[str, str] = {}
         question_node_ids: Dict[str, str] = {}
         question_display_titles: Dict[str, str] = {}
@@ -932,10 +1374,16 @@ class DeepResearchAgent:
                 for q, depth in raw_depths.items():
                     if isinstance(q, str) and isinstance(depth, int):
                         question_depths[q] = max(1, depth)
+            raw_max_depths = resume_state.get("question_max_depths", {})
+            if isinstance(raw_max_depths, dict):
+                for q, depth_cap in raw_max_depths.items():
+                    if isinstance(q, str) and isinstance(depth_cap, int):
+                        question_max_depths[q] = max(1, depth_cap)
             for q in self._dedupe_preserve_order(
                 sub_questions + unresolved_questions + extra_questions
             ):
                 question_depths.setdefault(q, 1)
+                question_max_depths.setdefault(q, self.max_depth)
             raw_parents = resume_state.get("question_parents", {})
             if isinstance(raw_parents, dict):
                 for q, parent in raw_parents.items():
@@ -1010,8 +1458,15 @@ class DeepResearchAgent:
                 "search_policy_file": str(SEARCH_POLICY_PATH),
                 "decompose_policy_file": str(DECOMPOSE_POLICY_PATH),
             }
-            self._log("Initializing root task node (no upfront decomposition).")
-            root_question = task.strip() or "Research task"
+            planning_seed = (
+                self.planning_seed if isinstance(self.planning_seed, dict) else {}
+            )
+            seeded_children = self._normalize_llm_list(
+                planning_seed.get("root_children", []), "planning_seed_root_children"
+            )
+            root_question = str(
+                planning_seed.get("root_question", task) if isinstance(planning_seed, dict) else task
+            ).strip() or (task.strip() or "Research task")
             sub_questions = [root_question]
             question_display_titles[root_question] = self._normalize_display_title(
                 root_question, fallback=root_question
@@ -1027,13 +1482,71 @@ class DeepResearchAgent:
             trace["plan"] = {
                 "sub_questions": sub_questions,
                 "success_criteria": success_criteria,
-                "planning_mode": "root_only",
+                "planning_mode": "seeded_children" if seeded_children else "root_only",
             }
             findings = {sq: SubQuestionFinding(sub_question=sq) for sq in sub_questions}
-            unresolved_questions = list(sub_questions)
-            for sq in sub_questions:
-                question_depths[sq] = 1
-                question_parents[sq] = ""
+            question_depths[root_question] = 1
+            question_max_depths[root_question] = self.max_depth
+            question_parents[root_question] = ""
+            if seeded_children:
+                self._log(
+                    f"Initializing from planning seed with {len(seeded_children)} root children."
+                )
+                title_map = (
+                    planning_seed.get("children_display_titles", {})
+                    if isinstance(planning_seed.get("children_display_titles", {}), dict)
+                    else {}
+                )
+                child_start_depths = (
+                    planning_seed.get("child_start_depths", {})
+                    if isinstance(planning_seed.get("child_start_depths", {}), dict)
+                    else {}
+                )
+                child_branch_max_depths = (
+                    planning_seed.get("child_branch_max_depths", {})
+                    if isinstance(planning_seed.get("child_branch_max_depths", {}), dict)
+                    else {}
+                )
+                pinned_children = set(
+                    self._normalize_llm_list(
+                        planning_seed.get("pinned_children", []), "planning_seed_pinned_children"
+                    )
+                )
+                for child in seeded_children:
+                    findings.setdefault(child, SubQuestionFinding(sub_question=child))
+                    try:
+                        start_depth = int(child_start_depths.get(child, 2))
+                    except Exception:
+                        start_depth = 2
+                    try:
+                        branch_max_depth = int(
+                            child_branch_max_depths.get(child, self.max_depth)
+                        )
+                    except Exception:
+                        branch_max_depth = self.max_depth
+                    branch_max_depth = max(2, branch_max_depth)
+                    question_max_depths[child] = branch_max_depth
+                    question_depths[child] = max(2, min(branch_max_depth, start_depth))
+                    question_parents[child] = root_question
+                    question_display_titles[child] = self._normalize_display_title(
+                        title_map.get(child, child), fallback=child
+                    )
+                    if child in pinned_children:
+                        findings[child].uncertainties.append(
+                            "Planning hint: user pinned this branch during planning review."
+                        )
+                unresolved_questions = list(seeded_children)
+                decomposed_questions.add(root_question)
+                trace["planning_seed"] = {
+                    "root_children": seeded_children,
+                    "pinned_children": list(pinned_children),
+                    "child_branch_max_depths": child_branch_max_depths,
+                    "root_lazy_queries": planning_seed.get("root_lazy_queries", []),
+                    "root_lazy_evidence": planning_seed.get("root_lazy_evidence", []),
+                }
+            else:
+                self._log("Initializing root task node (no upfront decomposition).")
+                unresolved_questions = list(sub_questions)
             start_round = 1
             self.query_memory = {}
 
@@ -1111,6 +1624,7 @@ class DeepResearchAgent:
                 recheck_queries=recheck_queries,
                 unresolved_questions=unresolved_questions,
                 question_depths=question_depths,
+                question_max_depths=question_max_depths,
                 question_parents=question_parents,
                 question_node_ids=question_node_ids,
                 question_display_titles=question_display_titles,
@@ -1176,17 +1690,27 @@ class DeepResearchAgent:
                 full_context_items = self._context_items_from_digest(
                     full_context_digest if isinstance(full_context_digest, dict) else {}
                 )
+                active_pin_records = (
+                    self.user_context_bundle.get("active_pin_records", [])
+                    if isinstance(self.user_context_bundle, dict)
+                    else []
+                )
                 node_context_slices: Dict[str, Dict[str, Any]] = {}
                 next_unresolved: List[str] = []
                 processed_questions_in_pass: set[str] = set()
                 active_questions_in_branch: set[str] = set()
 
                 def process_question_dfs(
-                    sq: str, depth: int, parent: str, ancestry: List[str]
+                    sq: str,
+                    depth: int,
+                    parent: str,
+                    ancestry: List[str],
+                    branch_max_depth: int,
                 ) -> bool:
                     nonlocal round_new_fact_gain, total_search_calls, failed_search_calls
                     nonlocal queries_with_evidence, total_selected_results
                     self._abort_if_requested("sub_question_start")
+                    local_max_depth = max(depth, int(branch_max_depth or self.max_depth))
                     if sq in processed_questions_in_pass:
                         return sq in resolved_questions
                     if sq in resolved_questions:
@@ -1221,6 +1745,9 @@ class DeepResearchAgent:
 
                     active_questions_in_branch.add(sq)
                     question_depths[sq] = max(1, depth)
+                    question_max_depths[sq] = max(
+                        local_max_depth, int(question_max_depths.get(sq, local_max_depth))
+                    )
                     if sq not in question_parents or not question_parents.get(sq, ""):
                         question_parents[sq] = parent
                     node_id = get_or_assign_node_id(sq, question_parents.get(sq, ""))
@@ -1259,6 +1786,7 @@ class DeepResearchAgent:
                             "selected_items": self._compact_context_items(
                                 full_context_items, max_items=40, char_budget=9000
                             ),
+                            "active_pin_records": active_pin_records if isinstance(active_pin_records, list) else [],
                         }
                     else:
                         preset_slice = node_context_slices.get(sq, {})
@@ -1280,6 +1808,11 @@ class DeepResearchAgent:
                                     max_items=24,
                                     char_budget=7000,
                                 ),
+                                "active_pin_records": (
+                                    preset_slice.get("active_pin_records", active_pin_records)
+                                    if isinstance(preset_slice.get("active_pin_records", active_pin_records), list)
+                                    else (active_pin_records if isinstance(active_pin_records, list) else [])
+                                ),
                             }
                         else:
                             parent_slice = node_context_slices.get(parent, {})
@@ -1295,6 +1828,11 @@ class DeepResearchAgent:
                                     "selected_items": self._compact_context_items(
                                         parent_items, max_items=24, char_budget=7000
                                     ),
+                                    "active_pin_records": (
+                                        parent_slice.get("active_pin_records", active_pin_records)
+                                        if isinstance(parent_slice.get("active_pin_records", active_pin_records), list)
+                                        else (active_pin_records if isinstance(active_pin_records, list) else [])
+                                    ),
                                 }
                             else:
                                 node_context_slice = {
@@ -1305,6 +1843,7 @@ class DeepResearchAgent:
                                     "selected_items": self._compact_context_items(
                                         full_context_items, max_items=24, char_budget=7000
                                     ),
+                                    "active_pin_records": active_pin_records if isinstance(active_pin_records, list) else [],
                                 }
                     node_context_slices[sq] = node_context_slice
                     question_trace["context_slice"] = node_context_slice
@@ -1769,7 +2308,7 @@ Runtime context (authoritative):
                             save_checkpoint(status="running", next_round=round_i)
                             return True
 
-                        if depth < self.max_depth:
+                        if depth < local_max_depth:
                             self._emit(
                                 "node_decomposition_started",
                                 {
@@ -1786,7 +2325,7 @@ Runtime context (authoritative):
                                 node_gaps=node_gaps,
                                 node_reasoning=node_reasoning,
                                 depth=depth,
-                                max_depth=self.max_depth,
+                                max_depth=local_max_depth,
                                 finding=findings[sq],
                                 node_context_slice=node_context_slice,
                             )
@@ -1798,7 +2337,11 @@ Runtime context (authoritative):
                                         children_display_titles.get(child, child),
                                         fallback=child,
                                     )
-                                    question_depths[child] = min(self.max_depth, depth + 1)
+                                    question_depths[child] = min(local_max_depth, depth + 1)
+                                    question_max_depths[child] = max(
+                                        int(question_max_depths.get(child, 1)),
+                                        local_max_depth,
+                                    )
                                     if child not in question_parents or not question_parents.get(child, ""):
                                         question_parents[child] = sq
                                     child_node_ids.append(get_or_assign_node_id(child, sq))
@@ -1850,7 +2393,11 @@ Runtime context (authoritative):
                                         child, SubQuestionFinding(sub_question=child)
                                     )
                                     child_solved = process_question_dfs(
-                                        child, min(self.max_depth, depth + 1), sq, ancestry + [sq]
+                                        child,
+                                        min(local_max_depth, depth + 1),
+                                        sq,
+                                        ancestry + [sq],
+                                        int(question_max_depths.get(child, local_max_depth)),
                                     )
                                     child_all_solved = child_all_solved and child_solved
                                 if child_all_solved:
@@ -1882,7 +2429,7 @@ Runtime context (authoritative):
                                 save_checkpoint(status="running", next_round=round_i)
                                 return False
 
-                        reason = "depth_limit_reached" if depth >= self.max_depth else "decompose_failed"
+                        reason = "depth_limit_reached" if depth >= local_max_depth else "decompose_failed"
                         self._emit(
                             "node_unresolved",
                             {
@@ -1906,7 +2453,10 @@ Runtime context (authoritative):
                         continue
                     root_depth = max(1, int(question_depths.get(sq, 1)))
                     root_parent = question_parents.get(sq, "")
-                    process_question_dfs(sq, root_depth, root_parent, [])
+                    root_max_depth = max(
+                        root_depth, int(question_max_depths.get(sq, self.max_depth))
+                    )
+                    process_question_dfs(sq, root_depth, root_parent, [], root_max_depth)
 
                 unresolved_questions = self._dedupe_preserve_order(
                     [q for q in next_unresolved if q not in resolved_questions]
@@ -1982,6 +2532,7 @@ Runtime context (authoritative):
                 )
                 for q in extra_questions:
                     question_depths.setdefault(q, 1)
+                    question_max_depths.setdefault(q, self.max_depth)
                     question_parents.setdefault(q, "")
                     findings.setdefault(q, SubQuestionFinding(sub_question=q))
                 unresolved_questions = self._dedupe_preserve_order(
@@ -2008,6 +2559,7 @@ Runtime context (authoritative):
             trace["query_memory"] = self._query_memory_summary()
             trace["question_tree"] = {
                 "depths": question_depths,
+                "max_depths": question_max_depths,
                 "parents": question_parents,
                 "node_ids": question_node_ids,
                 "resolved_questions": sorted(resolved_questions),
@@ -2337,6 +2889,7 @@ Runtime context (authoritative):
         max_depth: int,
         finding: SubQuestionFinding,
         node_context_slice: Dict[str, Any],
+        planning_directive: str = "",
     ) -> tuple[List[str], Dict[str, str]]:
         mode = self._compute_decompose_mode_hint(
             parent_question=sub_question,
@@ -2384,6 +2937,9 @@ Runtime context (authoritative):
 
             Decomposition style hint (guidance, not rigid):
             {json.dumps(mode, ensure_ascii=False)}
+
+            Additional decomposition directives:
+            {planning_directive or "None"}
 
             Return child sub-questions focused on unresolved evidence gaps.
             Use as few children as possible while keeping the set MECE and answerable.
@@ -3288,6 +3844,7 @@ Runtime context (authoritative):
         recheck_queries: List[str],
         unresolved_questions: List[str],
         question_depths: Dict[str, int],
+        question_max_depths: Dict[str, int],
         question_parents: Dict[str, str],
         question_node_ids: Dict[str, str],
         question_display_titles: Dict[str, str],
@@ -3322,6 +3879,7 @@ Runtime context (authoritative):
             "recheck_queries": recheck_queries,
             "unresolved_questions": unresolved_questions,
             "question_depths": question_depths,
+            "question_max_depths": question_max_depths,
             "question_parents": question_parents,
             "question_node_ids": question_node_ids,
             "question_display_titles": question_display_titles,

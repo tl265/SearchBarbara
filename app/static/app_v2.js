@@ -3,9 +3,11 @@ const maxDepthEl = document.getElementById("maxDepth");
 const runBtn = document.getElementById("runBtn");
 const reportBtn = document.getElementById("reportBtn");
 const downloadBtn = document.getElementById("downloadBtn");
+const planningActionBtn = document.getElementById("planningActionBtn");
 const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const abortBtn = document.getElementById("abortBtn");
+const swapBatchCanvasBtn = document.getElementById("swapBatchCanvasBtn");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
@@ -45,6 +47,7 @@ const reportVersionLabel = document.getElementById("reportVersionLabel");
 const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
   ? window.APP_CONFIG
   : {};
+const SWAP_BATCH_LABEL = "Refresh the lineup";
 const SESSION_SYNC_CHANNEL = "searchbarbara:sessions:v1";
 const SESSION_SYNC_STORAGE_KEY = "searchbarbara:sessions:signal";
 const SESSION_RAIL_COLLAPSED_KEY = "sb_sessions_rail_collapsed";
@@ -106,6 +109,7 @@ let selectedContextFileId = "";
 let contextMutationInFlight = false;
 let pendingUploadFiles = [];
 let contextInputLocked = false;
+let planningMutationInFlight = false;
 const contextFetchStateByKey = new Map();
 const contextRefreshDebounceTimerByKey = new Map();
 const contextFetchSeqByKey = new Map();
@@ -113,6 +117,8 @@ const stagedContextBySessionId = new Map();
 const startupParseStateByRunId = new Map();
 let currentContextSource = "session";
 let errorBannerTimer = null;
+let contextAggregateViewBase = null;
+let contextAggregateViewMode = "";
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
 }
@@ -238,6 +244,10 @@ function resetWorkspaceForNewSession() {
   runBtn.textContent = "Start Research";
   runBtn.classList.add("primary");
   runBtn.disabled = false;
+  if (planningActionBtn) {
+    planningActionBtn.textContent = "Start Planning";
+    planningActionBtn.disabled = false;
+  }
   reportBtn.disabled = true;
   setReportButtonVisual(false);
   downloadBtn.setAttribute("title", "Download report");
@@ -251,11 +261,113 @@ function resetWorkspaceForNewSession() {
   reportVersionLabel.textContent = "-/-";
   selectedReportVersionIndex = null;
   currentSnapshot = null;
+  renderPlanningPanel(null);
 }
 
 function isDraftSnapshot(snap) {
   const tree = snap && typeof snap.tree === "object" ? snap.tree : {};
   return !!tree.is_draft;
+}
+
+function planningPhase(snap) {
+  if (!snap || typeof snap !== "object") return "research";
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const phase = String(snap.phase || tree.phase || "research").trim().toLowerCase();
+  return phase === "planning" ? "planning" : "research";
+}
+
+function planningState(snap) {
+  if (!snap || typeof snap !== "object") return "idle";
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const st = String(snap.planning_state || tree.planning_state || "").trim().toLowerCase();
+  return st || "idle";
+}
+
+function planningCandidates(snap) {
+  if (!snap || typeof snap !== "object") return [];
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
+  const rows = Array.isArray(planning.root_children_candidates) ? planning.root_children_candidates : [];
+  return rows.filter((r) => r && typeof r === "object");
+}
+
+function planningDepthBonusLimit(snap) {
+  if (!snap || typeof snap !== "object") return null;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
+  const defaultMax = Number(planning.default_max_depth);
+  const systemMax = Number(planning.system_max_depth);
+  if (!Number.isFinite(defaultMax) || !Number.isFinite(systemMax)) return null;
+  return Math.max(0, Math.floor(systemMax) - Math.floor(defaultMax));
+}
+
+function planningResearchDepthBonusMap(snap) {
+  const out = new Map();
+  if (!snap || typeof snap !== "object") return out;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const seed = tree.planning_seed && typeof tree.planning_seed === "object" ? tree.planning_seed : {};
+  const perBranch = seed.child_branch_max_depths && typeof seed.child_branch_max_depths === "object"
+    ? seed.child_branch_max_depths
+    : {};
+  const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
+  const baselineRaw = Number(planning.default_max_depth);
+  const fallbackRaw = Number(snap.max_depth);
+  const baseline = Number.isFinite(baselineRaw)
+    ? Math.max(1, Math.floor(baselineRaw))
+    : (Number.isFinite(fallbackRaw) ? Math.max(1, Math.floor(fallbackRaw)) : 1);
+
+  for (const [question, branchRaw] of Object.entries(perBranch)) {
+    const key = normalizeQuestionKey(question);
+    const branchMax = Number(branchRaw);
+    if (!key || !Number.isFinite(branchMax)) continue;
+    const branch = Math.max(1, Math.floor(branchMax));
+    const bonus = Math.max(0, branch - baseline);
+    if (bonus <= 0) continue;
+    out.set(key, { bonus, branchMax: branch, baseline });
+  }
+  return out;
+}
+
+function isPlanningSwapInProgress(snap) {
+  if (!snap || typeof snap !== "object") return false;
+  if (planningPhase(snap) !== "planning") return false;
+  const pState = planningState(snap);
+  if (!["running", "idle"].includes(pState)) return false;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const pendingAction = String(tree.planning_pending_action || "").trim().toLowerCase();
+  return pendingAction === "swap_batch" || pendingAction === "swap_batch_retry";
+}
+
+function derivePlanningUiState(phase, pState, opts = {}) {
+  const inPlanning = phase === "planning";
+  const isReview = inPlanning && pState === "review";
+  const isMutating = !!planningMutationInFlight;
+  const swapInProgress = !!opts.swapInProgress;
+  const reportBusy = !!opts.reportBusy;
+  const transitionPending = !!opts.transitionPending;
+  const startRunBusy = !!opts.startRunBusy;
+  const canEdit = isReview && !isMutating;
+  const swapBatchText = (isMutating || swapInProgress) ? "Swapping..." : "Swap Batch";
+  let planningActionText = "Start Planning";
+  let planningActionDisabled = true;
+
+  if (!inPlanning) {
+    planningActionDisabled = true;
+  } else if (isReview) {
+    planningActionText = isMutating ? "Working..." : "Go for a full run";
+    planningActionDisabled = !!(reportBusy || transitionPending || isMutating || startRunBusy);
+  } else if (pState === "running" || pState === "idle") {
+    planningActionText = "Planning...";
+    planningActionDisabled = true;
+  }
+
+  return {
+    inPlanning,
+    canEdit,
+    swapBatchText,
+    planningActionText,
+    planningActionDisabled,
+  };
 }
 
 function isReportGeneratingForRun(runId) {
@@ -397,6 +509,8 @@ function clearContextPane(msg = "No context files uploaded.") {
   currentContextSet = null;
   currentContextSource = "session";
   selectedContextFileId = "";
+  contextAggregateViewBase = null;
+  contextAggregateViewMode = "";
   contextMetaEl.textContent = msg;
   contextDiffBannerEl.textContent = "";
   contextFilesEl.innerHTML = `<div class="muted">No files.</div>`;
@@ -591,6 +705,149 @@ function cloneJson(v) {
   }
 }
 
+function buildContextAggregateView(basePayload, mode = "digest") {
+  const payload = basePayload && typeof basePayload === "object" ? basePayload : {};
+  const viewMode = String(mode || "digest");
+  return viewMode === "context_slice"
+    ? { context_slice: payload }
+    : { digest: payload };
+}
+
+function renderContextAggregateView(basePayload, mode = "digest") {
+  if (!contextAggregateDigestEl) return;
+  contextAggregateViewBase = cloneJson(basePayload && typeof basePayload === "object" ? basePayload : {});
+  contextAggregateViewMode = String(mode || "digest");
+  contextAggregateDigestEl.textContent = JSON.stringify(
+    buildContextAggregateView(contextAggregateViewBase, contextAggregateViewMode),
+    null,
+    2
+  );
+}
+
+function refreshContextAggregateViewFromSnapshot() {
+  if (!contextAggregateDigestEl) return;
+  if (!contextAggregateViewBase || typeof contextAggregateViewBase !== "object") return;
+  contextAggregateDigestEl.textContent = JSON.stringify(
+    buildContextAggregateView(contextAggregateViewBase, contextAggregateViewMode || "digest"),
+    null,
+    2
+  );
+}
+
+function renderPlanningPanel(snap) {
+  const phase = planningPhase(snap);
+  const pState = planningState(snap);
+  const swapInProgress = isPlanningSwapInProgress(snap);
+  const planningUi = derivePlanningUiState(phase, pState, { swapInProgress });
+  if (swapBatchCanvasBtn) {
+    swapBatchCanvasBtn.classList.toggle("hidden", !planningUi.inPlanning);
+    swapBatchCanvasBtn.disabled = !planningUi.canEdit;
+    swapBatchCanvasBtn.setAttribute("title", SWAP_BATCH_LABEL);
+    swapBatchCanvasBtn.setAttribute("aria-label", SWAP_BATCH_LABEL);
+  }
+}
+
+function refreshPlanningUi(snap) {
+  renderPlanningPanel(snap);
+  if (snap && typeof snap === "object" && snap.tree && typeof snap.tree === "object") {
+    renderCanvas(snap.tree);
+  }
+  refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap);
+}
+
+async function planningSwapBatch() {
+  if (!currentRunId || planningMutationInFlight) return;
+  planningMutationInFlight = true;
+  refreshPlanningUi(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/planning/swap_batch${qs}`, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey("planning_swap") },
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Swap batch failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    refreshPlanningUi(currentSnapshot);
+  }
+}
+
+async function planningCommit() {
+  if (!currentRunId || planningMutationInFlight) return;
+  planningMutationInFlight = true;
+  refreshPlanningUi(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/planning/commit${qs}`, {
+      method: "POST",
+      headers: { "Idempotency-Key": newIdempotencyKey("planning_commit") },
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Start research failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    refreshPlanningUi(currentSnapshot);
+  }
+}
+
+async function planningSetPin(nodeId, pin) {
+  if (!currentRunId || planningMutationInFlight) return;
+  const nid = String(nodeId || "").trim();
+  if (!nid) return;
+  planningMutationInFlight = true;
+  refreshPlanningUi(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const method = pin ? "POST" : "DELETE";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/nodes/${encodeURIComponent(nid)}/pin${qs}`, {
+      method,
+      headers: { "Idempotency-Key": newIdempotencyKey(pin ? "planning_pin" : "planning_unpin") },
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `${pin ? "Pin" : "Unpin"} failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    refreshPlanningUi(currentSnapshot);
+  }
+}
+
+async function planningDepthPlus(nodeId) {
+  if (!currentRunId || planningMutationInFlight) return;
+  const nid = String(nodeId || "").trim();
+  if (!nid) return;
+  planningMutationInFlight = true;
+  refreshPlanningUi(currentSnapshot);
+  try {
+    const ev = currentExpectedVersion();
+    const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const rsp = await fetch(`/api/runs/${encodeURIComponent(String(currentRunId))}/nodes/${encodeURIComponent(nid)}/depth_bonus${qs}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": newIdempotencyKey("planning_depth"),
+      },
+      body: JSON.stringify({ increment: 1 }),
+    });
+    if (!rsp.ok) {
+      throw new Error(await responseDetail(rsp, `Depth update failed: ${rsp.status}`));
+    }
+    await fetchSnapshot(currentRunId);
+  } finally {
+    planningMutationInFlight = false;
+    refreshPlanningUi(currentSnapshot);
+  }
+}
+
 function currentStartupPhase() {
   const tree = currentSnapshot && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
   return String(tree.startup_phase || "").trim().toLowerCase();
@@ -668,6 +925,8 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
   const set = currentContextSet && typeof currentContextSet === "object" ? currentContextSet : {};
   const files = Array.isArray(set.files) ? set.files.filter((f) => f && typeof f === "object") : [];
   if (files.length === 0) {
+    contextAggregateViewBase = null;
+    contextAggregateViewMode = "";
     contextAggregateDigestEl.textContent = "";
     return;
   }
@@ -685,16 +944,17 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
       statusLower !== "failed" &&
       !err
     ) {
+      contextAggregateViewBase = null;
+      contextAggregateViewMode = "";
       contextAggregateDigestEl.textContent = "";
       return;
     }
-    contextAggregateDigestEl.textContent = JSON.stringify(
+    renderContextAggregateView(
       {
         status: status || "missing",
         error: err || `${label} not ready (${statusCode}).`,
       },
-      null,
-      2
+      "digest"
     );
   };
 
@@ -711,7 +971,7 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
     }
     const data = await rsp.json();
     const digest = data && typeof data === "object" ? data.digest : null;
-    contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+    renderContextAggregateView(digest || {}, "digest");
     return;
   }
 
@@ -722,7 +982,7 @@ async function fetchContextAggregateDigest(runIdOverride = "", workspaceIdOverri
   }
   const data = await rsp.json();
   const digest = data && typeof data === "object" ? data.digest : null;
-  contextAggregateDigestEl.textContent = JSON.stringify(digest || {}, null, 2);
+  renderContextAggregateView(digest || {}, "digest");
 }
 
 async function fetchContextFileDigest(fileId, runIdOverride = "", workspaceIdOverride = "") {
@@ -1476,6 +1736,19 @@ function restoreAndTrackDetailState() {
 function eventNarration(ev) {
   const et = String(ev.event_type || "");
   const p = (ev.payload && typeof ev.payload === "object") ? ev.payload : {};
+  if (et === "planning_started") {
+    const action = String(p.action || "").trim().toLowerCase();
+    if (action === "swap_batch" || action === "swap_batch_retry") {
+      return "Swapping planning batch. Current candidates remain visible until replacement is ready.";
+    }
+    return "Planning started for root decomposition.";
+  }
+  if (et === "planning_review_ready") return `Planning ready: ${Array.isArray(p.root_children_candidates) ? p.root_children_candidates.length : 0} root child candidates.`;
+  if (et === "planning_pin_updated") return "Updated pinned planning branches.";
+  if (et === "planning_depth_bonus_updated") return "Updated planning branch depth bonus.";
+  if (et === "planning_committed") return "Planning committed. Starting formal research.";
+  if (et === "planning_failed") return `Planning failed: ${p.error || "unknown error"}`;
+  if (et === "planning_aborted") return "Planning stopped by user request.";
   if (et === "run_started") return "Research started.";
   if (et === "context_binding_parsing_started") return `Parsing uploaded context files (${Number(p.files_total || 0)} total)...`;
   if (et === "context_binding_parsing_file_completed") return `Parsed context file ${Number(p.index || 0)}/${Number(p.total || 0)}: ${p.filename || ""}`;
@@ -1814,6 +2087,20 @@ function renderCanvas(tree) {
     canvasEl.innerHTML = "<em>No run yet.</em>";
     return;
   }
+  const phase = planningPhase(currentSnapshot || { tree });
+  const pState = planningState(currentSnapshot || { tree });
+  const isPlanningView = phase === "planning";
+  const swapInProgress = isPlanningSwapInProgress(currentSnapshot || { tree });
+  const planningSwapDimAll = isPlanningView && swapInProgress;
+  const bonusCap = planningDepthBonusLimit(currentSnapshot || { tree });
+  const researchDepthBonusByQuestion = planningResearchDepthBonusMap(currentSnapshot || { tree });
+  const planningUi = derivePlanningUiState(phase, pState);
+  const planningRows = planningCandidates(currentSnapshot || { tree });
+  const planningRowByNodeId = new Map();
+  for (const row of planningRows) {
+    const nid = String((row && row.node_id) || "").trim();
+    if (nid) planningRowByNodeId.set(nid, row);
+  }
   const renderGraph = (questions, scopeKey, passNo = null) => {
     const byDepth = buildQuestionsByDepth(questions);
     const nodeIdMap = buildNodeIdMap(byDepth);
@@ -1849,7 +2136,9 @@ function renderCanvas(tree) {
           visualCls === "state-visited"
             ? (solvedStatuses.has(st) ? "visited-solved" : (unresolvedStatuses.has(st) ? "visited-unresolved" : "visited-neutral"))
             : "";
-        const dim = visualCls === "state-planned" ? "dimmed" : "";
+        const dim = planningSwapDimAll
+          ? "dimmed"
+          : ((visualCls === "state-planned" && !isPlanningView) ? "dimmed" : "");
         const parentCls = q.parent ? "has-parent" : "";
         const stLower = st.toLowerCase();
         const isRunning = ["running", "researching", "decomposing"].includes(stLower);
@@ -1872,6 +2161,29 @@ function renderCanvas(tree) {
         const fullQuestion = String(q.sub_question || "").trim();
         const displayTitle = String(q.display_title || fullQuestion || "").trim();
         html += `<p class="node-title" title="${esc(fullQuestion)}">${esc(displayTitle)}</p>`;
+        const researchDepthBonus = !isPlanningView
+          ? researchDepthBonusByQuestion.get(normalizeQuestionKey(q.sub_question || ""))
+          : null;
+        const planningRow = planningUi.inPlanning ? planningRowByNodeId.get(pathId) : null;
+        if (planningRow) {
+          const pinned = !!planningRow.is_pinned;
+          const bonus = Math.max(0, Number(planningRow.pin_depth_bonus || 0));
+          const canEdit = !!planningUi.canEdit;
+          html += `<div class="planning-node-actions">`;
+          html += `<button type="button" class="planning-node-icon-btn ${pinned ? "is-active" : ""}" data-planning-action="${pinned ? "unpin" : "pin"}" data-node-id="${esc(pathId)}" ${canEdit ? "" : "disabled"} title="${pinned ? "Unpin" : "Pin"}" aria-label="${pinned ? "Unpin" : "Pin"}">`;
+          html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8l1 4h-2l-1 5 2 2v1H8v-1l2-2-1-5H7l1-4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 15v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+          html += `</button>`;
+          html += `<button type="button" class="planning-node-icon-btn" data-planning-action="depth" data-node-id="${esc(pathId)}" ${(canEdit && pinned) ? "" : "disabled"} title="Depth +1" aria-label="Depth +1">`;
+          html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
+          html += `</button>`;
+          const capTail = Number.isFinite(bonusCap) ? ` (<=${Math.max(0, Number(bonusCap))})` : "";
+          html += `<span class="planning-node-depth">depth bonus +${bonus}${esc(capTail)}</span>`;
+          html += `</div>`;
+        } else if (researchDepthBonus && Number.isFinite(researchDepthBonus.bonus) && researchDepthBonus.bonus > 0) {
+          html += `<div class="planning-node-actions">`;
+          html += `<span class="planning-node-depth planning-node-depth-readonly">depth bonus +${Math.max(0, Number(researchDepthBonus.bonus || 0))}</span>`;
+          html += `</div>`;
+        }
         if (q.parent) {
           html += `<p class="node-parent"><span class="parent-link">from</span> ${esc(q.parent)}</p>`;
         }
@@ -2040,8 +2352,70 @@ function isAbortPendingSnapshot(snap) {
   return !!tree.abort_pending;
 }
 
+function setPrimaryAndPlanningActionButtons({
+  isNewSessionWorkspace,
+  reportBusy,
+  transitionPending,
+  phase,
+  pState,
+}) {
+  runBtn.textContent = "Start Research";
+  runBtn.classList.add("primary");
+  runBtn.disabled = !!(!isNewSessionWorkspace || reportBusy || startRunInFlight);
+  if (!planningActionBtn) return;
+  if (!currentRunId) {
+    planningActionBtn.textContent = "Start Planning";
+    planningActionBtn.disabled = !!(reportBusy || startRunInFlight);
+    return;
+  }
+  const planningUi = derivePlanningUiState(phase, pState, {
+    reportBusy,
+    transitionPending,
+    startRunBusy: startRunInFlight,
+  });
+  if (planningUi.inPlanning) {
+    planningActionBtn.textContent = planningUi.planningActionText;
+    planningActionBtn.disabled = planningUi.planningActionDisabled;
+    return;
+  }
+  planningActionBtn.textContent = "Start Planning";
+  planningActionBtn.disabled = true;
+}
+
+function refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap) {
+  if (!snap || typeof snap !== "object") return;
+  const sid = String(snap.session_id || snap.run_id || "").trim();
+  const isDraft = isDraftSnapshot(snap);
+  const executionState = String(snap.execution_state || "").toLowerCase();
+  const researchState = String(snap.research_state || "").toLowerCase();
+  const paused = researchState ? researchState === "paused" : executionState === "paused";
+  const terminal = researchState
+    ? researchState === "terminal"
+    : ["completed", "aborted", "failed"].includes(executionState);
+  const pausePending = pauseRequested && !paused && !terminal;
+  const abortPending = abortRequested || isAbortPendingSnapshot(snap);
+  const transitionPending = pausePending || abortPending;
+  const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+  const reportState = String(snap.report_state || "").toLowerCase();
+  const reportPhase = String(
+    snap.report_status || (snap.tree && snap.tree.report_status) || "pending"
+  ).toLowerCase();
+  const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
+  const isNewSessionWorkspace = !currentRunId || isDraft;
+  const phase = planningPhase(snap);
+  const pState = planningState(snap);
+  setPrimaryAndPlanningActionButtons({
+    isNewSessionWorkspace,
+    reportBusy,
+    transitionPending,
+    phase,
+    pState,
+  });
+}
+
 function applySnapshot(snap) {
   currentSnapshot = snap;
+  refreshContextAggregateViewFromSnapshot();
   const sid = String(snap.session_id || snap.run_id || "").trim();
   setContextEnabled(!!sid);
   if (contextDigestPaneEl) {
@@ -2141,9 +2515,16 @@ function applySnapshot(snap) {
   const reportPhase = String(snap.report_status || (snap.tree && snap.tree.report_status) || "pending").toLowerCase();
   const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
   const isNewSessionWorkspace = !currentRunId || isDraft;
-  runBtn.textContent = "Start Research";
-  runBtn.classList.add("primary");
-  runBtn.disabled = !isNewSessionWorkspace || reportBusy;
+  const phase = planningPhase(snap);
+  const pState = planningState(snap);
+  const planningAbortable = phase === "planning" && ["running", "review"].includes(pState);
+  setPrimaryAndPlanningActionButtons({
+    isNewSessionWorkspace,
+    reportBusy,
+    transitionPending,
+    phase,
+    pState,
+  });
   if (transitionPending) {
     pauseBtn.disabled = true;
     resumeBtn.disabled = true;
@@ -2151,7 +2532,7 @@ function applySnapshot(snap) {
   } else {
     pauseBtn.disabled = !(running && !reportBusy);
     resumeBtn.disabled = !(paused && !reportBusy);
-    abortBtn.disabled = !((running || paused) && !reportBusy);
+    abortBtn.disabled = !((running || paused || planningAbortable) && !reportBusy);
   }
   abortBtn.textContent = abortPending ? "Stopping..." : "Abort";
 
@@ -2167,6 +2548,7 @@ function applySnapshot(snap) {
   }
   reportPrevBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx > 1);
   reportNextBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx < versions.length);
+  renderPlanningPanel(snap);
   renderSessions();
 }
 
@@ -2259,6 +2641,8 @@ function connectEvents(runId) {
   };
 
   const events = [
+    "planning_started", "planning_review_ready", "planning_pin_updated", "planning_depth_bonus_updated",
+    "planning_committed", "planning_failed", "planning_aborted",
     "run_started", "context_binding_started", "context_binding_completed", "context_binding_failed",
     "context_binding_parsing_started", "context_binding_parsing_file_completed", "context_binding_parsing_completed", "context_for_node_ready",
     "plan_created", "round_started", "sub_question_started", "queries_generated",
@@ -2308,7 +2692,7 @@ function connectEvents(runId) {
             ? parsed.payload.context_slice
             : null;
           if (ctx && typeof ctx === "object") {
-            contextAggregateDigestEl.textContent = JSON.stringify(ctx, null, 2);
+            renderContextAggregateView(ctx, "context_slice");
           }
         }
         if (parsed.event_type === "report_generation_completed" || parsed.event_type === "report_generation_failed") {
@@ -2320,7 +2704,13 @@ function connectEvents(runId) {
         if (parsed.event_type === "run_abort_requested" || parsed.event_type === "abort_requested") {
           abortRequested = true;
         }
-        if (parsed.event_type === "run_aborted" || parsed.event_type === "run_completed" || parsed.event_type === "run_failed") {
+        if (
+          parsed.event_type === "run_aborted"
+          || parsed.event_type === "run_completed"
+          || parsed.event_type === "run_failed"
+          || parsed.event_type === "planning_aborted"
+          || parsed.event_type === "planning_failed"
+        ) {
           clearStartupParseState(runId);
           pauseRequested = false;
           abortRequested = false;
@@ -2333,7 +2723,7 @@ function connectEvents(runId) {
   }
 }
 
-async function startRun(idempotencyKey) {
+async function startRun(idempotencyKey, startMode = "research") {
   const task = taskEl.value.trim();
   if (!task) {
     showError("Task is required.");
@@ -2361,6 +2751,7 @@ async function startRun(idempotencyKey) {
         task,
         max_depth: Number(maxDepthEl.value || DEFAULT_MAX_DEPTH),
         results_per_query: DEFAULT_RESULTS_PER_QUERY,
+        start_mode: String(startMode || "research"),
       }),
     });
     if (!rsp.ok) {
@@ -2503,6 +2894,8 @@ async function uploadContextFiles(files) {
   pendingUploadFiles = uploadedNames;
   renderContextPane();
   if (contextAggregateDigestEl) {
+    contextAggregateViewBase = null;
+    contextAggregateViewMode = "";
     contextAggregateDigestEl.textContent = `Parsing uploaded files, please wait...\n- ${uploadedNames.join("\n- ")}`;
   }
   setContextBusy(true);
@@ -2632,23 +3025,64 @@ runBtn.addEventListener("click", async () => {
   }
   startRunInFlight = true;
   runBtn.disabled = true;
+  if (planningActionBtn) {
+    planningActionBtn.disabled = true;
+  }
   try {
-    await startRun(newIdempotencyKey("start_run"));
+    await startRun(newIdempotencyKey("start_research"), "research");
   } catch (err) {
     showError(err.message || String(err));
   } finally {
     startRunInFlight = false;
     if (!currentRunId) {
       runBtn.disabled = false;
+      if (planningActionBtn) {
+        planningActionBtn.disabled = false;
+      }
     }
   }
 });
+
+if (planningActionBtn) {
+  planningActionBtn.addEventListener("click", async () => {
+    const phase = planningPhase(currentSnapshot);
+    const pState = planningState(currentSnapshot);
+    if (currentRunId && phase === "planning" && pState === "review") {
+      try {
+        await planningCommit();
+      } catch (err) {
+        showError(err.message || String(err));
+      }
+      return;
+    }
+    if (currentRunId || startRunInFlight) {
+      return;
+    }
+    startRunInFlight = true;
+    runBtn.disabled = true;
+    planningActionBtn.disabled = true;
+    try {
+      await startRun(newIdempotencyKey("start_planning"), "planning");
+    } catch (err) {
+      showError(err.message || String(err));
+    } finally {
+      startRunInFlight = false;
+      if (!currentRunId) {
+        runBtn.disabled = false;
+        planningActionBtn.disabled = false;
+      }
+    }
+  });
+}
 
 reportBtn.addEventListener("click", async () => {
   const reportRunId = String(currentRunId || "").trim();
   if (!reportRunId || isReportGeneratingForRun(reportRunId)) return;
   reportGeneratingRunIds.add(reportRunId);
   runBtn.disabled = true;
+  if (planningActionBtn) {
+    planningActionBtn.disabled = true;
+  }
   reportBtn.disabled = true;
   setReportButtonVisual(true);
   showError("");
@@ -2707,6 +3141,37 @@ resumeBtn.addEventListener("click", async () => {
 abortBtn.addEventListener("click", async () => {
   try {
     await abortRun();
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+});
+
+if (swapBatchCanvasBtn) {
+  swapBatchCanvasBtn.addEventListener("click", async () => {
+    try {
+      await planningSwapBatch();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+  });
+}
+
+canvasEl.addEventListener("click", async (evt) => {
+  const target = evt && evt.target ? evt.target : null;
+  if (!target || typeof target.closest !== "function") return;
+  const btn = target.closest("button[data-planning-action][data-node-id]");
+  if (!btn) return;
+  const action = String(btn.getAttribute("data-planning-action") || "").trim();
+  const nodeId = String(btn.getAttribute("data-node-id") || "").trim();
+  if (!action || !nodeId) return;
+  try {
+    if (action === "pin") {
+      await planningSetPin(nodeId, true);
+    } else if (action === "unpin") {
+      await planningSetPin(nodeId, false);
+    } else if (action === "depth") {
+      await planningDepthPlus(nodeId);
+    }
   } catch (err) {
     showError(err.message || String(err));
   }

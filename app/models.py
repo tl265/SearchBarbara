@@ -7,6 +7,15 @@ from pydantic import BaseModel, Field
 RunStatus = Literal["queued", "running", "completed", "failed"]
 ExecutionState = Literal["idle", "running", "paused", "completed", "failed", "aborted"]
 ReportTriggerType = Literal["auto_natural_stop", "manual", "manual_legacy"]
+RunPhase = Literal["planning", "research"]
+PlanningState = Literal[
+    "idle",
+    "running",
+    "review",
+    "committed",
+    "failed",
+    "aborted",
+]
 
 
 class CreateRunRequest(BaseModel):
@@ -26,6 +35,11 @@ class StartFromWorkspaceRequest(BaseModel):
     results_per_query: int = Field(default=3, ge=1)
     model: str = "gpt-4.1"
     report_model: str = "gpt-5.2"
+    start_mode: Literal["research", "planning"] = "planning"
+
+
+class PlanningDepthBonusRequest(BaseModel):
+    increment: int = Field(default=1, ge=1, le=4)
 
 
 class CreateRunResponse(BaseModel):
@@ -40,6 +54,8 @@ class RunSnapshotResponse(BaseModel):
     status: RunStatus
     version: int = 1
     execution_state: Optional[ExecutionState] = None
+    phase: Optional[RunPhase] = None
+    planning_state: Optional[PlanningState] = None
     research_state: Optional[str] = None
     report_state: Optional[str] = None
     terminal_reason: Optional[str] = None
@@ -85,6 +101,8 @@ class RunState(BaseModel):
     status: RunStatus
     version: int = 1
     execution_state: ExecutionState = "idle"
+    phase: RunPhase = "research"
+    planning_state: PlanningState = "idle"
     research_state: Optional[str] = None
     report_state: Optional[str] = None
     terminal_reason: Optional[str] = None
@@ -122,6 +140,8 @@ class SessionSummary(BaseModel):
     status: RunStatus
     version: int = 1
     execution_state: ExecutionState
+    phase: Optional[RunPhase] = None
+    planning_state: Optional[PlanningState] = None
     research_state: Optional[str] = None
     report_state: Optional[str] = None
     created_at: datetime

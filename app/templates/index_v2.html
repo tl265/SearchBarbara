@@ -81,10 +81,11 @@
       <details>
         <summary>Advanced controls</summary>
         <div class="dock-controls advanced-controls-row">
-          <button id="pauseBtn" type="button" disabled>Pause</button>
-          <button id="resumeBtn" type="button" disabled>Resume</button>
+          <button id="planningActionBtn" type="button">Start Planning</button>
+          <button id="pauseBtn" class="debug-only-control" type="button" disabled>Pause</button>
+          <button id="resumeBtn" class="debug-only-control" type="button" disabled>Resume</button>
           <button id="abortBtn" type="button" disabled>Abort</button>
-          <label class="inline-number-control">Max depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
+          <label class="inline-number-control">Baseline depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
         </div>
         <section class="context context-in-advanced">
           <div class="section-head">
@@ -104,7 +105,7 @@
               <div id="contextFiles" class="context-files-list"></div>
             </div>
             <div class="context-digest-pane">
-              <h3>Aggregated File Digest</h3>
+              <h3>User Context Digest</h3>
               <pre id="contextAggregateDigest" class="usage"></pre>
             </div>
           </div>
@@ -118,7 +119,23 @@
     <main class="content-grid">
       <section class="canvas card">
         <div class="section-head">
-          <h2>Research Canvas</h2>
+          <div class="canvas-title-group">
+            <h2>Research Canvas</h2>
+            <button
+              id="swapBatchCanvasBtn"
+              class="icon-btn hidden"
+              type="button"
+              aria-label="Refresh the lineup"
+              title="Refresh the lineup"
+            >
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M14 4l3 3-3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M20 17H7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M10 14l-3 3 3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
           <div class="canvas-toolbar">
             <span id="canvasHint" class="muted">Auto-fit</span>
             <button id="zoomOutBtn" type="button">-</button>
