@@ -2430,10 +2430,15 @@ class RunManager:
             state.status = "running"
             state.execution_state = "running"
             if isinstance(tree, dict):
+                action = str(payload.get("action", "") or "").strip().lower()
+                is_swap_batch = action in {"swap_batch", "swap_batch_retry"}
                 tree["phase"] = "planning"
                 tree["planning_state"] = "running"
-                tree["rounds"] = []
-                tree.pop("final_sufficiency", None)
+                # Preserve currently visible planning rounds while a swap batch is
+                # being prepared, then atomically replace on planning_review_ready.
+                if not is_swap_batch:
+                    tree["rounds"] = []
+                    tree.pop("final_sufficiency", None)
             return
         if et == "planning_review_ready":
             state.status = "queued"

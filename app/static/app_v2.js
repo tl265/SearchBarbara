@@ -7,10 +7,9 @@ const planningActionBtn = document.getElementById("planningActionBtn");
 const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const abortBtn = document.getElementById("abortBtn");
-const swapBatchBtn = document.getElementById("swapBatchBtn");
+const swapBatchCanvasBtn = document.getElementById("swapBatchCanvasBtn");
 const planningPanelEl = document.getElementById("planningPanel");
 const planningMetaEl = document.getElementById("planningMeta");
-const planningChildrenEl = document.getElementById("planningChildren");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
@@ -293,15 +292,63 @@ function planningCandidates(snap) {
   return rows.filter((r) => r && typeof r === "object");
 }
 
+function planningDepthBonusLimit(snap) {
+  if (!snap || typeof snap !== "object") return null;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
+  const defaultMax = Number(planning.default_max_depth);
+  const systemMax = Number(planning.system_max_depth);
+  if (!Number.isFinite(defaultMax) || !Number.isFinite(systemMax)) return null;
+  return Math.max(0, Math.floor(systemMax) - Math.floor(defaultMax));
+}
+
+function planningResearchDepthBonusMap(snap) {
+  const out = new Map();
+  if (!snap || typeof snap !== "object") return out;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const seed = tree.planning_seed && typeof tree.planning_seed === "object" ? tree.planning_seed : {};
+  const perBranch = seed.child_branch_max_depths && typeof seed.child_branch_max_depths === "object"
+    ? seed.child_branch_max_depths
+    : {};
+  const planning = tree.planning && typeof tree.planning === "object" ? tree.planning : {};
+  const baselineRaw = Number(planning.default_max_depth);
+  const fallbackRaw = Number(snap.max_depth);
+  const baseline = Number.isFinite(baselineRaw)
+    ? Math.max(1, Math.floor(baselineRaw))
+    : (Number.isFinite(fallbackRaw) ? Math.max(1, Math.floor(fallbackRaw)) : 1);
+
+  for (const [question, branchRaw] of Object.entries(perBranch)) {
+    const key = normalizeQuestionKey(question);
+    const branchMax = Number(branchRaw);
+    if (!key || !Number.isFinite(branchMax)) continue;
+    const branch = Math.max(1, Math.floor(branchMax));
+    const bonus = Math.max(0, branch - baseline);
+    if (bonus <= 0) continue;
+    out.set(key, { bonus, branchMax: branch, baseline });
+  }
+  return out;
+}
+
+function isPlanningSwapInProgress(snap) {
+  if (!snap || typeof snap !== "object") return false;
+  if (planningPhase(snap) !== "planning") return false;
+  const pState = planningState(snap);
+  if (!["running", "idle"].includes(pState)) return false;
+  const tree = snap.tree && typeof snap.tree === "object" ? snap.tree : {};
+  const pendingAction = String(tree.planning_pending_action || "").trim().toLowerCase();
+  return pendingAction === "swap_batch" || pendingAction === "swap_batch_retry";
+}
+
 function derivePlanningUiState(phase, pState, opts = {}) {
   const inPlanning = phase === "planning";
   const isReview = inPlanning && pState === "review";
   const isMutating = !!planningMutationInFlight;
+  const swapInProgress = !!opts.swapInProgress;
   const reportBusy = !!opts.reportBusy;
   const transitionPending = !!opts.transitionPending;
   const startRunBusy = !!opts.startRunBusy;
   const canEdit = isReview && !isMutating;
-  const swapBatchText = isMutating ? "Working..." : "Swap Batch";
+  const swapBatchText = (isMutating || swapInProgress) ? "Swapping..." : "Swap Batch";
   let planningActionText = "Start Planning";
   let planningActionDisabled = true;
 
@@ -728,50 +775,44 @@ function refreshContextAggregateViewFromSnapshot() {
 }
 
 function renderPlanningPanel(snap) {
-  if (!planningPanelEl || !planningMetaEl || !planningChildrenEl) return;
+  if (!planningPanelEl || !planningMetaEl) return;
   const phase = planningPhase(snap);
   const pState = planningState(snap);
-  const planningUi = derivePlanningUiState(phase, pState);
+  const bonusCap = planningDepthBonusLimit(snap);
+  const bonusHint = Number.isFinite(bonusCap) ? `Depth bonus (<=${bonusCap}). ` : "Depth bonus. ";
+  const swapInProgress = isPlanningSwapInProgress(snap);
+  const planningUi = derivePlanningUiState(phase, pState, { swapInProgress });
   const rows = planningCandidates(snap);
-  if (swapBatchBtn) {
-    swapBatchBtn.disabled = !planningUi.canEdit;
-    swapBatchBtn.textContent = planningUi.swapBatchText;
+  const pinnedCount = rows.filter((r) => !!r.is_pinned).length;
+  if (swapBatchCanvasBtn) {
+    swapBatchCanvasBtn.classList.toggle("hidden", !planningUi.inPlanning);
+    swapBatchCanvasBtn.disabled = !planningUi.canEdit;
+    swapBatchCanvasBtn.setAttribute("title", planningUi.swapBatchText);
+    swapBatchCanvasBtn.setAttribute("aria-label", planningUi.swapBatchText);
   }
   if (!planningUi.inPlanning) {
     planningPanelEl.classList.add("hidden");
     planningMetaEl.textContent = "Planning not started.";
-    planningChildrenEl.innerHTML = "";
     return;
   }
   planningPanelEl.classList.remove("hidden");
-  const canEdit = planningUi.canEdit;
-  planningMetaEl.textContent = `State: ${shortStatus(`planning_${pState}`)} · Pins are merged with uploaded files for decomposition.`;
-  if (!rows.length) {
-    planningChildrenEl.innerHTML = `<div class="muted">No root child candidates yet.</div>`;
+  const stateLabel = shortStatus(`planning_${pState}`);
+  if (swapInProgress) {
+    planningMetaEl.textContent =
+      `Swapping batch... Current candidates stay visible until replacement is ready. ` +
+      `State: ${stateLabel} · ${pinnedCount}/${rows.length} pinned. ${bonusHint}`;
     return;
   }
-  planningChildrenEl.innerHTML = rows.map((r) => {
-    const nodeId = String(r.node_id || "").trim();
-    const label = String(r.display_title || r.sub_question || "").trim();
-    const full = String(r.sub_question || "").trim();
-    const pinned = !!r.is_pinned;
-    const bonus = Math.max(0, Number(r.pin_depth_bonus || 0));
-    return `<div class="context-file-row" data-node-id="${esc(nodeId)}">
-      <div class="context-file-main">
-        <div class="context-file-name">${esc(label || full || nodeId)}</div>
-        <span class="context-chip ${pinned ? "ready" : "stale"}">${pinned ? "pinned" : "candidate"}</span>
-      </div>
-      <div class="context-file-meta">${esc(full || label)} · depth bonus +${bonus}</div>
-      <div class="context-file-actions">
-        <button type="button" data-action="${pinned ? "unpin" : "pin"}" data-node-id="${esc(nodeId)}" ${canEdit ? "" : "disabled"}>${pinned ? "Unpin" : "Pin"}</button>
-        <button type="button" data-action="depth" data-node-id="${esc(nodeId)}" ${canEdit && pinned ? "" : "disabled"}>Depth +1</button>
-      </div>
-    </div>`;
-  }).join("");
+  planningMetaEl.textContent =
+    `State: ${stateLabel} · ` +
+    `${pinnedCount}/${rows.length} pinned. ${bonusHint}Use node-card icons in Research Canvas to pin and adjust depth.`;
 }
 
 function refreshPlanningUi(snap) {
   renderPlanningPanel(snap);
+  if (snap && typeof snap === "object" && snap.tree && typeof snap.tree === "object") {
+    renderCanvas(snap.tree);
+  }
   refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap);
 }
 
@@ -1756,7 +1797,13 @@ function restoreAndTrackDetailState() {
 function eventNarration(ev) {
   const et = String(ev.event_type || "");
   const p = (ev.payload && typeof ev.payload === "object") ? ev.payload : {};
-  if (et === "planning_started") return "Planning started for root decomposition.";
+  if (et === "planning_started") {
+    const action = String(p.action || "").trim().toLowerCase();
+    if (action === "swap_batch" || action === "swap_batch_retry") {
+      return "Swapping planning batch. Current candidates remain visible until replacement is ready.";
+    }
+    return "Planning started for root decomposition.";
+  }
   if (et === "planning_review_ready") return `Planning ready: ${Array.isArray(p.root_children_candidates) ? p.root_children_candidates.length : 0} root child candidates.`;
   if (et === "planning_pin_updated") return "Updated pinned planning branches.";
   if (et === "planning_depth_bonus_updated") return "Updated planning branch depth bonus.";
@@ -2101,6 +2148,20 @@ function renderCanvas(tree) {
     canvasEl.innerHTML = "<em>No run yet.</em>";
     return;
   }
+  const phase = planningPhase(currentSnapshot || { tree });
+  const pState = planningState(currentSnapshot || { tree });
+  const isPlanningView = phase === "planning";
+  const swapInProgress = isPlanningSwapInProgress(currentSnapshot || { tree });
+  const planningSwapDimAll = isPlanningView && swapInProgress;
+  const bonusCap = planningDepthBonusLimit(currentSnapshot || { tree });
+  const researchDepthBonusByQuestion = planningResearchDepthBonusMap(currentSnapshot || { tree });
+  const planningUi = derivePlanningUiState(phase, pState);
+  const planningRows = planningCandidates(currentSnapshot || { tree });
+  const planningRowByNodeId = new Map();
+  for (const row of planningRows) {
+    const nid = String((row && row.node_id) || "").trim();
+    if (nid) planningRowByNodeId.set(nid, row);
+  }
   const renderGraph = (questions, scopeKey, passNo = null) => {
     const byDepth = buildQuestionsByDepth(questions);
     const nodeIdMap = buildNodeIdMap(byDepth);
@@ -2136,7 +2197,9 @@ function renderCanvas(tree) {
           visualCls === "state-visited"
             ? (solvedStatuses.has(st) ? "visited-solved" : (unresolvedStatuses.has(st) ? "visited-unresolved" : "visited-neutral"))
             : "";
-        const dim = visualCls === "state-planned" ? "dimmed" : "";
+        const dim = planningSwapDimAll
+          ? "dimmed"
+          : ((visualCls === "state-planned" && !isPlanningView) ? "dimmed" : "");
         const parentCls = q.parent ? "has-parent" : "";
         const stLower = st.toLowerCase();
         const isRunning = ["running", "researching", "decomposing"].includes(stLower);
@@ -2159,6 +2222,29 @@ function renderCanvas(tree) {
         const fullQuestion = String(q.sub_question || "").trim();
         const displayTitle = String(q.display_title || fullQuestion || "").trim();
         html += `<p class="node-title" title="${esc(fullQuestion)}">${esc(displayTitle)}</p>`;
+        const researchDepthBonus = !isPlanningView
+          ? researchDepthBonusByQuestion.get(normalizeQuestionKey(q.sub_question || ""))
+          : null;
+        const planningRow = planningUi.inPlanning ? planningRowByNodeId.get(pathId) : null;
+        if (planningRow) {
+          const pinned = !!planningRow.is_pinned;
+          const bonus = Math.max(0, Number(planningRow.pin_depth_bonus || 0));
+          const canEdit = !!planningUi.canEdit;
+          html += `<div class="planning-node-actions">`;
+          html += `<button type="button" class="planning-node-icon-btn ${pinned ? "is-active" : ""}" data-planning-action="${pinned ? "unpin" : "pin"}" data-node-id="${esc(pathId)}" ${canEdit ? "" : "disabled"} title="${pinned ? "Unpin" : "Pin"}" aria-label="${pinned ? "Unpin" : "Pin"}">`;
+          html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8l1 4h-2l-1 5 2 2v1H8v-1l2-2-1-5H7l1-4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 15v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+          html += `</button>`;
+          html += `<button type="button" class="planning-node-icon-btn" data-planning-action="depth" data-node-id="${esc(pathId)}" ${(canEdit && pinned) ? "" : "disabled"} title="Depth +1" aria-label="Depth +1">`;
+          html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
+          html += `</button>`;
+          const capTail = Number.isFinite(bonusCap) ? ` (<=${Math.max(0, Number(bonusCap))})` : "";
+          html += `<span class="planning-node-depth">depth bonus +${bonus}${esc(capTail)}</span>`;
+          html += `</div>`;
+        } else if (researchDepthBonus && Number.isFinite(researchDepthBonus.bonus) && researchDepthBonus.bonus > 0) {
+          html += `<div class="planning-node-actions">`;
+          html += `<span class="planning-node-depth planning-node-depth-readonly">depth bonus +${Math.max(0, Number(researchDepthBonus.bonus || 0))}</span>`;
+          html += `</div>`;
+        }
         if (q.parent) {
           html += `<p class="node-parent"><span class="parent-link">from</span> ${esc(q.parent)}</p>`;
         }
@@ -3120,8 +3206,8 @@ abortBtn.addEventListener("click", async () => {
   }
 });
 
-if (swapBatchBtn) {
-  swapBatchBtn.addEventListener("click", async () => {
+if (swapBatchCanvasBtn) {
+  swapBatchCanvasBtn.addEventListener("click", async () => {
     try {
       await planningSwapBatch();
     } catch (err) {
@@ -3130,28 +3216,26 @@ if (swapBatchBtn) {
   });
 }
 
-if (planningChildrenEl) {
-  planningChildrenEl.addEventListener("click", async (evt) => {
-    const target = evt && evt.target ? evt.target : null;
-    if (!target || typeof target.closest !== "function") return;
-    const btn = target.closest("button[data-action][data-node-id]");
-    if (!btn) return;
-    const action = String(btn.getAttribute("data-action") || "").trim();
-    const nodeId = String(btn.getAttribute("data-node-id") || "").trim();
-    if (!action || !nodeId) return;
-    try {
-      if (action === "pin") {
-        await planningSetPin(nodeId, true);
-      } else if (action === "unpin") {
-        await planningSetPin(nodeId, false);
-      } else if (action === "depth") {
-        await planningDepthPlus(nodeId);
-      }
-    } catch (err) {
-      showError(err.message || String(err));
+canvasEl.addEventListener("click", async (evt) => {
+  const target = evt && evt.target ? evt.target : null;
+  if (!target || typeof target.closest !== "function") return;
+  const btn = target.closest("button[data-planning-action][data-node-id]");
+  if (!btn) return;
+  const action = String(btn.getAttribute("data-planning-action") || "").trim();
+  const nodeId = String(btn.getAttribute("data-node-id") || "").trim();
+  if (!action || !nodeId) return;
+  try {
+    if (action === "pin") {
+      await planningSetPin(nodeId, true);
+    } else if (action === "unpin") {
+      await planningSetPin(nodeId, false);
+    } else if (action === "depth") {
+      await planningDepthPlus(nodeId);
     }
-  });
-}
+  } catch (err) {
+    showError(err.message || String(err));
+  }
+});
 
 reportPrevBtn.addEventListener("click", async () => {
   try {

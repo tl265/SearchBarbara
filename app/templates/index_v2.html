@@ -92,10 +92,6 @@
             <h2>Planning Controls</h2>
             <span id="planningMeta" class="muted">Planning not started.</span>
           </div>
-          <div class="dock-controls">
-            <button id="swapBatchBtn" type="button" disabled>Swap Batch</button>
-          </div>
-          <div id="planningChildren" class="context-files-list muted"></div>
         </section>
         <section class="context context-in-advanced">
           <div class="section-head">
@@ -131,6 +127,20 @@
         <div class="section-head">
           <h2>Research Canvas</h2>
           <div class="canvas-toolbar">
+            <button
+              id="swapBatchCanvasBtn"
+              class="icon-btn hidden"
+              type="button"
+              aria-label="Swap planning batch"
+              title="Swap Batch"
+            >
+              <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 7h13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M14 4l3 3-3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                <path d="M20 17H7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M10 14l-3 3 3 3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
             <span id="canvasHint" class="muted">Auto-fit</span>
             <button id="zoomOutBtn" type="button">-</button>
             <span id="zoomPct" class="zoom-pct">100%</span>
