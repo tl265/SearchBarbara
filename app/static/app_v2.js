@@ -2517,6 +2517,7 @@ function applySnapshot(snap) {
   const isNewSessionWorkspace = !currentRunId || isDraft;
   const phase = planningPhase(snap);
   const pState = planningState(snap);
+  const planningAbortable = phase === "planning" && ["running", "review"].includes(pState);
   setPrimaryAndPlanningActionButtons({
     isNewSessionWorkspace,
     reportBusy,
@@ -2531,7 +2532,7 @@ function applySnapshot(snap) {
   } else {
     pauseBtn.disabled = !(running && !reportBusy);
     resumeBtn.disabled = !(paused && !reportBusy);
-    abortBtn.disabled = !((running || paused) && !reportBusy);
+    abortBtn.disabled = !((running || paused || planningAbortable) && !reportBusy);
   }
   abortBtn.textContent = abortPending ? "Stopping..." : "Abort";
 

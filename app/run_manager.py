@@ -1065,11 +1065,32 @@ class RunManager:
             pass
         return "deleted"
 
+    def _is_formal_aborted_state_locked(self, state: RunState) -> bool:
+        return (
+            str(state.execution_state or "").strip().lower() == "aborted"
+            and str(state.error or "").strip() == "Run aborted by user"
+            and str(state.phase or "").strip().lower() == "research"
+        )
+
+    def _set_formal_aborted_state_locked(self, state: RunState) -> None:
+        tree = state.tree if isinstance(state.tree, dict) else {}
+        state.tree = tree
+        state.status = "failed"
+        state.execution_state = "aborted"
+        state.error = "Run aborted by user"
+        state.phase = "research"
+        state.planning_state = "committed"
+        tree["phase"] = "research"
+        tree["planning_state"] = "committed"
+        tree["planning_pending_action"] = ""
+        tree["abort_pending"] = False
+
     def abort_run(
         self, run_id: str, expected_version: Optional[int] = None
     ) -> Optional[Dict[str, Any]]:
         session_lock = self._session_lock_for(run_id)
-        should_emit = False
+        should_emit_request = False
+        should_emit_terminal = False
         out_version = 1
         with session_lock:
             state = self._ensure_run_loaded_session_locked(run_id)
@@ -1078,11 +1099,18 @@ class RunManager:
             conflict = self._version_conflict_payload_locked(state, expected_version)
             if conflict:
                 return conflict
+            phase = self._derive_phase_locked(state)
+            pstate = self._derive_planning_state_locked(state)
+            planning_running_abortable = phase == "planning" and pstate == "running"
+            planning_review_abortable = phase == "planning" and pstate == "review"
             # Allow cancellation during startup race only when a worker exists.
             with self._lock:
                 worker = self._run_workers.get(run_id)
                 worker_alive = bool(worker and worker.is_alive())
             can_abort = (
+                planning_running_abortable
+                or planning_review_abortable
+                or
                 state.status == "running"
                 or state.execution_state in ("running", "paused")
                 or (state.status == "queued" and worker_alive)
@@ -1090,16 +1118,20 @@ class RunManager:
             if not can_abort:
                 return {"status": state.status, "version": state.version}
             state.updated_at = _now()
-            self._refresh_lifecycle_fields_locked(state)
-            self._next_state_version_locked(state)
-            out_version = max(1, int(state.version or 1))
-            should_emit = True
             with self._lock:
                 self._cancel_flags[run_id] = True
                 self._pause_flags[run_id] = False
+                if planning_review_abortable:
+                    # In planning review there is no in-flight atomic step; abort can finalize immediately.
+                    self._set_formal_aborted_state_locked(state)
+                    should_emit_terminal = True
+                self._next_state_version_locked(state)
+                self._refresh_lifecycle_fields_locked(state)
+                out_version = max(1, int(state.version or 1))
+                should_emit_request = not planning_review_abortable
                 self._sync_session_from_state_locked(state)
                 self._save_sessions_index_locked(force=True)
-        if should_emit:
+        if should_emit_request:
             self._publish_event(
                 run_id,
                 {
@@ -1118,7 +1150,18 @@ class RunManager:
                     "payload": {},
                 },
             )
-        if should_emit:
+        if should_emit_terminal:
+            self._publish_event(
+                run_id,
+                {
+                    "run_id": run_id,
+                    "timestamp": _now().isoformat(),
+                    "event_type": "run_aborted",
+                    "payload": {"error": "Run aborted by user"},
+                },
+            )
+            return {"status": "aborted", "version": out_version}
+        if should_emit_request:
             return {"status": "aborting", "version": out_version}
         return {"status": "aborting"}
 
@@ -3382,29 +3425,31 @@ class RunManager:
             heartbeat_thread.join(timeout=1.0)
             return
         if run_phase == "planning":
+            def _finalize_planning_abort_terminal() -> None:
+                already_terminal = False
+                with session_lock:
+                    st = self._ensure_run_loaded_session_locked(run_id)
+                    with self._lock:
+                        if st:
+                            already_terminal = self._is_formal_aborted_state_locked(st)
+                            if not already_terminal:
+                                self._set_formal_aborted_state_locked(st)
+                                self._run_workers.pop(run_id, None)
+                                self._next_state_version_locked(st)
+                                self._refresh_lifecycle_fields_locked(st)
+                                self._sync_session_from_state_locked(st)
+                                self._save_sessions_index_locked(force=True)
+                    if st:
+                        self._persist_run_state_locked(st)
+                if not already_terminal:
+                    emit_worker_event("run_aborted", {"error": "Run aborted by user"})
+
             emit_worker_event(
                 "planning_started",
                 {"action": planning_pending_action or "start"},
             )
             if is_cancel_requested():
-                emit_worker_event("planning_aborted", {"error": "Run aborted by user"})
-                with session_lock:
-                    state = self._ensure_run_loaded_session_locked(run_id)
-                    with self._lock:
-                        if state:
-                            state.status = "failed"
-                            state.execution_state = "aborted"
-                            state.error = "Run aborted by user"
-                            state.tree["planning_state"] = "aborted"
-                            state.phase = "planning"
-                            state.planning_state = "aborted"
-                            self._run_workers.pop(run_id, None)
-                            self._next_state_version_locked(state)
-                            self._refresh_lifecycle_fields_locked(state)
-                            self._sync_session_from_state_locked(state)
-                            self._save_sessions_index_locked(force=True)
-                    if state:
-                        self._persist_run_state_locked(state)
+                _finalize_planning_abort_terminal()
                 heartbeat_stop.set()
                 heartbeat_thread.join(timeout=1.0)
                 return
@@ -3532,24 +3577,7 @@ class RunManager:
                             cached_root=cached_root_analysis,
                         )
                 if is_cancel_requested():
-                    emit_worker_event("planning_aborted", {"error": "Run aborted by user"})
-                    with session_lock:
-                        st = self._ensure_run_loaded_session_locked(run_id)
-                        with self._lock:
-                            if st:
-                                st.status = "failed"
-                                st.execution_state = "aborted"
-                                st.error = "Run aborted by user"
-                                st.tree["planning_state"] = "aborted"
-                                st.phase = "planning"
-                                st.planning_state = "aborted"
-                                self._run_workers.pop(run_id, None)
-                                self._next_state_version_locked(st)
-                                self._refresh_lifecycle_fields_locked(st)
-                                self._sync_session_from_state_locked(st)
-                                self._save_sessions_index_locked(force=True)
-                        if st:
-                            self._persist_run_state_locked(st)
+                    _finalize_planning_abort_terminal()
                     heartbeat_stop.set()
                     heartbeat_thread.join(timeout=1.0)
                     return
@@ -3610,153 +3638,163 @@ class RunManager:
                     )
                 with session_lock:
                     st = self._ensure_run_loaded_session_locked(run_id)
+                    terminal_aborted = False
                     with self._lock:
                         if not st:
                             raise RuntimeError("Run not found while applying planning result.")
-                        st.token_usage = agent.usage_tracker.to_dict()
-                        tr = st.tree if isinstance(st.tree, dict) else {}
-                        st.tree = tr
-                        tr["phase"] = "planning"
-                        tr["planning_state"] = "review"
-                        tr["planning_pending_action"] = ""
-                        planning_obj = tr.get("planning")
-                        if not isinstance(planning_obj, dict):
-                            planning_obj = self._new_planning_tree(
-                                task=st.task,
-                                max_depth=st.max_depth,
-                                max_depth_cap_snapshot=tr.get("max_depth_cap_snapshot", st.max_depth),
-                            )
-                            tr["planning"] = planning_obj
-                        planning_obj["root_question"] = root_question
-                        planning_obj["batch_id"] = next_batch
-                        planning_obj["default_max_depth"] = default_max_depth
-                        planning_obj["system_max_depth"] = system_max_depth
-                        planning_obj["root_lazy_queries"] = copy.deepcopy(
-                            planning_result.get("queries", [])
-                            if isinstance(planning_result.get("queries", []), list)
-                            else []
-                        )
-                        planning_obj["root_lazy_evidence"] = copy.deepcopy(
-                            planning_result.get("evidence", [])
-                            if isinstance(planning_result.get("evidence", []), list)
-                            else []
-                        )
-                        planning_obj["root_query_steps"] = copy.deepcopy(
-                            planning_result.get("query_steps", [])
-                            if isinstance(planning_result.get("query_steps", []), list)
-                            else []
-                        )
-                        planning_obj["root_node_sufficiency"] = {
-                            "is_sufficient": bool(planning_result.get("is_sufficient", False)),
-                            "reasoning": str(planning_result.get("node_reasoning", "")).strip(),
-                            "gaps": copy.deepcopy(
-                                planning_result.get("node_gaps", [])
-                                if isinstance(planning_result.get("node_gaps", []), list)
+                        terminal_aborted = self._is_formal_aborted_state_locked(st)
+                        if terminal_aborted:
+                            self._run_workers.pop(run_id, None)
+                        if not terminal_aborted:
+                            st.token_usage = agent.usage_tracker.to_dict()
+                            tr = st.tree if isinstance(st.tree, dict) else {}
+                            st.tree = tr
+                            tr["phase"] = "planning"
+                            tr["planning_state"] = "review"
+                            tr["planning_pending_action"] = ""
+                            planning_obj = tr.get("planning")
+                            if not isinstance(planning_obj, dict):
+                                planning_obj = self._new_planning_tree(
+                                    task=st.task,
+                                    max_depth=st.max_depth,
+                                    max_depth_cap_snapshot=tr.get("max_depth_cap_snapshot", st.max_depth),
+                                )
+                                tr["planning"] = planning_obj
+                            planning_obj["root_question"] = root_question
+                            planning_obj["batch_id"] = next_batch
+                            planning_obj["default_max_depth"] = default_max_depth
+                            planning_obj["system_max_depth"] = system_max_depth
+                            planning_obj["root_lazy_queries"] = copy.deepcopy(
+                                planning_result.get("queries", [])
+                                if isinstance(planning_result.get("queries", []), list)
                                 else []
-                            ),
-                        }
-                        planning_obj["root_finding"] = copy.deepcopy(
-                            planning_result.get("finding", {})
-                            if isinstance(planning_result.get("finding", {}), dict)
-                            else {}
-                        )
-                        planning_obj["root_children_candidates"] = copy.deepcopy(final_rows)
-                        planning_obj["pinned_root_child_ids"] = [
-                            r["node_id"] for r in final_rows if bool(r.get("is_pinned", False))
-                        ]
-                        planning_obj["active_pin_records"] = [
-                            {
-                                "node_id": r["node_id"],
-                                "sub_question": r["sub_question"],
-                                "display_title": r["display_title"],
-                                "pin_depth_bonus": int(r.get("pin_depth_bonus", 0) or 0),
-                                "updated_at": str(r.get("pin_updated_at", "") or _now().isoformat()),
+                            )
+                            planning_obj["root_lazy_evidence"] = copy.deepcopy(
+                                planning_result.get("evidence", [])
+                                if isinstance(planning_result.get("evidence", []), list)
+                                else []
+                            )
+                            planning_obj["root_query_steps"] = copy.deepcopy(
+                                planning_result.get("query_steps", [])
+                                if isinstance(planning_result.get("query_steps", []), list)
+                                else []
+                            )
+                            planning_obj["root_node_sufficiency"] = {
+                                "is_sufficient": bool(planning_result.get("is_sufficient", False)),
+                                "reasoning": str(planning_result.get("node_reasoning", "")).strip(),
+                                "gaps": copy.deepcopy(
+                                    planning_result.get("node_gaps", [])
+                                    if isinstance(planning_result.get("node_gaps", []), list)
+                                    else []
+                                ),
                             }
-                            for r in final_rows
-                            if bool(r.get("is_pinned", False))
-                        ]
-                        swap_exclusions = planning_obj.get("swap_exclusions", [])
-                        if not isinstance(swap_exclusions, list):
-                            swap_exclusions = []
-                        if planning_pending_action == "swap_batch":
-                            for ex in exclusions:
-                                if ex and ex not in swap_exclusions:
-                                    swap_exclusions.append(ex)
-                        for row in unpinned:
-                            sq = str(row.get("sub_question", "")).strip()
-                            if sq and sq not in swap_exclusions:
-                                swap_exclusions.append(sq)
-                        planning_obj["swap_exclusions"] = swap_exclusions[-80:]
-                        planning_obj["last_planning_error"] = ""
-                        planning_obj["last_planning_at"] = _now().isoformat()
-                        tr_rounds: List[Dict[str, Any]] = []
-                        root_status = (
-                            "decomposed" if final_rows else
-                            ("solved" if bool(planning_result.get("is_sufficient", False)) else "unresolved")
-                        )
-                        tr_rounds.append(
-                            {
-                                "round": 1,
-                                "questions": [
-                                    {
-                                        "sub_question": root_question,
-                                        "display_title": root_question,
-                                        "node_id": "1",
-                                        "depth": 1,
-                                        "parent": "",
-                                        "status": root_status,
-                                        "query_steps": copy.deepcopy(
-                                            planning_result.get("query_steps", [])
-                                            if isinstance(planning_result.get("query_steps", []), list)
-                                            else []
-                                        ),
-                                        "node_sufficiency": {
-                                            "is_sufficient": bool(planning_result.get("is_sufficient", False)),
-                                            "reasoning": str(planning_result.get("node_reasoning", "")).strip(),
-                                            "gaps": copy.deepcopy(
-                                                planning_result.get("node_gaps", [])
-                                                if isinstance(planning_result.get("node_gaps", []), list)
+                            planning_obj["root_finding"] = copy.deepcopy(
+                                planning_result.get("finding", {})
+                                if isinstance(planning_result.get("finding", {}), dict)
+                                else {}
+                            )
+                            planning_obj["root_children_candidates"] = copy.deepcopy(final_rows)
+                            planning_obj["pinned_root_child_ids"] = [
+                                r["node_id"] for r in final_rows if bool(r.get("is_pinned", False))
+                            ]
+                            planning_obj["active_pin_records"] = [
+                                {
+                                    "node_id": r["node_id"],
+                                    "sub_question": r["sub_question"],
+                                    "display_title": r["display_title"],
+                                    "pin_depth_bonus": int(r.get("pin_depth_bonus", 0) or 0),
+                                    "updated_at": str(r.get("pin_updated_at", "") or _now().isoformat()),
+                                }
+                                for r in final_rows
+                                if bool(r.get("is_pinned", False))
+                            ]
+                            swap_exclusions = planning_obj.get("swap_exclusions", [])
+                            if not isinstance(swap_exclusions, list):
+                                swap_exclusions = []
+                            if planning_pending_action == "swap_batch":
+                                for ex in exclusions:
+                                    if ex and ex not in swap_exclusions:
+                                        swap_exclusions.append(ex)
+                            for row in unpinned:
+                                sq = str(row.get("sub_question", "")).strip()
+                                if sq and sq not in swap_exclusions:
+                                    swap_exclusions.append(sq)
+                            planning_obj["swap_exclusions"] = swap_exclusions[-80:]
+                            planning_obj["last_planning_error"] = ""
+                            planning_obj["last_planning_at"] = _now().isoformat()
+                            tr_rounds: List[Dict[str, Any]] = []
+                            root_status = (
+                                "decomposed" if final_rows else
+                                ("solved" if bool(planning_result.get("is_sufficient", False)) else "unresolved")
+                            )
+                            tr_rounds.append(
+                                {
+                                    "round": 1,
+                                    "questions": [
+                                        {
+                                            "sub_question": root_question,
+                                            "display_title": root_question,
+                                            "node_id": "1",
+                                            "depth": 1,
+                                            "parent": "",
+                                            "status": root_status,
+                                            "query_steps": copy.deepcopy(
+                                                planning_result.get("query_steps", [])
+                                                if isinstance(planning_result.get("query_steps", []), list)
                                                 else []
                                             ),
-                                        },
-                                        "children": [r["sub_question"] for r in final_rows],
-                                        "children_display_titles": {
-                                            r["sub_question"]: r["display_title"] for r in final_rows
-                                        },
-                                        "child_node_ids": [r["node_id"] for r in final_rows],
-                                    }
-                                ]
-                                + [
-                                    {
-                                        "sub_question": r["sub_question"],
-                                        "display_title": r["display_title"],
-                                        "node_id": r["node_id"],
-                                        "depth": 2,
-                                        "parent": root_question,
-                                        "status": "pending",
-                                        "query_steps": [],
-                                        "is_pinned": bool(r.get("is_pinned", False)),
-                                        "pin_depth_bonus": int(r.get("pin_depth_bonus", 0) or 0),
-                                        "pin_updated_at": str(r.get("pin_updated_at", "") or ""),
-                                        "planning_batch_id": int(r.get("planning_batch_id", next_batch) or next_batch),
-                                    }
-                                    for r in final_rows
-                                ],
-                            }
-                        )
-                        tr["rounds"] = tr_rounds
-                        st.status = "queued"
-                        st.execution_state = "idle"
-                        st.phase = "planning"
-                        st.planning_state = "review"
-                        self._pause_flags[run_id] = False
-                        self._cancel_flags[run_id] = False
-                        self._run_workers.pop(run_id, None)
-                        self._next_state_version_locked(st)
-                        self._refresh_lifecycle_fields_locked(st)
-                        self._sync_session_from_state_locked(st)
-                        self._save_sessions_index_locked(force=True)
-                    self._persist_run_state_locked(st)
+                                            "node_sufficiency": {
+                                                "is_sufficient": bool(planning_result.get("is_sufficient", False)),
+                                                "reasoning": str(planning_result.get("node_reasoning", "")).strip(),
+                                                "gaps": copy.deepcopy(
+                                                    planning_result.get("node_gaps", [])
+                                                    if isinstance(planning_result.get("node_gaps", []), list)
+                                                    else []
+                                                ),
+                                            },
+                                            "children": [r["sub_question"] for r in final_rows],
+                                            "children_display_titles": {
+                                                r["sub_question"]: r["display_title"] for r in final_rows
+                                            },
+                                            "child_node_ids": [r["node_id"] for r in final_rows],
+                                        }
+                                    ]
+                                    + [
+                                        {
+                                            "sub_question": r["sub_question"],
+                                            "display_title": r["display_title"],
+                                            "node_id": r["node_id"],
+                                            "depth": 2,
+                                            "parent": root_question,
+                                            "status": "pending",
+                                            "query_steps": [],
+                                            "is_pinned": bool(r.get("is_pinned", False)),
+                                            "pin_depth_bonus": int(r.get("pin_depth_bonus", 0) or 0),
+                                            "pin_updated_at": str(r.get("pin_updated_at", "") or ""),
+                                            "planning_batch_id": int(r.get("planning_batch_id", next_batch) or next_batch),
+                                        }
+                                        for r in final_rows
+                                    ],
+                                }
+                            )
+                            tr["rounds"] = tr_rounds
+                            st.status = "queued"
+                            st.execution_state = "idle"
+                            st.phase = "planning"
+                            st.planning_state = "review"
+                            self._pause_flags[run_id] = False
+                            self._cancel_flags[run_id] = False
+                            self._run_workers.pop(run_id, None)
+                            self._next_state_version_locked(st)
+                            self._refresh_lifecycle_fields_locked(st)
+                            self._sync_session_from_state_locked(st)
+                            self._save_sessions_index_locked(force=True)
+                    if not terminal_aborted:
+                        self._persist_run_state_locked(st)
+                if terminal_aborted:
+                    heartbeat_stop.set()
+                    heartbeat_thread.join(timeout=1.0)
+                    return
                 planning_payload = {
                     "batch_id": next_batch,
                     "root_question": root_question,
@@ -3797,25 +3835,34 @@ class RunManager:
                 heartbeat_thread.join(timeout=1.0)
                 return
             except Exception as exc:
+                if is_cancel_requested():
+                    _finalize_planning_abort_terminal()
+                    heartbeat_stop.set()
+                    heartbeat_thread.join(timeout=1.0)
+                    return
                 emit_worker_event("planning_failed", {"error": str(exc)})
                 with session_lock:
                     st = self._ensure_run_loaded_session_locked(run_id)
                     with self._lock:
                         if st:
-                            st.status = "failed"
-                            st.execution_state = "failed"
-                            st.phase = "planning"
-                            st.planning_state = "failed"
-                            st.error = str(exc)
-                            if isinstance(st.tree, dict):
-                                st.tree["phase"] = "planning"
-                                st.tree["planning_state"] = "failed"
-                            self._pause_flags[run_id] = False
-                            self._run_workers.pop(run_id, None)
-                            self._next_state_version_locked(st)
-                            self._refresh_lifecycle_fields_locked(st)
-                            self._sync_session_from_state_locked(st)
-                            self._save_sessions_index_locked(force=True)
+                            if self._is_formal_aborted_state_locked(st):
+                                self._run_workers.pop(run_id, None)
+                                st = None
+                            else:
+                                st.status = "failed"
+                                st.execution_state = "failed"
+                                st.phase = "planning"
+                                st.planning_state = "failed"
+                                st.error = str(exc)
+                                if isinstance(st.tree, dict):
+                                    st.tree["phase"] = "planning"
+                                    st.tree["planning_state"] = "failed"
+                                self._pause_flags[run_id] = False
+                                self._run_workers.pop(run_id, None)
+                                self._next_state_version_locked(st)
+                                self._refresh_lifecycle_fields_locked(st)
+                                self._sync_session_from_state_locked(st)
+                                self._save_sessions_index_locked(force=True)
                     if st:
                         self._persist_run_state_locked(st)
                 heartbeat_stop.set()
