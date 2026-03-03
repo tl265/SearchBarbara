@@ -37,6 +37,8 @@ class RunManager:
     _MAX_SSE_REPLAY_EVENTS = 120
     _IDEMPOTENCY_TTL_CREATE_RUN_SEC = 600
     _IDEMPOTENCY_TTL_REPORT_SEC = 300
+    _REPORT_TEMPLATE_SCHEMA_VERSION = 1
+    _DEFAULT_REPORT_TEMPLATE_ID = "executive"
 
     def __init__(
         self,
@@ -62,6 +64,7 @@ class RunManager:
         self._event_seq: Dict[str, int] = {}
         self._run_workers: Dict[str, threading.Thread] = {}
         self._active_report_runs: set[str] = set()
+        self._report_templates_lock = threading.Lock()
         self._idempotency_lock = threading.Lock()
         self._idempotency_records: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.Lock()
@@ -111,6 +114,9 @@ class RunManager:
         self._runs_dir.mkdir(parents=True, exist_ok=True)
         self._contexts_dir = self._runs_dir / "contexts"
         self._contexts_dir.mkdir(parents=True, exist_ok=True)
+        self._report_templates_dir = self._runs_dir / "templates"
+        self._report_templates_users_dir = self._report_templates_dir / "users"
+        self._report_templates_users_dir.mkdir(parents=True, exist_ok=True)
         self._context_files_dir = self._contexts_dir / "files"
         self._context_files_dir.mkdir(parents=True, exist_ok=True)
         self._context_digests_dir = self._contexts_dir / "digests"
@@ -572,6 +578,480 @@ class RunManager:
             return self._sessions_index_legacy_path
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
         return self._sessions_index_users_dir / f"{digest}.json"
+
+    def _report_templates_path_for_owner(self, owner_id: Optional[str]) -> Path:
+        key = self._owner_index_key(owner_id)
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        return self._report_templates_users_dir / f"{digest}.json"
+
+    def _normalize_report_template_fields(self, fields: Any) -> Dict[str, Any]:
+        raw = fields if isinstance(fields, dict) else {}
+
+        def _clean_text(value: Any, max_len: int) -> str:
+            out = str(value or "").strip()
+            if len(out) > max_len:
+                out = out[:max_len].strip()
+            return out
+
+        def _clean_list(value: Any, max_items: int, item_max_len: int) -> List[str]:
+            out: List[str] = []
+            if not isinstance(value, list):
+                return out
+            for item in value:
+                if not isinstance(item, str):
+                    continue
+                s = item.strip()
+                if not s:
+                    continue
+                if len(s) > item_max_len:
+                    s = s[:item_max_len].strip()
+                out.append(s)
+                if len(out) >= max_items:
+                    break
+            return out
+
+        return {
+            "audience": _clean_text(raw.get("audience", ""), 4000),
+            "presentation_setup": _clean_text(raw.get("presentation_setup", ""), 6000),
+            "dos": _clean_list(raw.get("dos", []), 20, 300),
+            "donts": _clean_list(raw.get("donts", []), 20, 300),
+            "tone": _clean_text(raw.get("tone", ""), 800),
+            "focus": _clean_text(raw.get("focus", ""), 800),
+        }
+
+    def _render_custom_background_prompt(self, fields: Dict[str, Any]) -> str:
+        audience = str(fields.get("audience", "")).strip() or "未指定"
+        setup = str(fields.get("presentation_setup", "")).strip() or "未指定"
+        tone = str(fields.get("tone", "")).strip()
+        focus = str(fields.get("focus", "")).strip()
+        dos = [
+            str(v).strip()
+            for v in fields.get("dos", [])
+            if isinstance(v, str) and str(v).strip()
+        ]
+        donts = [
+            str(v).strip()
+            for v in fields.get("donts", [])
+            if isinstance(v, str) and str(v).strip()
+        ]
+        lines: List[str] = [
+            "<Audience_Scenario>",
+            "【背景和汇报对象】",
+            audience,
+            "",
+            "【汇报场景】",
+            setup,
+        ]
+        if tone:
+            lines.extend(["", "【语气与风格】", tone])
+        if focus:
+            lines.extend(["", "【重点关注】", focus])
+        if dos:
+            lines.extend(["", "【Do's】"])
+            for idx, item in enumerate(dos, start=1):
+                lines.append(f"{idx}. {item}")
+        if donts:
+            lines.extend(["", "【Don'ts】"])
+            for idx, item in enumerate(donts, start=1):
+                lines.append(f"{idx}. {item}")
+        lines.append("</Audience_Scenario>")
+        return "\n".join(lines).strip()
+
+    def _load_report_prompt_file(self, filename: str, fallback: str = "") -> str:
+        try:
+            return load_prompt(filename)
+        except Exception:
+            return str(fallback or "").strip()
+
+    def _load_report_universal_prompt(self) -> str:
+        prompt = self._load_report_prompt_file("report.universal.system.txt", "")
+        if prompt:
+            return prompt
+        return str(SYSTEM_REPORT or "").strip()
+
+    def _builtin_report_template_specs(self) -> List[Dict[str, Any]]:
+        return [
+            {
+                "template_id": "executive",
+                "name": "Executive / Senior Management",
+                "background_type": "executive",
+                "fields": self._normalize_report_template_fields(
+                    {
+                        "audience": "集团高层与战略决策层",
+                        "presentation_setup": "用于高层决策讨论，强调战略判断、取舍与资源配置方向。",
+                        "dos": [
+                            "结论先行，形成清晰战略主张与优先级。",
+                            "把证据转化为可决策的取舍逻辑。",
+                        ],
+                        "donts": [
+                            "避免落入过细执行排期与任务清单。",
+                            "避免空泛口号式表达。",
+                        ],
+                        "tone": "专业、克制、客观中立。",
+                        "focus": "战略方向、关键矛盾、资源优先级。",
+                    }
+                ),
+                "prompt_file": "report.background.executive.txt",
+            },
+            {
+                "template_id": "business_head_execution",
+                "name": "Business Head (Execution-focused)",
+                "background_type": "business_head_execution",
+                "fields": self._normalize_report_template_fields(
+                    {
+                        "audience": "业务负责人、业务线管理者、执行管理团队",
+                        "presentation_setup": "用于业务执行推进会议，强调落地路径、责任分工、依赖与风险控制。",
+                        "dos": [
+                            "给出可执行的工作流与里程碑。",
+                            "明确关键指标、owner 和跨团队依赖。",
+                        ],
+                        "donts": [
+                            "避免过多宏观战略叙事而缺少执行抓手。",
+                            "避免只有方向没有度量标准。",
+                        ],
+                        "tone": "务实、清晰、可执行。",
+                        "focus": "执行优先级、节奏控制、资源约束、风险处置。",
+                    }
+                ),
+                "prompt_file": "report.background.business_head_execution.txt",
+            },
+        ]
+
+    def _render_background_prompt_for_template(
+        self, template: Dict[str, Any]
+    ) -> str:
+        bg_type = str(template.get("background_type", "custom") or "custom").strip().lower()
+        if bg_type in {"executive", "business_head_execution"}:
+            prompt_file = str(template.get("prompt_file", "")).strip()
+            if prompt_file:
+                loaded = self._load_report_prompt_file(prompt_file, "")
+                if loaded:
+                    return loaded
+        fields = self._normalize_report_template_fields(template.get("fields", {}))
+        return self._render_custom_background_prompt(fields)
+
+    def _compose_report_system_prompt(self, template: Dict[str, Any]) -> str:
+        universal = self._load_report_universal_prompt()
+        background = str(
+            template.get("rendered_background_prompt", "")
+        ).strip()
+        if not background:
+            background = self._render_background_prompt_for_template(template)
+        if background and universal:
+            return f"{background}\n\n{universal}".strip()
+        if universal:
+            return universal
+        if background:
+            return background
+        return str(SYSTEM_REPORT or "").strip()
+
+    def _report_template_store_default(self, owner_id: Optional[str]) -> Dict[str, Any]:
+        return {
+            "schema_version": self._REPORT_TEMPLATE_SCHEMA_VERSION,
+            "owner_id": str(owner_id or "").strip() or None,
+            "default_manual_template_id": self._DEFAULT_REPORT_TEMPLATE_ID,
+            "templates": [],
+            "updated_at": _now().isoformat(),
+        }
+
+    def _load_report_template_store_locked(self, owner_id: Optional[str]) -> Dict[str, Any]:
+        path = self._report_templates_path_for_owner(owner_id)
+        if not path.exists():
+            return self._report_template_store_default(owner_id)
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return self._report_template_store_default(owner_id)
+        if not isinstance(raw, dict):
+            return self._report_template_store_default(owner_id)
+        out = self._report_template_store_default(owner_id)
+        out["default_manual_template_id"] = str(
+            raw.get("default_manual_template_id", self._DEFAULT_REPORT_TEMPLATE_ID)
+            or self._DEFAULT_REPORT_TEMPLATE_ID
+        )
+        templates = raw.get("templates", [])
+        if isinstance(templates, list):
+            normalized: List[Dict[str, Any]] = []
+            for item in templates:
+                if not isinstance(item, dict):
+                    continue
+                tid = str(item.get("template_id", "")).strip()
+                name = str(item.get("name", "")).strip()
+                if not tid or not name:
+                    continue
+                bg_type = str(item.get("background_type", "custom")).strip().lower()
+                if bg_type not in {"executive", "business_head_execution", "custom"}:
+                    bg_type = "custom"
+                fields = self._normalize_report_template_fields(item.get("fields", {}))
+                normalized.append(
+                    {
+                        "template_id": tid,
+                        "name": name[:120],
+                        "background_type": bg_type,
+                        "fields": fields,
+                        "created_at": str(item.get("created_at", "") or ""),
+                        "updated_at": str(item.get("updated_at", "") or ""),
+                    }
+                )
+            out["templates"] = normalized
+        return out
+
+    def _save_report_template_store_locked(
+        self, owner_id: Optional[str], store: Dict[str, Any]
+    ) -> None:
+        path = self._report_templates_path_for_owner(owner_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": self._REPORT_TEMPLATE_SCHEMA_VERSION,
+            "owner_id": str(owner_id or "").strip() or None,
+            "default_manual_template_id": str(
+                store.get("default_manual_template_id", self._DEFAULT_REPORT_TEMPLATE_ID)
+                or self._DEFAULT_REPORT_TEMPLATE_ID
+            ),
+            "templates": [
+                t
+                for t in (store.get("templates", []) if isinstance(store.get("templates", []), list) else [])
+                if isinstance(t, dict)
+            ],
+            "updated_at": _now().isoformat(),
+        }
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(path)
+
+    def list_report_templates(self, owner_id: Optional[str]) -> Dict[str, Any]:
+        with self._report_templates_lock:
+            store = self._load_report_template_store_locked(owner_id)
+        default_id = str(
+            store.get("default_manual_template_id", self._DEFAULT_REPORT_TEMPLATE_ID)
+            or self._DEFAULT_REPORT_TEMPLATE_ID
+        )
+        templates: List[Dict[str, Any]] = []
+        for item in self._builtin_report_template_specs():
+            tid = str(item.get("template_id", "")).strip()
+            templates.append(
+                {
+                    "template_id": tid,
+                    "name": str(item.get("name", "")).strip() or tid,
+                    "background_type": str(item.get("background_type", "custom")).strip(),
+                    "is_builtin": True,
+                    "is_default_manual": tid == default_id,
+                    "fields": self._normalize_report_template_fields(item.get("fields", {})),
+                    "rendered_background_prompt": self._render_background_prompt_for_template(item),
+                    "created_at": None,
+                    "updated_at": None,
+                }
+            )
+        custom = store.get("templates", [])
+        if isinstance(custom, list):
+            for item in custom:
+                if not isinstance(item, dict):
+                    continue
+                tid = str(item.get("template_id", "")).strip()
+                if not tid:
+                    continue
+                custom_tpl = {
+                    "template_id": tid,
+                    "name": str(item.get("name", "")).strip() or tid,
+                    "background_type": str(item.get("background_type", "custom")).strip(),
+                    "is_builtin": False,
+                    "is_default_manual": tid == default_id,
+                    "fields": self._normalize_report_template_fields(item.get("fields", {})),
+                    "created_at": str(item.get("created_at", "") or "") or None,
+                    "updated_at": str(item.get("updated_at", "") or "") or None,
+                }
+                custom_tpl["rendered_background_prompt"] = self._render_background_prompt_for_template(custom_tpl)
+                templates.append(custom_tpl)
+        return {"templates": templates, "default_manual_template_id": default_id}
+
+    def create_report_template(
+        self,
+        owner_id: Optional[str],
+        name: str,
+        background_type: str,
+        fields: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        nm = str(name or "").strip()[:120]
+        if not nm:
+            raise ValueError("Template name is required.")
+        bg_type = str(background_type or "custom").strip().lower()
+        if bg_type not in {"executive", "business_head_execution", "custom"}:
+            bg_type = "custom"
+        record = {
+            "template_id": f"tpl_{uuid.uuid4().hex[:12]}",
+            "name": nm,
+            "background_type": bg_type,
+            "fields": self._normalize_report_template_fields(fields),
+            "created_at": _now().isoformat(),
+            "updated_at": _now().isoformat(),
+        }
+        with self._report_templates_lock:
+            store = self._load_report_template_store_locked(owner_id)
+            items = store.get("templates", [])
+            if not isinstance(items, list):
+                items = []
+            items.append(record)
+            store["templates"] = items
+            self._save_report_template_store_locked(owner_id, store)
+        out = dict(record)
+        out["is_builtin"] = False
+        out["is_default_manual"] = False
+        out["rendered_background_prompt"] = self._render_background_prompt_for_template(out)
+        return out
+
+    def update_report_template(
+        self,
+        owner_id: Optional[str],
+        template_id: str,
+        name: str,
+        background_type: str,
+        fields: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        tid = str(template_id or "").strip()
+        if not tid:
+            return None
+        nm = str(name or "").strip()[:120]
+        if not nm:
+            raise ValueError("Template name is required.")
+        bg_type = str(background_type or "custom").strip().lower()
+        if bg_type not in {"executive", "business_head_execution", "custom"}:
+            bg_type = "custom"
+        updated: Optional[Dict[str, Any]] = None
+        with self._report_templates_lock:
+            store = self._load_report_template_store_locked(owner_id)
+            items = store.get("templates", [])
+            if not isinstance(items, list):
+                items = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("template_id", "")).strip() != tid:
+                    continue
+                item["name"] = nm
+                item["background_type"] = bg_type
+                item["fields"] = self._normalize_report_template_fields(fields)
+                item["updated_at"] = _now().isoformat()
+                updated = dict(item)
+                break
+            if updated is None:
+                return None
+            store["templates"] = items
+            self._save_report_template_store_locked(owner_id, store)
+        updated["is_builtin"] = False
+        updated["is_default_manual"] = False
+        updated["rendered_background_prompt"] = self._render_background_prompt_for_template(updated)
+        return updated
+
+    def delete_report_template(
+        self, owner_id: Optional[str], template_id: str
+    ) -> bool:
+        tid = str(template_id or "").strip()
+        if not tid:
+            return False
+        deleted = False
+        with self._report_templates_lock:
+            store = self._load_report_template_store_locked(owner_id)
+            items = store.get("templates", [])
+            if not isinstance(items, list):
+                items = []
+            kept: List[Dict[str, Any]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("template_id", "")).strip() == tid:
+                    deleted = True
+                    continue
+                kept.append(item)
+            if not deleted:
+                return False
+            store["templates"] = kept
+            if str(store.get("default_manual_template_id", "")) == tid:
+                store["default_manual_template_id"] = self._DEFAULT_REPORT_TEMPLATE_ID
+            self._save_report_template_store_locked(owner_id, store)
+        return True
+
+    def resolve_report_template(
+        self, owner_id: Optional[str], template_id: Optional[str]
+    ) -> Dict[str, Any]:
+        target_id = str(template_id or "").strip()
+        listing = self.list_report_templates(owner_id)
+        templates = listing.get("templates", [])
+        if not isinstance(templates, list):
+            templates = []
+        default_id = str(
+            listing.get("default_manual_template_id", self._DEFAULT_REPORT_TEMPLATE_ID)
+            or self._DEFAULT_REPORT_TEMPLATE_ID
+        )
+        fallback: Optional[Dict[str, Any]] = None
+        for tpl in templates:
+            if not isinstance(tpl, dict):
+                continue
+            tid = str(tpl.get("template_id", "")).strip()
+            if tid == default_id:
+                fallback = tpl
+            if target_id and tid == target_id:
+                resolved = dict(tpl)
+                resolved["composed_system_prompt"] = self._compose_report_system_prompt(resolved)
+                return resolved
+        if fallback is None and templates:
+            fallback = dict(templates[0]) if isinstance(templates[0], dict) else None
+        if fallback is None:
+            fallback = {
+                "template_id": self._DEFAULT_REPORT_TEMPLATE_ID,
+                "name": "Executive / Senior Management",
+                "background_type": "executive",
+                "is_builtin": True,
+                "fields": {},
+                "rendered_background_prompt": self._load_report_prompt_file(
+                    "report.background.executive.txt", ""
+                ),
+            }
+        resolved = dict(fallback)
+        resolved["composed_system_prompt"] = self._compose_report_system_prompt(resolved)
+        return resolved
+
+    def preview_report_template(
+        self,
+        owner_id: Optional[str],
+        template_id: Optional[str] = None,
+        draft: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        if isinstance(draft, dict):
+            bg_type = str(draft.get("background_type", "custom") or "custom").strip().lower()
+            if bg_type not in {"executive", "business_head_execution", "custom"}:
+                bg_type = "custom"
+            fields = self._normalize_report_template_fields(draft.get("fields", {}))
+            tpl = {
+                "template_id": None,
+                "name": str(draft.get("name", "")).strip() or "Draft Template",
+                "background_type": bg_type,
+                "is_builtin": False,
+                "fields": fields,
+            }
+            rendered = self._render_background_prompt_for_template(tpl)
+            universal = self._load_report_universal_prompt()
+            composed = self._compose_report_system_prompt({**tpl, "rendered_background_prompt": rendered})
+            return {
+                "template_id": None,
+                "rendered_background_prompt": rendered,
+                "universal_prompt": universal,
+                "composed_system_prompt": composed,
+            }
+        resolved = self.resolve_report_template(owner_id, template_id)
+        universal = self._load_report_universal_prompt()
+        return {
+            "template_id": str(resolved.get("template_id", "")).strip() or None,
+            "rendered_background_prompt": str(
+                resolved.get("rendered_background_prompt", "")
+            ).strip(),
+            "universal_prompt": universal,
+            "composed_system_prompt": str(
+                resolved.get("composed_system_prompt", "")
+            ).strip(),
+        }
 
     def _owner_index_lock(self, owner_key: str) -> threading.Lock:
         key = str(owner_key or "__legacy__").strip() or "__legacy__"
@@ -1761,11 +2241,17 @@ class RunManager:
         return {"status": "ok", "version": max(1, int(state.version or 1))}
 
     def generate_partial_report(
-        self, run_id: str, expected_version: Optional[int] = None
+        self,
+        run_id: str,
+        expected_version: Optional[int] = None,
+        report_template_id: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         session_lock = self._session_lock_for(run_id)
         snapshot: Optional[RunState] = None
         report_mode = "partial"
+        template_hint = str(
+            report_template_id or self._DEFAULT_REPORT_TEMPLATE_ID
+        ).strip() or self._DEFAULT_REPORT_TEMPLATE_ID
         start_persist_error = ""
         acquired = session_lock.acquire(timeout=2.0)
         if not acquired:
@@ -1825,6 +2311,8 @@ class RunManager:
                 report_mode=report_mode,
                 report_error="",
             )
+            if isinstance(state.tree, dict):
+                state.tree["report_template_id"] = template_hint
             self._next_state_version_locked(state)
             self._active_report_runs.add(run_id)
             self._refresh_lifecycle_fields_locked(state)
@@ -1854,10 +2342,23 @@ class RunManager:
                     "run_id": run_id,
                     "timestamp": _now().isoformat(),
                     "event_type": "report_generation_failed",
-                    "payload": {"mode": report_mode, "error": start_persist_error},
+                    "payload": {
+                        "mode": report_mode,
+                        "template_id": template_hint,
+                        "error": start_persist_error,
+                    },
                 },
             )
             return {"error": start_persist_error, "error_code": "persist_failed"}
+        resolved_tpl = self.resolve_report_template(
+            snapshot.owner_id, template_hint
+        )
+        selected_template_id = str(
+            resolved_tpl.get("template_id", template_hint) or template_hint
+        ).strip() or self._DEFAULT_REPORT_TEMPLATE_ID
+        report_system_prompt = str(
+            resolved_tpl.get("composed_system_prompt", "") or ""
+        ).strip() or str(SYSTEM_REPORT or "").strip()
         base_usage = self._best_effort_usage_snapshot(snapshot)
         self._publish_event(
             run_id,
@@ -1865,7 +2366,11 @@ class RunManager:
                 "run_id": run_id,
                 "timestamp": _now().isoformat(),
                 "event_type": "report_generation_started",
-                "payload": {"mode": report_mode},
+                "payload": {
+                    "mode": report_mode,
+                    "template_id": selected_template_id,
+                    "template_name": str(resolved_tpl.get("name", "")).strip(),
+                },
             },
         )
         report_heartbeat_stop = threading.Event()
@@ -1892,7 +2397,10 @@ class RunManager:
         report_heartbeat_thread.start()
         try:
             report_text, partial_usage = self._build_partial_report_with_agent(
-                snapshot, report_mode
+                snapshot,
+                report_mode,
+                report_system_prompt=report_system_prompt,
+                report_template_id=selected_template_id,
             )
         except Exception:
             with self._lock:
@@ -1910,7 +2418,10 @@ class RunManager:
                     "run_id": run_id,
                     "timestamp": _now().isoformat(),
                     "event_type": "report_generation_failed",
-                    "payload": {"mode": report_mode},
+                    "payload": {
+                        "mode": report_mode,
+                        "template_id": selected_template_id,
+                    },
                 },
             )
             return {
@@ -1984,6 +2495,11 @@ class RunManager:
                 report_mode=report_mode,
                 report_error="",
             )
+            if isinstance(state.tree, dict):
+                state.tree["report_template_id"] = selected_template_id
+                state.tree["report_template_name"] = str(
+                    resolved_tpl.get("name", "")
+                ).strip()
             self._next_state_version_locked(state)
             self._refresh_lifecycle_fields_locked(state)
             try:
@@ -2016,7 +2532,11 @@ class RunManager:
                     "run_id": run_id,
                     "timestamp": _now().isoformat(),
                     "event_type": "report_generation_failed",
-                    "payload": {"mode": report_mode, "error": persist_error},
+                    "payload": {
+                        "mode": report_mode,
+                        "template_id": selected_template_id,
+                        "error": persist_error,
+                    },
                 },
             )
             return {"error": persist_error, "error_code": "persist_failed"}
@@ -2031,6 +2551,7 @@ class RunManager:
                     "report_file_path": str(report_path),
                     "version_index": int(created.get("version_index", 1)),
                     "mode": report_mode,
+                    "template_id": selected_template_id,
                 },
             },
         )
@@ -2044,6 +2565,7 @@ class RunManager:
                     "report_file_path": str(report_path),
                     "version_index": int(created.get("version_index", 1)),
                     "mode": report_mode,
+                    "template_id": selected_template_id,
                 },
             },
         )
@@ -3937,7 +4459,11 @@ class RunManager:
         return token_usage if isinstance(token_usage, dict) else None
 
     def _build_partial_report_with_agent(
-        self, snapshot: RunState, report_mode: str
+        self,
+        snapshot: RunState,
+        report_mode: str,
+        report_system_prompt: Optional[str] = None,
+        report_template_id: Optional[str] = None,
     ) -> tuple[str, Optional[Dict[str, Any]]]:
         try:
             agent = DeepResearchAgent(
@@ -4020,14 +4546,17 @@ class RunManager:
                 ),
             )
             report_text = agent.report_llm.text(
-                SYSTEM_REPORT,
+                str(report_system_prompt or SYSTEM_REPORT),
                 prompt,
                 stage=(
                     "report_partial"
                     if report_mode == "partial"
                     else "report_final_from_snapshot"
                 ),
-                metadata={"task": snapshot.task[:120]},
+                metadata={
+                    "task": snapshot.task[:120],
+                    "template_id": str(report_template_id or "").strip(),
+                },
             )
             return report_text, agent.usage_tracker.to_dict()
         except Exception:

@@ -203,6 +203,37 @@
             <button id="reportNextBtn" type="button" disabled>&gt;</button>
           </div>
         </div>
+        <div class="report-template-row">
+          <label for="reportTemplateSelect" class="muted">Template</label>
+          <select id="reportTemplateSelect"></select>
+          <button id="reportTemplateManageBtn" type="button">Manage</button>
+        </div>
+        <details id="reportTemplateEditor" class="report-template-editor">
+          <summary>Template Editor</summary>
+          <div class="report-template-form-grid">
+            <label>Name <input id="reportTplName" type="text" maxlength="120" /></label>
+            <label>Background
+              <select id="reportTplBackgroundType">
+                <option value="custom">Custom</option>
+                <option value="executive">Executive</option>
+                <option value="business_head_execution">Business Head (Execution)</option>
+              </select>
+            </label>
+            <label>Audience <textarea id="reportTplAudience" rows="2"></textarea></label>
+            <label>Presentation Setup <textarea id="reportTplPresentationSetup" rows="2"></textarea></label>
+            <label>Do's (one line each) <textarea id="reportTplDos" rows="3"></textarea></label>
+            <label>Don'ts (one line each) <textarea id="reportTplDonts" rows="3"></textarea></label>
+            <label>Tone <input id="reportTplTone" type="text" /></label>
+            <label>Focus <input id="reportTplFocus" type="text" /></label>
+          </div>
+          <div class="report-template-actions">
+            <button id="reportTplNewBtn" type="button">New</button>
+            <button id="reportTplSaveBtn" type="button">Save</button>
+            <button id="reportTplDeleteBtn" type="button">Delete</button>
+            <button id="reportTplPreviewBtn" type="button">Preview</button>
+          </div>
+          <pre id="reportTplPreview" class="usage"></pre>
+        </details>
         <div id="coverageNote" class="muted"></div>
         <div id="reportRendered" class="report-body rendered"></div>
         <h3>Token Usage</h3>

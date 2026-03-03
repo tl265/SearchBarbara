@@ -45,6 +45,22 @@ const usageEl = document.getElementById("usage");
 const reportPrevBtn = document.getElementById("reportPrevBtn");
 const reportNextBtn = document.getElementById("reportNextBtn");
 const reportVersionLabel = document.getElementById("reportVersionLabel");
+const reportTemplateSelectEl = document.getElementById("reportTemplateSelect");
+const reportTemplateManageBtn = document.getElementById("reportTemplateManageBtn");
+const reportTemplateEditorEl = document.getElementById("reportTemplateEditor");
+const reportTplNameEl = document.getElementById("reportTplName");
+const reportTplBackgroundTypeEl = document.getElementById("reportTplBackgroundType");
+const reportTplAudienceEl = document.getElementById("reportTplAudience");
+const reportTplPresentationSetupEl = document.getElementById("reportTplPresentationSetup");
+const reportTplDosEl = document.getElementById("reportTplDos");
+const reportTplDontsEl = document.getElementById("reportTplDonts");
+const reportTplToneEl = document.getElementById("reportTplTone");
+const reportTplFocusEl = document.getElementById("reportTplFocus");
+const reportTplNewBtn = document.getElementById("reportTplNewBtn");
+const reportTplSaveBtn = document.getElementById("reportTplSaveBtn");
+const reportTplDeleteBtn = document.getElementById("reportTplDeleteBtn");
+const reportTplPreviewBtn = document.getElementById("reportTplPreviewBtn");
+const reportTplPreviewEl = document.getElementById("reportTplPreview");
 const APP_CONFIG = (window.APP_CONFIG && typeof window.APP_CONFIG === "object")
   ? window.APP_CONFIG
   : {};
@@ -111,6 +127,20 @@ let contextMutationInFlight = false;
 let pendingUploadFiles = [];
 let contextInputLocked = false;
 let planningMutationInFlight = false;
+let reportTemplateMutationInFlight = false;
+let reportTemplates = [];
+let selectedReportTemplateId = "executive";
+if (reportTemplateSelectEl) {
+  reportTemplates = [{
+    template_id: "executive",
+    name: "Executive / Senior Management",
+    background_type: "executive",
+    is_builtin: true,
+    is_default_manual: true,
+    fields: { audience: "", presentation_setup: "", dos: [], donts: [], tone: "", focus: "" },
+    rendered_background_prompt: "",
+  }];
+}
 const contextFetchStateByKey = new Map();
 const contextRefreshDebounceTimerByKey = new Map();
 const contextFetchSeqByKey = new Map();
@@ -136,6 +166,153 @@ function setReportButtonVisual(generating) {
     : "Generate report from current findings";
   reportBtn.setAttribute("title", label);
   reportBtn.setAttribute("aria-label", label);
+}
+
+function splitLines(value, maxItems = 20) {
+  const out = [];
+  const raw = String(value || "").split(/\r?\n/);
+  for (let i = 0; i < raw.length; i += 1) {
+    const s = String(raw[i] || "").trim();
+    if (!s) continue;
+    out.push(s);
+    if (out.length >= maxItems) break;
+  }
+  return out;
+}
+
+function reportTemplateDraftFromForm() {
+  return {
+    name: String(reportTplNameEl && reportTplNameEl.value || "").trim(),
+    background_type: String(reportTplBackgroundTypeEl && reportTplBackgroundTypeEl.value || "custom").trim() || "custom",
+    fields: {
+      audience: String(reportTplAudienceEl && reportTplAudienceEl.value || "").trim(),
+      presentation_setup: String(reportTplPresentationSetupEl && reportTplPresentationSetupEl.value || "").trim(),
+      dos: splitLines(reportTplDosEl && reportTplDosEl.value || "", 20),
+      donts: splitLines(reportTplDontsEl && reportTplDontsEl.value || "", 20),
+      tone: String(reportTplToneEl && reportTplToneEl.value || "").trim(),
+      focus: String(reportTplFocusEl && reportTplFocusEl.value || "").trim(),
+    },
+  };
+}
+
+function findReportTemplateById(templateId) {
+  const tid = String(templateId || "").trim();
+  if (!tid) return null;
+  for (let i = 0; i < reportTemplates.length; i += 1) {
+    const tpl = reportTemplates[i];
+    if (!tpl || typeof tpl !== "object") continue;
+    if (String(tpl.template_id || "").trim() === tid) return tpl;
+  }
+  return null;
+}
+
+function setReportTemplateForm(template) {
+  const tpl = template && typeof template === "object" ? template : {};
+  const fields = tpl.fields && typeof tpl.fields === "object" ? tpl.fields : {};
+  if (reportTplNameEl) reportTplNameEl.value = String(tpl.name || "");
+  if (reportTplBackgroundTypeEl) reportTplBackgroundTypeEl.value = String(tpl.background_type || "custom");
+  if (reportTplAudienceEl) reportTplAudienceEl.value = String(fields.audience || "");
+  if (reportTplPresentationSetupEl) reportTplPresentationSetupEl.value = String(fields.presentation_setup || "");
+  if (reportTplDosEl) reportTplDosEl.value = Array.isArray(fields.dos) ? fields.dos.map((v) => String(v || "")).join("\n") : "";
+  if (reportTplDontsEl) reportTplDontsEl.value = Array.isArray(fields.donts) ? fields.donts.map((v) => String(v || "")).join("\n") : "";
+  if (reportTplToneEl) reportTplToneEl.value = String(fields.tone || "");
+  if (reportTplFocusEl) reportTplFocusEl.value = String(fields.focus || "");
+}
+
+function refreshReportTemplateActionAvailability() {
+  const selected = findReportTemplateById(selectedReportTemplateId);
+  const isBuiltin = !!(selected && selected.is_builtin);
+  if (reportTplDeleteBtn && !reportTemplateMutationInFlight) {
+    reportTplDeleteBtn.disabled = isBuiltin;
+  }
+}
+
+function clearReportTemplateFormForNew() {
+  setReportTemplateForm({
+    name: "",
+    background_type: "custom",
+    fields: { audience: "", presentation_setup: "", dos: [], donts: [], tone: "", focus: "" },
+  });
+  if (reportTplPreviewEl) reportTplPreviewEl.textContent = "";
+}
+
+function renderReportTemplateSelect() {
+  if (!reportTemplateSelectEl) return;
+  const previous = String(selectedReportTemplateId || "").trim();
+  reportTemplateSelectEl.innerHTML = "";
+  for (let i = 0; i < reportTemplates.length; i += 1) {
+    const tpl = reportTemplates[i];
+    if (!tpl || typeof tpl !== "object") continue;
+    const option = document.createElement("option");
+    const tid = String(tpl.template_id || "").trim();
+    option.value = tid;
+    option.textContent = String(tpl.name || tid || "Template");
+    if (tpl.is_builtin) option.textContent += " (Built-in)";
+    reportTemplateSelectEl.appendChild(option);
+  }
+  let nextSelected = previous;
+  if (!findReportTemplateById(nextSelected)) {
+    const defaultTpl = reportTemplates.find((tpl) => tpl && tpl.is_default_manual);
+    nextSelected = String((defaultTpl && defaultTpl.template_id) || "");
+  }
+  if (!findReportTemplateById(nextSelected) && reportTemplates.length) {
+    nextSelected = String((reportTemplates[0] && reportTemplates[0].template_id) || "");
+  }
+  selectedReportTemplateId = nextSelected || "executive";
+  reportTemplateSelectEl.value = selectedReportTemplateId;
+  const selected = findReportTemplateById(selectedReportTemplateId);
+  if (selected) {
+    setReportTemplateForm(selected);
+    if (reportTplPreviewEl) {
+      reportTplPreviewEl.textContent = String(selected.rendered_background_prompt || "");
+    }
+  } else {
+    clearReportTemplateFormForNew();
+  }
+  refreshReportTemplateActionAvailability();
+}
+
+function setReportTemplateControlsDisabled(disabled) {
+  const off = !!disabled;
+  if (reportTemplateSelectEl) reportTemplateSelectEl.disabled = off;
+  if (reportTemplateManageBtn) reportTemplateManageBtn.disabled = off;
+  if (reportTplNameEl) reportTplNameEl.disabled = off;
+  if (reportTplBackgroundTypeEl) reportTplBackgroundTypeEl.disabled = off;
+  if (reportTplAudienceEl) reportTplAudienceEl.disabled = off;
+  if (reportTplPresentationSetupEl) reportTplPresentationSetupEl.disabled = off;
+  if (reportTplDosEl) reportTplDosEl.disabled = off;
+  if (reportTplDontsEl) reportTplDontsEl.disabled = off;
+  if (reportTplToneEl) reportTplToneEl.disabled = off;
+  if (reportTplFocusEl) reportTplFocusEl.disabled = off;
+  if (reportTplNewBtn) reportTplNewBtn.disabled = off;
+  if (reportTplSaveBtn) reportTplSaveBtn.disabled = off;
+  if (reportTplDeleteBtn) reportTplDeleteBtn.disabled = off;
+  if (reportTplPreviewBtn) reportTplPreviewBtn.disabled = off;
+  if (!off) {
+    refreshReportTemplateActionAvailability();
+  }
+}
+
+async function fetchReportTemplates() {
+  const rsp = await fetch("/api/report/templates");
+  if (!rsp.ok) {
+    throw new Error(await responseDetail(rsp, `Load templates failed: ${rsp.status}`));
+  }
+  const data = await rsp.json();
+  const list = Array.isArray(data.templates) ? data.templates : [];
+  reportTemplates = list.filter((tpl) => tpl && typeof tpl === "object");
+  if (!reportTemplates.length) {
+    reportTemplates = [{
+      template_id: "executive",
+      name: "Executive / Senior Management",
+      background_type: "executive",
+      is_builtin: true,
+      is_default_manual: true,
+      fields: { audience: "", presentation_setup: "", dos: [], donts: [], tone: "", focus: "" },
+      rendered_background_prompt: "",
+    }];
+  }
+  renderReportTemplateSelect();
 }
 
 function setSessionsRailCollapsed(collapsed, persist = true) {
@@ -2568,6 +2745,7 @@ function applySnapshot(snap) {
   downloadBtn.disabled = !hasDownloadableReport;
   const allowManualReport = !!sid && !reportBusy && (paused || terminal);
   reportBtn.disabled = !allowManualReport;
+  setReportTemplateControlsDisabled(reportBusy || reportTemplateMutationInFlight);
   setReportButtonVisual(reportGeneratingForThisRun);
   if (versions.length && activeIdx) {
     reportVersionLabel.textContent = `${activeIdx}/${versions.length}`;
@@ -3120,9 +3298,14 @@ reportBtn.addEventListener("click", async () => {
     const idempotencyKey = newIdempotencyKey("report");
     const ev = currentExpectedVersion();
     const qs = ev ? `?expected_version=${encodeURIComponent(String(ev))}` : "";
+    const templateId = String(selectedReportTemplateId || "").trim() || "executive";
     const rsp = await fetch(`/api/runs/${reportRunId}/report${qs}`, {
       method: "POST",
-      headers: { "Idempotency-Key": idempotencyKey },
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      },
+      body: JSON.stringify({ template_id: templateId }),
     });
     if (!rsp.ok) {
       throw new Error(`Report generation failed: ${rsp.status}`);
@@ -3139,6 +3322,158 @@ reportBtn.addEventListener("click", async () => {
     }
   }
 });
+
+if (reportTemplateSelectEl) {
+  reportTemplateSelectEl.addEventListener("change", () => {
+    selectedReportTemplateId = String(reportTemplateSelectEl.value || "").trim() || "executive";
+    const selected = findReportTemplateById(selectedReportTemplateId);
+    if (selected) {
+      setReportTemplateForm(selected);
+      if (reportTplPreviewEl) {
+        reportTplPreviewEl.textContent = String(selected.rendered_background_prompt || "");
+      }
+    }
+    refreshReportTemplateActionAvailability();
+  });
+}
+
+if (reportTemplateManageBtn && reportTemplateEditorEl) {
+  reportTemplateManageBtn.addEventListener("click", () => {
+    reportTemplateEditorEl.open = !reportTemplateEditorEl.open;
+  });
+}
+
+if (reportTplNewBtn) {
+  reportTplNewBtn.addEventListener("click", () => {
+    selectedReportTemplateId = "";
+    if (reportTemplateSelectEl) {
+      reportTemplateSelectEl.value = "";
+    }
+    clearReportTemplateFormForNew();
+    if (reportTemplateEditorEl) reportTemplateEditorEl.open = true;
+    refreshReportTemplateActionAvailability();
+  });
+}
+
+if (reportTplSaveBtn) {
+  reportTplSaveBtn.addEventListener("click", async () => {
+    const draft = reportTemplateDraftFromForm();
+    if (!draft.name) {
+      showError("Template name is required.");
+      return;
+    }
+    const selected = findReportTemplateById(selectedReportTemplateId);
+    if (selected && selected.is_builtin) {
+      selectedReportTemplateId = "";
+    }
+    reportTemplateMutationInFlight = true;
+    setReportTemplateControlsDisabled(true);
+    try {
+      const payload = JSON.stringify(draft);
+      let rsp;
+      const existing = findReportTemplateById(selectedReportTemplateId);
+      if (existing && !existing.is_builtin) {
+        rsp = await fetch(`/api/report/templates/${encodeURIComponent(String(existing.template_id || ""))}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: payload,
+        });
+      } else {
+        rsp = await fetch("/api/report/templates", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: payload,
+        });
+      }
+      if (!rsp.ok) {
+        throw new Error(await responseDetail(rsp, `Save template failed: ${rsp.status}`));
+      }
+      const saved = await rsp.json();
+      await fetchReportTemplates();
+      selectedReportTemplateId = String(saved.template_id || selectedReportTemplateId || "").trim() || "executive";
+      if (reportTemplateSelectEl) reportTemplateSelectEl.value = selectedReportTemplateId;
+      const chosen = findReportTemplateById(selectedReportTemplateId);
+      if (chosen) setReportTemplateForm(chosen);
+    } catch (err) {
+      showError(err.message || String(err));
+    } finally {
+      reportTemplateMutationInFlight = false;
+      const sid = String((currentSnapshot && (currentSnapshot.session_id || currentSnapshot.run_id)) || "").trim();
+      const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+      const reportState = String((currentSnapshot && currentSnapshot.report_state) || "").toLowerCase();
+      const tree = currentSnapshot && currentSnapshot.tree && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
+      const reportPhase = String((currentSnapshot && currentSnapshot.report_status) || tree.report_status || "pending").toLowerCase();
+      setReportTemplateControlsDisabled(reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating");
+    }
+  });
+}
+
+if (reportTplDeleteBtn) {
+  reportTplDeleteBtn.addEventListener("click", async () => {
+    const selected = findReportTemplateById(selectedReportTemplateId);
+    if (!selected || selected.is_builtin) {
+      showError("Select a custom template to delete.");
+      return;
+    }
+    const ok = window.confirm(`Delete template "${selected.name || selected.template_id}"?`);
+    if (!ok) return;
+    reportTemplateMutationInFlight = true;
+    setReportTemplateControlsDisabled(true);
+    try {
+      const rsp = await fetch(`/api/report/templates/${encodeURIComponent(String(selected.template_id || ""))}`, {
+        method: "DELETE",
+      });
+      if (!rsp.ok) {
+        throw new Error(await responseDetail(rsp, `Delete template failed: ${rsp.status}`));
+      }
+      selectedReportTemplateId = "executive";
+      await fetchReportTemplates();
+    } catch (err) {
+      showError(err.message || String(err));
+    } finally {
+      reportTemplateMutationInFlight = false;
+      const sid = String((currentSnapshot && (currentSnapshot.session_id || currentSnapshot.run_id)) || "").trim();
+      const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+      const reportState = String((currentSnapshot && currentSnapshot.report_state) || "").toLowerCase();
+      const tree = currentSnapshot && currentSnapshot.tree && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
+      const reportPhase = String((currentSnapshot && currentSnapshot.report_status) || tree.report_status || "pending").toLowerCase();
+      setReportTemplateControlsDisabled(reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating");
+    }
+  });
+}
+
+if (reportTplPreviewBtn) {
+  reportTplPreviewBtn.addEventListener("click", async () => {
+    reportTemplateMutationInFlight = true;
+    setReportTemplateControlsDisabled(true);
+    try {
+      const draft = reportTemplateDraftFromForm();
+      const rsp = await fetch("/api/report/templates/preview", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ draft }),
+      });
+      if (!rsp.ok) {
+        throw new Error(await responseDetail(rsp, `Preview failed: ${rsp.status}`));
+      }
+      const data = await rsp.json();
+      if (reportTplPreviewEl) {
+        reportTplPreviewEl.textContent = String(data.composed_system_prompt || "");
+      }
+      if (reportTemplateEditorEl) reportTemplateEditorEl.open = true;
+    } catch (err) {
+      showError(err.message || String(err));
+    } finally {
+      reportTemplateMutationInFlight = false;
+      const sid = String((currentSnapshot && (currentSnapshot.session_id || currentSnapshot.run_id)) || "").trim();
+      const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+      const reportState = String((currentSnapshot && currentSnapshot.report_state) || "").toLowerCase();
+      const tree = currentSnapshot && currentSnapshot.tree && typeof currentSnapshot.tree === "object" ? currentSnapshot.tree : {};
+      const reportPhase = String((currentSnapshot && currentSnapshot.report_status) || tree.report_status || "pending").toLowerCase();
+      setReportTemplateControlsDisabled(reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating");
+    }
+  });
+}
 
 downloadBtn.addEventListener("click", () => {
   if (!currentRunId) return;
@@ -3267,6 +3602,11 @@ window.addEventListener("resize", () => {
 async function bootstrapFromUrl() {
   const runId = readRunIdFromUrl();
   try {
+    try {
+      await fetchReportTemplates();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
     await fetchSessions();
     const selected = runId ? String(runId) : "";
     if (!selected) {
@@ -3283,6 +3623,9 @@ async function bootstrapFromUrl() {
 
 setContextEnabled(false);
 clearContextPane("No context files uploaded.");
+if (reportTemplateSelectEl) {
+  renderReportTemplateSelect();
+}
 bootstrapFromUrl();
 initSessionSyncListeners();
 

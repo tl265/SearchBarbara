@@ -211,3 +211,70 @@ class ContextDigestResponse(BaseModel):
 class ContextMutateResponse(BaseModel):
     context_set: ContextSet
     diff: Dict[str, int] = Field(default_factory=dict)
+
+
+ReportTemplateBackgroundType = Literal[
+    "executive",
+    "business_head_execution",
+    "custom",
+]
+
+
+class ReportTemplateFields(BaseModel):
+    audience: str = ""
+    presentation_setup: str = ""
+    dos: List[str] = Field(default_factory=list)
+    donts: List[str] = Field(default_factory=list)
+    tone: str = ""
+    focus: str = ""
+
+
+class ReportTemplate(BaseModel):
+    template_id: str
+    name: str
+    background_type: ReportTemplateBackgroundType
+    is_builtin: bool = False
+    is_default_manual: bool = False
+    fields: ReportTemplateFields = Field(default_factory=ReportTemplateFields)
+    rendered_background_prompt: str = ""
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+class ReportTemplateListResponse(BaseModel):
+    templates: List[ReportTemplate] = Field(default_factory=list)
+    default_manual_template_id: str = "executive"
+
+
+class ReportTemplateCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    background_type: ReportTemplateBackgroundType = "custom"
+    fields: ReportTemplateFields = Field(default_factory=ReportTemplateFields)
+
+
+class ReportTemplateUpdateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    background_type: ReportTemplateBackgroundType = "custom"
+    fields: ReportTemplateFields = Field(default_factory=ReportTemplateFields)
+
+
+class ReportTemplateDraftRequest(BaseModel):
+    name: str = Field(default="", max_length=120)
+    background_type: ReportTemplateBackgroundType = "custom"
+    fields: ReportTemplateFields = Field(default_factory=ReportTemplateFields)
+
+
+class ReportTemplatePreviewRequest(BaseModel):
+    template_id: Optional[str] = None
+    draft: Optional[ReportTemplateDraftRequest] = None
+
+
+class ReportTemplatePreviewResponse(BaseModel):
+    template_id: Optional[str] = None
+    rendered_background_prompt: str = ""
+    universal_prompt: str = ""
+    composed_system_prompt: str = ""
+
+
+class GenerateReportRequest(BaseModel):
+    template_id: Optional[str] = None

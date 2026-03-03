@@ -4,7 +4,7 @@ from typing import Any, Dict, Iterator, List
 import json
 import os
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header, Body
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -23,10 +23,17 @@ from app.models import (
     ContextFileDetailResponse,
     ContextMutateResponse,
     ContextSetResponse,
+    GenerateReportRequest,
     CreateRunRequest,
     CreateRunResponse,
     PlanningDepthBonusRequest,
     PatchSessionRequest,
+    ReportTemplateCreateRequest,
+    ReportTemplateListResponse,
+    ReportTemplate,
+    ReportTemplatePreviewRequest,
+    ReportTemplatePreviewResponse,
+    ReportTemplateUpdateRequest,
     RunSnapshotResponse,
     StartFromWorkspaceRequest,
     SessionListResponse,
@@ -1447,6 +1454,91 @@ def download_report(
     )
 
 
+@app.get("/api/report/templates", response_model=ReportTemplateListResponse)
+def list_report_templates(request: Request) -> ReportTemplateListResponse:
+    user = _require_user(request)
+    payload = run_manager.list_report_templates(owner_id=user.user_id)
+    return ReportTemplateListResponse(
+        templates=[
+            ReportTemplate.model_validate(tpl)
+            for tpl in payload.get("templates", [])
+            if isinstance(tpl, dict)
+        ],
+        default_manual_template_id=str(
+            payload.get("default_manual_template_id", "executive") or "executive"
+        ),
+    )
+
+
+@app.post("/api/report/templates", response_model=ReportTemplate)
+def create_report_template(
+    request: Request,
+    body: ReportTemplateCreateRequest,
+) -> ReportTemplate:
+    user = _require_user(request)
+    try:
+        created = run_manager.create_report_template(
+            owner_id=user.user_id,
+            name=body.name,
+            background_type=body.background_type,
+            fields=body.fields.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return ReportTemplate.model_validate(created)
+
+
+@app.put("/api/report/templates/{template_id}", response_model=ReportTemplate)
+def update_report_template(
+    template_id: str,
+    request: Request,
+    body: ReportTemplateUpdateRequest,
+) -> ReportTemplate:
+    user = _require_user(request)
+    try:
+        updated = run_manager.update_report_template(
+            owner_id=user.user_id,
+            template_id=template_id,
+            name=body.name,
+            background_type=body.background_type,
+            fields=body.fields.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return ReportTemplate.model_validate(updated)
+
+
+@app.delete("/api/report/templates/{template_id}")
+def delete_report_template(template_id: str, request: Request) -> dict:
+    user = _require_user(request)
+    ok = run_manager.delete_report_template(
+        owner_id=user.user_id,
+        template_id=template_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"ok": True}
+
+
+@app.post(
+    "/api/report/templates/preview",
+    response_model=ReportTemplatePreviewResponse,
+)
+def preview_report_template(
+    request: Request,
+    body: ReportTemplatePreviewRequest,
+) -> ReportTemplatePreviewResponse:
+    user = _require_user(request)
+    preview = run_manager.preview_report_template(
+        owner_id=user.user_id,
+        template_id=body.template_id,
+        draft=body.draft.model_dump() if body.draft else None,
+    )
+    return ReportTemplatePreviewResponse.model_validate(preview)
+
+
 @app.post("/api/runs/{run_id}/abort")
 def abort_run(
     run_id: str,
@@ -1682,16 +1774,21 @@ def increment_planning_depth_bonus(
 def generate_partial_report(
     run_id: str,
     request: Request,
+    body: GenerateReportRequest | None = Body(default=None),
     expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
     user = _require_user(request)
     if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
         raise HTTPException(status_code=404, detail="Run not found")
+    selected_template_id = str(
+        (body.template_id if body else "") or ""
+    ).strip() or None
     idem_key = _idempotency_key_from_request(request)
     idem_scope = f"report_partial:{run_id}"
     idem_payload = {
         "run_id": run_id,
         "mode": "partial",
+        "template_id": selected_template_id,
         "expected_version": expected_version,
     }
     idem = run_manager.idempotency_begin(
@@ -1705,7 +1802,11 @@ def generate_partial_report(
         payload = idem.get("payload")
         return payload if isinstance(payload, dict) else {}
     _raise_on_idempotency_state(idem_state)
-    result = run_manager.generate_partial_report(run_id, expected_version=expected_version)
+    result = run_manager.generate_partial_report(
+        run_id,
+        expected_version=expected_version,
+        report_template_id=selected_template_id,
+    )
     if result is None:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         raise HTTPException(status_code=404, detail="Run not found")
@@ -1732,16 +1833,21 @@ def generate_partial_report(
 def generate_report_now(
     run_id: str,
     request: Request,
+    body: GenerateReportRequest | None = Body(default=None),
     expected_version: int | None = Query(default=None, ge=1),
 ) -> dict:
     user = _require_user(request)
     if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
         raise HTTPException(status_code=404, detail="Run not found")
+    selected_template_id = str(
+        (body.template_id if body else "") or ""
+    ).strip() or None
     idem_key = _idempotency_key_from_request(request)
     idem_scope = f"report_full:{run_id}"
     idem_payload = {
         "run_id": run_id,
         "mode": "full",
+        "template_id": selected_template_id,
         "expected_version": expected_version,
     }
     idem = run_manager.idempotency_begin(
@@ -1755,7 +1861,11 @@ def generate_report_now(
         payload = idem.get("payload")
         return payload if isinstance(payload, dict) else {}
     _raise_on_idempotency_state(idem_state)
-    result = run_manager.generate_partial_report(run_id, expected_version=expected_version)
+    result = run_manager.generate_partial_report(
+        run_id,
+        expected_version=expected_version,
+        report_template_id=selected_template_id,
+    )
     if result is None:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
         raise HTTPException(status_code=404, detail="Run not found")

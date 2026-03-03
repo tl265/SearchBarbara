@@ -435,6 +435,49 @@ body.sessions-collapsed .session-toggle-icon {
   align-items: center;
   gap: 6px;
 }
+.report-template-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+.report-template-row select {
+  min-width: 220px;
+  max-width: 100%;
+}
+.report-template-editor {
+  margin: 6px 0 10px;
+}
+.report-template-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.report-template-form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.84rem;
+}
+.report-template-form-grid textarea,
+.report-template-form-grid input,
+.report-template-form-grid select {
+  width: 100%;
+  box-sizing: border-box;
+}
+.report-template-actions {
+  margin-top: 8px;
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#reportTplPreview {
+  margin-top: 8px;
+  max-height: 220px;
+  overflow: auto;
+}
 .debug-only-control {
   display: none;
 }
@@ -1015,5 +1058,8 @@ details.node-section {
     gap: 4px;
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+  .report-template-form-grid {
+    grid-template-columns: 1fr;
   }
 }
