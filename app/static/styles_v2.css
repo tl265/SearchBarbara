@@ -434,15 +434,13 @@ body.sessions-collapsed .session-toggle-icon {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-}
-.report-template-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
   flex-wrap: wrap;
+  justify-content: flex-end;
 }
-.report-template-row select {
+.report-template-inline-label {
+  font-size: 0.84rem;
+}
+.report-template-inline-select {
   min-width: 220px;
   max-width: 100%;
 }

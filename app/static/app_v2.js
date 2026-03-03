@@ -46,7 +46,6 @@ const reportPrevBtn = document.getElementById("reportPrevBtn");
 const reportNextBtn = document.getElementById("reportNextBtn");
 const reportVersionLabel = document.getElementById("reportVersionLabel");
 const reportTemplateSelectEl = document.getElementById("reportTemplateSelect");
-const reportTemplateManageBtn = document.getElementById("reportTemplateManageBtn");
 const reportTemplateEditorEl = document.getElementById("reportTemplateEditor");
 const reportTplNameEl = document.getElementById("reportTplName");
 const reportTplBackgroundTypeEl = document.getElementById("reportTplBackgroundType");
@@ -275,7 +274,6 @@ function renderReportTemplateSelect() {
 function setReportTemplateControlsDisabled(disabled) {
   const off = !!disabled;
   if (reportTemplateSelectEl) reportTemplateSelectEl.disabled = off;
-  if (reportTemplateManageBtn) reportTemplateManageBtn.disabled = off;
   if (reportTplNameEl) reportTplNameEl.disabled = off;
   if (reportTplBackgroundTypeEl) reportTplBackgroundTypeEl.disabled = off;
   if (reportTplAudienceEl) reportTplAudienceEl.disabled = off;
@@ -3337,12 +3335,6 @@ if (reportTemplateSelectEl) {
   });
 }
 
-if (reportTemplateManageBtn && reportTemplateEditorEl) {
-  reportTemplateManageBtn.addEventListener("click", () => {
-    reportTemplateEditorEl.open = !reportTemplateEditorEl.open;
-  });
-}
-
 if (reportTplNewBtn) {
   reportTplNewBtn.addEventListener("click", () => {
     selectedReportTemplateId = "";
@@ -3458,7 +3450,7 @@ if (reportTplPreviewBtn) {
       }
       const data = await rsp.json();
       if (reportTplPreviewEl) {
-        reportTplPreviewEl.textContent = String(data.composed_system_prompt || "");
+        reportTplPreviewEl.textContent = String(data.rendered_background_prompt || "");
       }
       if (reportTemplateEditorEl) reportTemplateEditorEl.open = true;
     } catch (err) {

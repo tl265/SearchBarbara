@@ -171,6 +171,8 @@
         <div class="section-head">
           <h2>Report</h2>
           <div class="report-head-tools">
+            <label for="reportTemplateSelect" class="muted report-template-inline-label">Template</label>
+            <select id="reportTemplateSelect" class="report-template-inline-select"></select>
             <button
               id="reportBtn"
               class="icon-btn"
@@ -203,11 +205,6 @@
             <button id="reportNextBtn" type="button" disabled>&gt;</button>
           </div>
         </div>
-        <div class="report-template-row">
-          <label for="reportTemplateSelect" class="muted">Template</label>
-          <select id="reportTemplateSelect"></select>
-          <button id="reportTemplateManageBtn" type="button">Manage</button>
-        </div>
         <details id="reportTemplateEditor" class="report-template-editor">
           <summary>Template Editor</summary>
           <div class="report-template-form-grid">
@@ -216,7 +213,7 @@
               <select id="reportTplBackgroundType">
                 <option value="custom">Custom</option>
                 <option value="executive">Executive</option>
-                <option value="business_head_execution">Business Head (Execution)</option>
+                <option value="business_head_execution">Business Head</option>
               </select>
             </label>
             <label>Audience <textarea id="reportTplAudience" rows="2"></textarea></label>

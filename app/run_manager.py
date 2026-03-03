@@ -4,6 +4,7 @@ import hashlib
 import mimetypes
 import io
 import os
+import re
 import tempfile
 import threading
 import uuid
@@ -657,6 +658,69 @@ class RunManager:
         lines.append("</Audience_Scenario>")
         return "\n".join(lines).strip()
 
+    def _parse_background_prompt_fields(self, prompt_text: str) -> Dict[str, Any]:
+        text = str(prompt_text or "").strip()
+        if not text:
+            return self._normalize_report_template_fields({})
+        lines = [str(line or "").strip() for line in text.splitlines()]
+
+        def _section_key(raw_title: str) -> str:
+            title = str(raw_title or "").strip().lower()
+            if not title:
+                return ""
+            if "do" in title and "don't" not in title and "dont" not in title:
+                return "dos"
+            if "don't" in title or "dont" in title:
+                return "donts"
+            if "汇报对象" in title or "背景和汇报对象" in title:
+                return "audience"
+            if "汇报场景" in title:
+                return "presentation_setup"
+            if "语气" in title or "风格" in title:
+                return "tone"
+            if "重点关注" in title:
+                return "focus"
+            return ""
+
+        buckets: Dict[str, List[str]] = {
+            "audience": [],
+            "presentation_setup": [],
+            "tone": [],
+            "focus": [],
+            "dos": [],
+            "donts": [],
+        }
+        current = ""
+        for raw in lines:
+            line = raw.strip()
+            if not line:
+                continue
+            m = re.match(r"^【\s*(.*?)\s*】$", line)
+            if m:
+                current = _section_key(m.group(1))
+                continue
+            if line.startswith("<") and line.endswith(">"):
+                continue
+            if not current:
+                continue
+            if current in {"dos", "donts"}:
+                item = re.sub(r"^\s*(?:\d+\s*[\.、\)]\s*|[-*•]\s*)", "", line).strip()
+                if item:
+                    buckets[current].append(item)
+                continue
+            buckets[current].append(line)
+
+        return self._normalize_report_template_fields(
+            {
+                "audience": "\n".join(buckets["audience"]).strip(),
+                "presentation_setup": "\n".join(buckets["presentation_setup"]).strip(),
+                "tone": "\n".join(buckets["tone"]).strip(),
+                "focus": "\n".join(buckets["focus"]).strip(),
+                "dos": buckets["dos"],
+                "donts": buckets["donts"],
+            }
+        )
+
     def _load_report_prompt_file(self, filename: str, fallback: str = "") -> str:
         try:
             return load_prompt(filename)
@@ -670,7 +734,7 @@ class RunManager:
         return str(SYSTEM_REPORT or "").strip()
 
     def _builtin_report_template_specs(self) -> List[Dict[str, Any]]:
-        return [
+        specs = [
             {
                 "template_id": "executive",
                 "name": "Executive / Senior Management",
@@ -695,7 +759,7 @@ class RunManager:
             },
             {
                 "template_id": "business_head_execution",
-                "name": "Business Head (Execution-focused)",
+                "name": "Business Head",
                 "background_type": "business_head_execution",
                 "fields": self._normalize_report_template_fields(
                     {
@@ -716,6 +780,28 @@ class RunManager:
                 "prompt_file": "report.background.business_head_execution.txt",
             },
         ]
+        out: List[Dict[str, Any]] = []
+        for item in specs:
+            spec = dict(item)
+            fallback_fields = self._normalize_report_template_fields(spec.get("fields", {}))
+            prompt_file = str(spec.get("prompt_file", "")).strip()
+            if prompt_file:
+                loaded = self._load_report_prompt_file(prompt_file, "")
+                if loaded:
+                    parsed_fields = self._parse_background_prompt_fields(loaded)
+                    if any(
+                        parsed_fields.get(k)
+                        for k in ("audience", "presentation_setup", "tone", "focus", "dos", "donts")
+                    ):
+                        spec["fields"] = parsed_fields
+                    else:
+                        spec["fields"] = fallback_fields
+                else:
+                    spec["fields"] = fallback_fields
+            else:
+                spec["fields"] = fallback_fields
+            out.append(spec)
+        return out
 
     def _render_background_prompt_for_template(
         self, template: Dict[str, Any]
