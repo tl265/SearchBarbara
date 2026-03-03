@@ -8,6 +8,7 @@ const pauseBtn = document.getElementById("pauseBtn");
 const resumeBtn = document.getElementById("resumeBtn");
 const abortBtn = document.getElementById("abortBtn");
 const swapBatchCanvasBtn = document.getElementById("swapBatchCanvasBtn");
+const planningCommitCanvasBtn = document.getElementById("planningCommitCanvasBtn");
 const runMeta = document.getElementById("runMeta");
 const stopReasonEl = document.getElementById("stopReason");
 const errorBanner = document.getElementById("errorBanner");
@@ -738,12 +739,39 @@ function renderPlanningPanel(snap) {
   const phase = planningPhase(snap);
   const pState = planningState(snap);
   const swapInProgress = isPlanningSwapInProgress(snap);
-  const planningUi = derivePlanningUiState(phase, pState, { swapInProgress });
+  const sid = String((snap && (snap.session_id || snap.run_id)) || "").trim();
+  const executionState = String((snap && snap.execution_state) || "").toLowerCase();
+  const researchState = String((snap && snap.research_state) || "").toLowerCase();
+  const paused = researchState ? researchState === "paused" : executionState === "paused";
+  const terminal = researchState
+    ? researchState === "terminal"
+    : ["completed", "aborted", "failed"].includes(executionState);
+  const pausePending = pauseRequested && !paused && !terminal;
+  const abortPending = abortRequested || isAbortPendingSnapshot(snap);
+  const transitionPending = pausePending || abortPending;
+  const reportGeneratingForThisRun = isReportGeneratingForRun(sid);
+  const reportState = String((snap && snap.report_state) || "").toLowerCase();
+  const reportPhase = String(
+    (snap && (snap.report_status || (snap.tree && snap.tree.report_status))) || "pending"
+  ).toLowerCase();
+  const reportBusy = reportGeneratingForThisRun || reportPhase === "running" || reportState === "generating";
+  const planningUi = derivePlanningUiState(phase, pState, {
+    swapInProgress,
+    reportBusy,
+    transitionPending,
+    startRunBusy: startRunInFlight,
+  });
   if (swapBatchCanvasBtn) {
     swapBatchCanvasBtn.classList.toggle("hidden", !planningUi.inPlanning);
     swapBatchCanvasBtn.disabled = !planningUi.canEdit;
     swapBatchCanvasBtn.setAttribute("title", SWAP_BATCH_LABEL);
     swapBatchCanvasBtn.setAttribute("aria-label", SWAP_BATCH_LABEL);
+  }
+  if (planningCommitCanvasBtn) {
+    planningCommitCanvasBtn.classList.toggle("hidden", !planningUi.inPlanning);
+    planningCommitCanvasBtn.disabled = planningUi.planningActionDisabled;
+    planningCommitCanvasBtn.setAttribute("title", "Go for a full run");
+    planningCommitCanvasBtn.setAttribute("aria-label", "Go for a full run");
   }
 }
 
@@ -2177,11 +2205,11 @@ function renderCanvas(tree) {
           html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
           html += `</button>`;
           const capTail = Number.isFinite(bonusCap) ? ` (<=${Math.max(0, Number(bonusCap))})` : "";
-          html += `<span class="planning-node-depth">depth bonus +${bonus}${esc(capTail)}</span>`;
+          html += `<span class="planning-node-depth">depth +${bonus}${esc(capTail)}</span>`;
           html += `</div>`;
         } else if (researchDepthBonus && Number.isFinite(researchDepthBonus.bonus) && researchDepthBonus.bonus > 0) {
           html += `<div class="planning-node-actions">`;
-          html += `<span class="planning-node-depth planning-node-depth-readonly">depth bonus +${Math.max(0, Number(researchDepthBonus.bonus || 0))}</span>`;
+          html += `<span class="planning-node-depth planning-node-depth-readonly">depth +${Math.max(0, Number(researchDepthBonus.bonus || 0))}</span>`;
           html += `</div>`;
         }
         if (q.parent) {
@@ -3150,6 +3178,19 @@ if (swapBatchCanvasBtn) {
   swapBatchCanvasBtn.addEventListener("click", async () => {
     try {
       await planningSwapBatch();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+  });
+}
+
+if (planningCommitCanvasBtn) {
+  planningCommitCanvasBtn.addEventListener("click", async () => {
+    const phase = planningPhase(currentSnapshot);
+    const pState = planningState(currentSnapshot);
+    if (!currentRunId || phase !== "planning" || pState !== "review") return;
+    try {
+      await planningCommit();
     } catch (err) {
       showError(err.message || String(err));
     }

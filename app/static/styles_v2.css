@@ -676,11 +676,14 @@ body.ui-debug-on .zoom-debug {
   cursor: not-allowed;
 }
 .planning-node-depth {
+  display: inline-flex;
+  align-items: center;
   font-size: 0.84em;
   font-weight: 600;
   color: #0f172a;
-  min-width: 122px;
-  text-align: left;
+  width: fit-content;
+  max-width: 100%;
+  text-align: center;
   background: #eef2ff;
   border: 1px solid #c7d2fe;
   border-radius: 999px;
