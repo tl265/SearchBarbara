@@ -447,6 +447,26 @@ body.sessions-collapsed .session-toggle-icon {
 .report-template-editor {
   margin: 6px 0 10px;
 }
+.report-template-editor > summary {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.report-template-editor > summary::-webkit-details-marker {
+  display: none;
+}
+.report-template-toggle-btn.is-active {
+  color: #0f766e;
+  border-color: #0f766e;
+  background: #ecfdf5;
+}
 .report-template-form-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -478,6 +498,18 @@ body.sessions-collapsed .session-toggle-icon {
 }
 .debug-only-control {
   display: none;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 body.ui-debug-on .debug-only-control {
   display: inline-block;

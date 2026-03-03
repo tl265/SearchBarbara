@@ -45,6 +45,7 @@ const usageEl = document.getElementById("usage");
 const reportPrevBtn = document.getElementById("reportPrevBtn");
 const reportNextBtn = document.getElementById("reportNextBtn");
 const reportVersionLabel = document.getElementById("reportVersionLabel");
+const reportTemplateToggleBtn = document.getElementById("reportTemplateToggleBtn");
 const reportTemplateSelectEl = document.getElementById("reportTemplateSelect");
 const reportTemplateEditorEl = document.getElementById("reportTemplateEditor");
 const reportTplNameEl = document.getElementById("reportTplName");
@@ -273,6 +274,7 @@ function renderReportTemplateSelect() {
 
 function setReportTemplateControlsDisabled(disabled) {
   const off = !!disabled;
+  if (reportTemplateToggleBtn) reportTemplateToggleBtn.disabled = off;
   if (reportTemplateSelectEl) reportTemplateSelectEl.disabled = off;
   if (reportTplNameEl) reportTplNameEl.disabled = off;
   if (reportTplBackgroundTypeEl) reportTplBackgroundTypeEl.disabled = off;
@@ -289,6 +291,27 @@ function setReportTemplateControlsDisabled(disabled) {
   if (!off) {
     refreshReportTemplateActionAvailability();
   }
+}
+
+function syncReportTemplateToggleState() {
+  if (!reportTemplateToggleBtn) return;
+  const isOpen = !!(reportTemplateEditorEl && reportTemplateEditorEl.open);
+  reportTemplateToggleBtn.classList.toggle("is-active", isOpen);
+  reportTemplateToggleBtn.setAttribute("aria-pressed", isOpen ? "true" : "false");
+  reportTemplateToggleBtn.setAttribute(
+    "aria-label",
+    isOpen ? "Collapse template editor" : "Expand template editor"
+  );
+  reportTemplateToggleBtn.setAttribute(
+    "title",
+    isOpen ? "Collapse template editor" : "Expand template editor"
+  );
+}
+
+function setReportTemplateEditorOpen(open) {
+  if (!reportTemplateEditorEl) return;
+  reportTemplateEditorEl.open = !!open;
+  syncReportTemplateToggleState();
 }
 
 async function fetchReportTemplates() {
@@ -3335,6 +3358,20 @@ if (reportTemplateSelectEl) {
   });
 }
 
+if (reportTemplateToggleBtn) {
+  reportTemplateToggleBtn.addEventListener("click", () => {
+    const isOpen = !!(reportTemplateEditorEl && reportTemplateEditorEl.open);
+    setReportTemplateEditorOpen(!isOpen);
+  });
+}
+
+if (reportTemplateEditorEl) {
+  reportTemplateEditorEl.addEventListener("toggle", () => {
+    syncReportTemplateToggleState();
+  });
+}
+syncReportTemplateToggleState();
+
 if (reportTplNewBtn) {
   reportTplNewBtn.addEventListener("click", () => {
     selectedReportTemplateId = "";
@@ -3342,7 +3379,7 @@ if (reportTplNewBtn) {
       reportTemplateSelectEl.value = "";
     }
     clearReportTemplateFormForNew();
-    if (reportTemplateEditorEl) reportTemplateEditorEl.open = true;
+    setReportTemplateEditorOpen(true);
     refreshReportTemplateActionAvailability();
   });
 }
@@ -3452,7 +3489,7 @@ if (reportTplPreviewBtn) {
       if (reportTplPreviewEl) {
         reportTplPreviewEl.textContent = String(data.rendered_background_prompt || "");
       }
-      if (reportTemplateEditorEl) reportTemplateEditorEl.open = true;
+      setReportTemplateEditorOpen(true);
     } catch (err) {
       showError(err.message || String(err));
     } finally {
