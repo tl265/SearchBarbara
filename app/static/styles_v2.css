@@ -434,9 +434,82 @@ body.sessions-collapsed .session-toggle-icon {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.report-template-inline-label {
+  font-size: 0.84rem;
+}
+.report-template-inline-select {
+  min-width: 220px;
+  max-width: 100%;
+}
+.report-template-editor {
+  margin: 6px 0 10px;
+}
+.report-template-editor > summary {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.report-template-editor > summary::-webkit-details-marker {
+  display: none;
+}
+.report-template-toggle-btn.is-active {
+  color: #0f766e;
+  border-color: #0f766e;
+  background: #ecfdf5;
+}
+.report-template-form-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin-top: 8px;
+}
+.report-template-form-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.84rem;
+}
+.report-template-form-grid textarea,
+.report-template-form-grid input,
+.report-template-form-grid select {
+  width: 100%;
+  box-sizing: border-box;
+}
+.report-template-actions {
+  margin-top: 8px;
+  display: inline-flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#reportTplPreview {
+  margin-top: 8px;
+  max-height: 220px;
+  overflow: auto;
 }
 .debug-only-control {
   display: none;
+}
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 body.ui-debug-on .debug-only-control {
   display: inline-block;
@@ -1015,5 +1088,8 @@ details.node-section {
     gap: 4px;
     flex-wrap: wrap;
     justify-content: flex-end;
+  }
+  .report-template-form-grid {
+    grid-template-columns: 1fr;
   }
 }

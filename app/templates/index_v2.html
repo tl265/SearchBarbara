@@ -172,6 +172,19 @@
           <h2>Report</h2>
           <div class="report-head-tools">
             <button
+              id="reportTemplateToggleBtn"
+              class="icon-btn report-template-toggle-btn"
+              type="button"
+              aria-label="Toggle template editor"
+              title="Template Editor"
+            >
+              <svg class="icon template-editor-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M4 6h16M7 6v4m10-4v8M4 12h16M10 12v6m-6 0h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </button>
+            <label for="reportTemplateSelect" class="muted report-template-inline-label">Template</label>
+            <select id="reportTemplateSelect" class="report-template-inline-select"></select>
+            <button
               id="reportBtn"
               class="icon-btn"
               type="button"
@@ -203,6 +216,32 @@
             <button id="reportNextBtn" type="button" disabled>&gt;</button>
           </div>
         </div>
+        <details id="reportTemplateEditor" class="report-template-editor">
+          <summary><span class="sr-only">Template Editor</span></summary>
+          <div class="report-template-form-grid">
+            <label>Name <input id="reportTplName" type="text" maxlength="120" /></label>
+            <label>Background
+              <select id="reportTplBackgroundType">
+                <option value="custom">Custom</option>
+                <option value="executive">Executive</option>
+                <option value="business_head_execution">Business Head</option>
+              </select>
+            </label>
+            <label>Audience <textarea id="reportTplAudience" rows="2"></textarea></label>
+            <label>Presentation Setup <textarea id="reportTplPresentationSetup" rows="2"></textarea></label>
+            <label>Do's (one line each) <textarea id="reportTplDos" rows="3"></textarea></label>
+            <label>Don'ts (one line each) <textarea id="reportTplDonts" rows="3"></textarea></label>
+            <label>Tone <input id="reportTplTone" type="text" /></label>
+            <label>Focus <input id="reportTplFocus" type="text" /></label>
+          </div>
+          <div class="report-template-actions">
+            <button id="reportTplNewBtn" type="button">New</button>
+            <button id="reportTplSaveBtn" type="button">Save</button>
+            <button id="reportTplDeleteBtn" type="button">Delete</button>
+            <button id="reportTplPreviewBtn" type="button">Preview</button>
+          </div>
+          <pre id="reportTplPreview" class="usage"></pre>
+        </details>
         <div id="coverageNote" class="muted"></div>
         <div id="reportRendered" class="report-body rendered"></div>
         <h3>Token Usage</h3>
