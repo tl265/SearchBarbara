@@ -3,6 +3,7 @@ from queue import Empty, Queue
 from typing import Any, Dict, Iterator, List
 import json
 import os
+import time
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header, Body
 from fastapi.responses import (
@@ -45,6 +46,8 @@ from app.sse import format_sse
 BASE_DIR = Path(__file__).resolve().parent
 WEB_CONFIG_PATH = BASE_DIR.parent / "web_config.json"
 templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
+
+_BOOT_TS = str(int(time.time()))
 
 app = FastAPI(title="SearchBarbara Web")
 app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
@@ -315,12 +318,15 @@ async def auth_middleware(request: Request, call_next):
         return await call_next(request)
 
     if not AUTH_CONFIG.configured:
-        if path.startswith("/api/"):
-            return JSONResponse(status_code=500, content={"error": "auth_not_configured"})
-        return HTMLResponse(
-            "<h2>Auth not configured.</h2><p>Set AUTH0_* and AUTH_COOKIE_SECRET env vars.</p>",
-            status_code=500,
+        # Auth not configured — bypass with a local dev user.
+        from app.auth import UserPrincipal
+        import time as _time
+        request.state.user = UserPrincipal(
+            user_id="local-dev-user",
+            email="dev@localhost",
+            session_expires_at=int(_time.time()) + 86400,
         )
+        return await call_next(request)
 
     user = get_current_user_from_request(request, auth_service)
     if not user:
@@ -430,6 +436,7 @@ def index(request: Request) -> HTMLResponse:
                 WEB_CONFIG.get("default_results_per_query", 3)
             ),
             "ui_debug": bool(WEB_CONFIG.get("ui_debug", False)),
+            "asset_v": _BOOT_TS,
         },
     )
 
@@ -564,14 +571,30 @@ def _latest_thought(events: List[Dict[str, Any]]) -> str:
     if et == "report_heartbeat":
         return "Still writing report..."
     if et == "run_heartbeat":
+        _phase_labels = {
+            "working": "Processing",
+            "initializing": "Initializing research",
+            "planning_node": "Planning sub-questions",
+            "idle": "Waiting for review",
+            "searching": "Searching the web",
+            "query_decision": "Evaluating queries",
+            "synthesizing": "Synthesizing results",
+            "node_sufficiency": "Checking evidence sufficiency",
+            "decomposing": "Decomposing into sub-tasks",
+            "run_sufficiency": "Checking overall sufficiency",
+            "writing_report": "Writing report",
+            "binding_context": "Loading context files",
+            "paused": "Paused",
+        }
         phase = str(payload.get("phase", "")).strip()
+        label = _phase_labels.get(phase, phase or "Processing")
         sq = str(payload.get("sub_question", "")).strip()
         query = str(payload.get("query", "")).strip()
         if query:
-            return f"Still working ({phase or 'processing'}): {query}"
+            return f"{label}: {query}"
         if sq:
-            return f"Still working ({phase or 'processing'}): {sq}"
-        return f"Still working ({phase or 'processing'})."
+            return f"{label}: {sq}"
+        return f"{label}."
     return et.replace("_", " ").strip().capitalize()
 
 

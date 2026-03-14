@@ -4,10 +4,11 @@ After=network.target
 
 [Service]
 Type=simple
-User=tl265
-WorkingDirectory=/home/tl265/projects/SearchBarbara
+User=root
+WorkingDirectory=/root/SearchBarbara
+EnvironmentFile=/root/SearchBarbara/.env
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/tl265/projects/SearchBarbara/run_web.py
+ExecStart=/root/SearchBarbara/.venv/bin/python /root/SearchBarbara/run_web.py
 Restart=always
 RestartSec=3
 

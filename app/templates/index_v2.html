@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SearchBarbara</title>
-  <link rel="stylesheet" href="/static/styles_v2.css" />
+  <link rel="stylesheet" href="/static/styles_v2.css?v={{ asset_v }}" />
 </head>
 <body>
   <div class="app-shell">
@@ -69,45 +69,69 @@
         </div>
       </div>
       <div id="sessionList" class="session-list"></div>
+      <div class="auth-box auth-box-rail">
+        <span class="muted">{{ user_email }}</span>
+        <form method="post" action="/logout">
+          <button type="submit">Logout</button>
+        </form>
+      </div>
     </aside>
 
-    <div class="app-main">
+    <div class="app-main is-empty">
+    <div class="homepage-logo">SearchBarbara</div>
+    <div class="welcome-greeting">Hello, {{ user_email }}</div>
     <section class="prompt-dock card">
-      <label for="task" class="dock-label">Research Task</label>
       <div class="task-run-row">
-        <textarea id="task" rows="3" placeholder="Ask a deep research question..."></textarea>
-        <button id="runBtn" class="primary">Start Research</button>
+        <div class="task-textarea-wrap">
+          <div id="inlineContextFiles" class="inline-context-files"></div>
+          <textarea id="task" rows="3" placeholder="Ask a deep research question..." maxlength="140"></textarea>
+          <span id="taskCharCount" class="task-char-count">0/140</span>
+          <input id="contextUploadInput" type="file" multiple style="display:none" />
+          <div class="depth-dropdown">
+            <button id="contextAddBtn" class="depth-dropdown-btn" type="button">
+              <svg viewBox="0 0 12 12" width="10" height="10" aria-hidden="true"><path d="M6 1v10M1 6h10" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+              <span class="ctx-add-tooltip">上传参考/支撑文献</span>
+            </button>
+            <button id="depthDropdownBtn" class="depth-dropdown-btn" type="button">
+              <span class="depth-tooltip">问题拆解深度</span>
+              Depth: <span id="depthDropdownValue">{{ default_max_depth }}</span>
+              <svg class="depth-dropdown-arrow" viewBox="0 0 12 12" aria-hidden="true"><path d="M3 5l3 3 3-3" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <div id="depthDropdownMenu" class="depth-dropdown-menu hidden">
+              <div class="depth-dropdown-option" data-depth="2">2</div>
+              <div class="depth-dropdown-option" data-depth="3">3</div>
+              <div class="depth-dropdown-option" data-depth="4">4</div>
+            </div>
+            <input id="maxDepth" type="hidden" value="{{ default_max_depth }}" />
+            <button id="runBtn" class="primary run-inline-btn">Start</button>
+          </div>
+        </div>
       </div>
-      <details>
+      <div class="prompt-examples">
+        <button type="button" class="prompt-example-chip">OpenClaw的市场扫描及发展趋势分析</button>
+        <button type="button" class="prompt-example-chip">美国主流信用卡积分及权益体系研究</button>
+        <button type="button" class="prompt-example-chip">近一年电商平台大促调研分析</button>
+      </div>
+      <details style="display:none">
         <summary>Advanced controls</summary>
         <div class="dock-controls advanced-controls-row">
           <button id="planningActionBtn" type="button">Start Planning</button>
           <button id="pauseBtn" class="debug-only-control" type="button" disabled>Pause</button>
           <button id="resumeBtn" class="debug-only-control" type="button" disabled>Resume</button>
           <button id="abortBtn" type="button" disabled>Abort</button>
-          <label class="inline-number-control">Baseline depth <input id="maxDepth" type="number" value="{{ default_max_depth }}" min="{{ max_depth_min }}" max="{{ max_depth_max }}"></label>
         </div>
-        <section class="context context-in-advanced">
+        <section class="context context-in-advanced" style="display:none">
           <div class="section-head">
             <h2>Context</h2>
             <div class="context-head-tools">
               <span id="contextMeta" class="muted">No session selected.</span>
             </div>
           </div>
-          <div class="context-controls">
-            <input id="contextUploadInput" type="file" multiple />
-            <button id="contextUploadBtn" type="button" disabled>Upload Files</button>
-          </div>
           <div id="contextDiffBanner" class="muted"></div>
-          <div class="context-grid">
-            <div class="context-files-pane">
-              <h3>Files</h3>
-              <div id="contextFiles" class="context-files-list"></div>
-            </div>
-            <div class="context-digest-pane">
-              <h3>User Context Digest</h3>
-              <pre id="contextAggregateDigest" class="usage"></pre>
-            </div>
+          <div id="contextFiles" style="display:none"></div>
+          <div class="context-digest-pane">
+            <h3>User Context Digest</h3>
+            <pre id="contextAggregateDigest" class="usage"></pre>
           </div>
         </section>
       </details>
@@ -116,11 +140,22 @@
       <div id="errorBanner" class="error hidden" aria-live="polite"></div>
     </section>
 
+    <section id="progressSection" class="progress-section" aria-live="polite">
+      <div class="progress-section-bar">
+        <h3 class="progress-title">Thought Stream</h3>
+        <button id="generateReportBtn" type="button" disabled>Generate Report</button>
+        <button id="viewReportBtn" type="button" disabled>Review Report</button>
+      </div>
+      <div class="progress-log-box">
+        <div id="progressLog" class="progress-log"></div>
+      </div>
+    </section>
+
     <main class="content-grid">
       <section class="canvas card">
         <div class="section-head">
           <div class="canvas-title-group">
-            <h2>Research Canvas</h2>
+            <h2></h2>
             <button
               id="swapBatchCanvasBtn"
               class="icon-btn hidden"
@@ -147,7 +182,7 @@
               </svg>
             </button>
           </div>
-          <div class="canvas-toolbar">
+          <div class="canvas-toolbar" style="display:none">
             <span id="canvasHint" class="muted">Auto-fit</span>
             <button id="zoomOutBtn" type="button">-</button>
             <span id="zoomPct" class="zoom-pct">100%</span>
@@ -156,96 +191,15 @@
             <span id="fitDebug" class="zoom-debug muted"></span>
           </div>
         </div>
-        <div id="canvas" class="canvas-board"></div>
-      </section>
-
-      <section class="thoughts card" aria-live="polite">
-        <div class="section-head">
-          <h2>Thought Stream</h2>
-          <span id="latestThought" class="muted"></span>
-        </div>
-        <div id="thoughtStream" class="thought-list"></div>
-      </section>
-
-      <section class="report card">
-        <div class="section-head">
-          <h2>Report</h2>
-          <div class="report-head-tools">
-            <button
-              id="reportTemplateToggleBtn"
-              class="icon-btn report-template-toggle-btn"
-              type="button"
-              aria-label="Toggle template editor"
-              title="Template Editor"
-            >
-              <svg class="icon template-editor-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M4 6h16M7 6v4m10-4v8M4 12h16M10 12v6m-6 0h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              </svg>
-            </button>
-            <label for="reportTemplateSelect" class="muted report-template-inline-label">Template</label>
-            <select id="reportTemplateSelect" class="report-template-inline-select"></select>
-            <button
-              id="reportBtn"
-              class="icon-btn"
-              type="button"
-              disabled
-              aria-label="Generate report from current findings"
-              title="Generate report from current findings"
-            >
-              <svg class="icon refresh-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                <path d="M20 4v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-            </button>
-            <button
-              id="downloadBtn"
-              class="icon-btn"
-              type="button"
-              disabled
-              aria-label="Download report"
-              title="Download report"
-            >
-              <svg class="icon download-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 3v12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-                <path d="m7 10 5 5 5-5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                <path d="M4 21h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-              </svg>
-            </button>
-            <button id="reportPrevBtn" type="button" disabled>&lt;</button>
-            <span id="reportVersionLabel" class="muted">-/-</span>
-            <button id="reportNextBtn" type="button" disabled>&gt;</button>
+        <div id="canvas" class="canvas-board">
+          <div id="canvasTreePanel" class="canvas-tree-panel"></div>
+          <div id="canvasDetailPanel" class="canvas-detail-panel">
           </div>
         </div>
-        <details id="reportTemplateEditor" class="report-template-editor">
-          <summary><span class="sr-only">Template Editor</span></summary>
-          <div class="report-template-form-grid">
-            <label>Name <input id="reportTplName" type="text" maxlength="120" /></label>
-            <label>Background
-              <select id="reportTplBackgroundType">
-                <option value="custom">Custom</option>
-                <option value="executive">Executive</option>
-                <option value="business_head_execution">Business Head</option>
-              </select>
-            </label>
-            <label>Audience <textarea id="reportTplAudience" rows="2"></textarea></label>
-            <label>Presentation Setup <textarea id="reportTplPresentationSetup" rows="2"></textarea></label>
-            <label>Do's (one line each) <textarea id="reportTplDos" rows="3"></textarea></label>
-            <label>Don'ts (one line each) <textarea id="reportTplDonts" rows="3"></textarea></label>
-            <label>Tone <input id="reportTplTone" type="text" /></label>
-            <label>Focus <input id="reportTplFocus" type="text" /></label>
-          </div>
-          <div class="report-template-actions">
-            <button id="reportTplNewBtn" type="button">New</button>
-            <button id="reportTplSaveBtn" type="button">Save</button>
-            <button id="reportTplDeleteBtn" type="button">Delete</button>
-            <button id="reportTplPreviewBtn" type="button">Preview</button>
-          </div>
-          <pre id="reportTplPreview" class="usage"></pre>
-        </details>
+      </section>
+
+      <section class="report card" style="display:none">
         <div id="coverageNote" class="muted"></div>
-        <div id="reportRendered" class="report-body rendered"></div>
-        <h3>Token Usage</h3>
-        <pre id="usage" class="usage"></pre>
       </section>
     </main>
     </div>
@@ -260,6 +214,75 @@
       ui_debug: {{ ui_debug|tojson }},
     };
   </script>
-  <script src="/static/app_v2.js"></script>
+  <div id="reportModal" class="report-modal-overlay hidden">
+    <div class="report-modal">
+      <div class="report-modal-header">
+        <div class="report-modal-template-picker">
+          <label for="reportTemplateSelect" class="muted report-template-inline-label">Template</label>
+          <select id="reportTemplateSelect" class="report-template-inline-select"></select>
+          <button
+            id="reportTemplateToggleBtn"
+            class="icon-btn report-template-toggle-btn"
+            type="button"
+            aria-label="Toggle template editor"
+            title="Template Editor"
+          >
+            <svg class="icon template-editor-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M4 6h16M7 6v4m10-4v8M4 12h16M10 12v6m-6 0h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+            </svg>
+          </button>
+          <button
+            id="reportBtn"
+            class="icon-btn"
+            type="button"
+            disabled
+            aria-label="Regenerate report"
+            title="Regenerate report"
+          >
+            <svg class="icon refresh-icon" viewBox="0 0 24 24" aria-hidden="true">
+              <path d="M20 12a8 8 0 1 1-2.34-5.66" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              <path d="M20 4v6h-6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+        <button id="reportModalCloseBtn" class="report-modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <details id="reportTemplateEditor" class="report-template-editor">
+        <summary><span class="sr-only">Template Editor</span></summary>
+        <div class="report-template-form-grid">
+          <label>Name <input id="reportTplName" type="text" maxlength="120" /></label>
+          <label>Background
+            <select id="reportTplBackgroundType">
+              <option value="custom">Custom</option>
+              <option value="executive">Executive</option>
+              <option value="business_head_execution">Business Head</option>
+            </select>
+          </label>
+          <label>Audience <textarea id="reportTplAudience" rows="2"></textarea></label>
+          <label>Presentation Setup <textarea id="reportTplPresentationSetup" rows="2"></textarea></label>
+          <label>Do's (one line each) <textarea id="reportTplDos" rows="3"></textarea></label>
+          <label>Don'ts (one line each) <textarea id="reportTplDonts" rows="3"></textarea></label>
+          <label>Tone <input id="reportTplTone" type="text" /></label>
+          <label>Focus <input id="reportTplFocus" type="text" /></label>
+        </div>
+        <div class="report-template-actions">
+          <button id="reportTplNewBtn" type="button">New</button>
+          <button id="reportTplSaveBtn" type="button">Save</button>
+          <button id="reportTplDeleteBtn" type="button">Delete</button>
+          <button id="reportTplPreviewBtn" type="button">Preview</button>
+        </div>
+        <pre id="reportTplPreview" class="usage"></pre>
+      </details>
+      <div id="reportModalBody" class="report-modal-body report-body rendered"></div>
+      <div class="report-modal-footer">
+        <div class="report-modal-footer-usage">
+          <span class="report-modal-footer-usage-title">Token Usage</span>
+          <span id="usage" class="report-modal-footer-usage-detail"></span>
+        </div>
+        <button id="reportModalDownloadBtn" type="button">Download Report</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/app_v2.js?v={{ asset_v }}"></script>
 </body>
 </html>
