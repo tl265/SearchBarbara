@@ -107,6 +107,7 @@
           </div>
         </div>
       </div>
+      <div id="liveIntent" class="live-intent hidden" aria-live="polite"></div>
       <div class="prompt-examples">
         <button type="button" class="prompt-example-chip">OpenClaw的市场扫描及发展趋势分析</button>
         <button type="button" class="prompt-example-chip">美国主流信用卡积分及权益体系研究</button>
@@ -211,6 +212,11 @@
       auto_fit_safety_px: {{ auto_fit_safety_px|tojson }},
       default_max_depth: {{ default_max_depth|tojson }},
       default_results_per_query: {{ default_results_per_query|tojson }},
+      live_intent_enabled: {{ live_intent_enabled|tojson }},
+      live_intent_min_chars_default: {{ live_intent_min_chars_default|tojson }},
+      live_intent_min_chars_cjk: {{ live_intent_min_chars_cjk|tojson }},
+      live_intent_debounce_ms: {{ live_intent_debounce_ms|tojson }},
+      live_intent_confidence_threshold: {{ live_intent_confidence_threshold|tojson }},
       ui_debug: {{ ui_debug|tojson }},
     };
   </script>

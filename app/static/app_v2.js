@@ -27,6 +27,7 @@ const contextAggregateDigestEl = document.getElementById("contextAggregateDigest
 const contextFileDigestEl = document.getElementById("contextFileDigest");
 const contextDigestPaneEl = document.querySelector(".context-digest-pane");
 const appMainEl = document.querySelector(".app-main");
+const liveIntentEl = document.getElementById("liveIntent");
 
 const runStatusEl = document.getElementById("runStatus");
 const researchStatusEl = document.getElementById("researchStatus");
@@ -130,6 +131,24 @@ const DEFAULT_RESULTS_PER_QUERY = Math.max(
   1,
   Math.floor(Number(APP_CONFIG.default_results_per_query ?? 3))
 );
+const LIVE_INTENT_ENABLED = !!APP_CONFIG.live_intent_enabled;
+const LIVE_INTENT_MIN_CHARS_DEFAULT = Math.max(
+  1,
+  Math.floor(Number(APP_CONFIG.live_intent_min_chars_default ?? 12))
+);
+const LIVE_INTENT_MIN_CHARS_CJK = Math.max(
+  1,
+  Math.floor(Number(APP_CONFIG.live_intent_min_chars_cjk ?? 6))
+);
+const LIVE_INTENT_DEBOUNCE_MS = Math.max(
+  80,
+  Math.floor(Number(APP_CONFIG.live_intent_debounce_ms ?? 320))
+);
+const LIVE_INTENT_CONFIDENCE_THRESHOLD = clamp(
+  Number(APP_CONFIG.live_intent_confidence_threshold ?? 0.45),
+  0,
+  0.95
+);
 const BASE_NODE_CARD_WIDTH = 340;
 const MIN_NODE_FONT_SCALE = 0.72;
 const MAX_NODE_FONT_SCALE = 1.25;
@@ -166,6 +185,14 @@ let currentContextSource = "session";
 let errorBannerTimer = null;
 let contextAggregateViewBase = null;
 let contextAggregateViewMode = "";
+let liveIntentDebounceTimer = null;
+let liveIntentRequestSeq = 0;
+let liveIntentAppliedServerFingerprint = "";
+let liveIntentAppliedText = "";
+let liveIntentPendingServerFingerprint = "";
+let liveIntentPendingServerCount = 0;
+let liveIntentDisplayedPrediction = null;
+let liveIntentFetchController = null;
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
 }
@@ -422,6 +449,7 @@ function resetWorkspaceForNewSession() {
     contextEs = null;
   }
   currentRunId = null;
+  clearLiveIntent();
   if (appMainEl) appMainEl.classList.add("is-empty");
   // Start a truly fresh workspace context for each new session/reset.
   currentWorkspaceId = newWorkspaceId();
@@ -726,6 +754,465 @@ async function responseDetail(rsp, fallback) {
     // no-op
   }
   return detail;
+}
+
+const LIVE_INTENT_FIELD_ORDER = [
+  "task_type",
+  "sophistication",
+  "audience",
+  "stake_level",
+  "time_horizon",
+];
+const LIVE_INTENT_LABELS = {
+  task_type: "Task",
+  sophistication: "Depth",
+  audience: "Audience",
+  stake_level: "Stakes",
+  time_horizon: "Horizon",
+};
+const LIVE_INTENT_VALUES = {
+  task_type: {
+    explain: "Explain",
+    analyze: "Analyze",
+    compare: "Compare",
+    create: "Create",
+    persuade: "Persuade",
+    troubleshoot: "Troubleshoot",
+    plan: "Plan",
+  },
+  sophistication: {
+    intro: "Intro",
+    intermediate: "Intermediate",
+    deep: "Deep",
+  },
+  audience: {
+    general_public: "General public",
+    practitioner: "Practitioner",
+    mid_management: "Mid-management",
+    senior_management: "Senior management",
+    academic: "Academic",
+  },
+  stake_level: {
+    low: "Low",
+    medium: "Medium",
+    high: "High",
+  },
+  time_horizon: {
+    immediate: "Immediate",
+    near_term: "Near term",
+    strategic: "Strategic",
+  },
+};
+const LIVE_INTENT_HINTS = {
+  task_type: {
+    compare: ["compare", "versus", " vs ", "pros and cons", "tradeoff", "对比", "比较", "区别", "优缺点", "差异"],
+    persuade: ["persuade", "convince", "memo", "pitch", "business case", "说服", "打动", "争取", "汇报材料", "立项"],
+    troubleshoot: ["error", "failing", "bug", "debug", "fix", "broken", "issue", "incident", "502", "排查", "报错", "故障", "异常", "修复", "问题", "出错"],
+    plan: ["plan", "roadmap", "strategy", "strategic", "next steps", "rollout", "migration plan", "规划", "计划", "路线图", "方案", "实施", "战略"],
+    create: ["draft", "write", "create", "design", "build", "generate", "写", "起草", "设计", "生成", "做一份", "整理一份"],
+    explain: ["explain", "what is", "why", "how does", "overview", "introduction", "解释", "为什么", "怎么", "介绍", "原理", "是什么"],
+    analyze: ["analyze", "assess", "evaluate", "implications", "recommend", "recommendation", "decision", "分析", "评估", "判断", "建议", "决策"],
+  },
+  sophistication: {
+    intro: ["simple", "simply", "beginner", "basic", "introduction", "eli5", "入门", "基础", "简单", "小白", "通俗"],
+    deep: ["deep", "detailed", "rigorous", "exhaustive", "comprehensive", "technical", "architecture", "benchmark", "academic", "深入", "详细", "严谨", "全面", "系统", "技术细节"],
+  },
+  audience: {
+    senior_management: ["ceo", "cto", "leadership", "executive", "senior management", "board", "exec team", "领导", "管理层", "高层", "老板"],
+    mid_management: ["manager", "managers", "director", "directors", "team lead", "stakeholder", "经理", "主管", "负责人", "项目负责人"],
+    academic: ["academic", "literature", "journal", "paper", "citation", "citations", "学术", "论文", "文献", "研究"],
+    practitioner: ["engineer", "developer", "operator", "implementation", "architecture", "production", "deploy", "debugging", "工程师", "开发", "运维", "研发", "程序员", "架构师"],
+    general_public: ["customer", "non-technical", "public", "general audience", "everyone", "普通人", "大众", "非技术", "小白用户"],
+  },
+  stake_level: {
+    high: ["urgent", "asap", "critical", "board", "compliance", "risk", "production", "incident", "outage", "紧急", "高风险", "事故", "线上", "生产", "宕机", "故障"],
+    medium: ["decide", "decision", "recommend", "migration", "launch", "plan", "persuade", "tradeoff", "决定", "决策", "建议", "迁移", "上线", "规划", "说服"],
+  },
+  time_horizon: {
+    immediate: ["now", "today", "asap", "immediate", "right away", "fix", "incident", "urgent", "现在", "今天", "马上", "尽快", "立刻", "当前"],
+    near_term: ["this week", "this month", "next sprint", "rollout", "migration", "near term", "launch", "本周", "这周", "近期", "这个月", "下周", "下个月"],
+    strategic: ["next quarter", "quarter", "next year", "yearly", "long term", "strategic", "roadmap", "multi-year", "下季度", "明年", "长期", "战略", "年度", "路线图"],
+  },
+};
+const LIVE_INTENT_CJK_RE = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]/g;
+const LIVE_INTENT_LATIN_RE = /[A-Za-z]/g;
+
+function liveIntentNormalizedText(raw) {
+  return String(raw || "").replace(/\s+/g, " ").trim();
+}
+
+function liveIntentSignalChars(raw) {
+  const text = String(raw || "");
+  let total = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    if (!/\s/.test(text[i])) total += 1;
+  }
+  return total;
+}
+
+function liveIntentCjkCharCount(raw) {
+  const matches = String(raw || "").match(LIVE_INTENT_CJK_RE);
+  return matches ? matches.length : 0;
+}
+
+function liveIntentLatinCharCount(raw) {
+  const matches = String(raw || "").match(LIVE_INTENT_LATIN_RE);
+  return matches ? matches.length : 0;
+}
+
+function liveIntentHasMeaningfulCjk(raw) {
+  return liveIntentCjkCharCount(raw) >= 2;
+}
+
+function liveIntentMinimumChars(raw) {
+  return liveIntentHasMeaningfulCjk(raw)
+    ? LIVE_INTENT_MIN_CHARS_CJK
+    : LIVE_INTENT_MIN_CHARS_DEFAULT;
+}
+
+function liveIntentTokenCount(raw) {
+  const text = liveIntentNormalizedText(raw);
+  return text ? text.split(" ").length : 0;
+}
+
+function liveIntentPhraseScore(text, phrases) {
+  let score = 0;
+  for (let i = 0; i < phrases.length; i += 1) {
+    const phrase = String(phrases[i] || "").trim().toLowerCase();
+    if (!phrase) continue;
+    if (text.includes(phrase)) {
+      score += 1 + (0.15 * Math.min(2, Math.max(0, phrase.split(" ").length - 1)));
+    }
+  }
+  return score;
+}
+
+function liveIntentPick(scores, minimum) {
+  let bestLabel = "";
+  let bestScore = 0;
+  for (const [label, scoreRaw] of Object.entries(scores || {})) {
+    const score = Number(scoreRaw || 0);
+    if (!Number.isFinite(score) || score <= bestScore) continue;
+    bestLabel = label;
+    bestScore = score;
+  }
+  if (!bestLabel || bestScore < Number(minimum || 0)) return null;
+  return bestLabel;
+}
+
+function liveIntentIsMaterialShift(prevText, nextText) {
+  const prev = liveIntentNormalizedText(prevText);
+  const next = liveIntentNormalizedText(nextText);
+  if (!prev || !next) return true;
+  if (prev === next) return false;
+  if (liveIntentHasMeaningfulCjk(prev) || liveIntentHasMeaningfulCjk(next)) {
+    const sharedLimit = Math.min(prev.length, next.length);
+    let sharedPrefix = 0;
+    while (sharedPrefix < sharedLimit && prev[sharedPrefix] === next[sharedPrefix]) {
+      sharedPrefix += 1;
+    }
+    if (sharedPrefix >= Math.max(3, Math.floor(sharedLimit * 0.6)) && Math.abs(next.length - prev.length) < 4) {
+      return false;
+    }
+    return sharedPrefix < Math.max(2, Math.floor(sharedLimit * 0.35));
+  }
+  if ((next.startsWith(prev) || prev.startsWith(next)) && Math.abs(next.length - prev.length) < 20) {
+    return false;
+  }
+  const prevTokens = prev.split(" ");
+  const nextTokens = next.split(" ");
+  const prevSet = new Set(prevTokens);
+  let overlap = 0;
+  for (let i = 0; i < nextTokens.length; i += 1) {
+    if (prevSet.has(nextTokens[i])) overlap += 1;
+  }
+  const base = Math.max(prevTokens.length, nextTokens.length, 1);
+  return (overlap / base) < 0.45;
+}
+
+function normalizeLiveIntentPrediction(raw, fallbackSource = "heuristic") {
+  if (!raw || typeof raw !== "object") return null;
+  const out = { source: fallbackSource, confidence: null };
+  for (let i = 0; i < LIVE_INTENT_FIELD_ORDER.length; i += 1) {
+    const key = LIVE_INTENT_FIELD_ORDER[i];
+    const allowed = LIVE_INTENT_VALUES[key] || {};
+    const value = String(raw[key] || "").trim();
+    out[key] = Object.prototype.hasOwnProperty.call(allowed, value) ? value : "";
+  }
+  const confidence = Number(raw.confidence);
+  if (Number.isFinite(confidence)) {
+    out.confidence = clamp(confidence, 0, 1);
+  }
+  const source = String(raw.source || fallbackSource).trim().toLowerCase();
+  out.source = source === "model" ? "model" : "heuristic";
+  let visible = 0;
+  for (let i = 0; i < LIVE_INTENT_FIELD_ORDER.length; i += 1) {
+    if (out[LIVE_INTENT_FIELD_ORDER[i]]) visible += 1;
+  }
+  if (!visible) return null;
+  return out;
+}
+
+function liveIntentFingerprint(prediction) {
+  const normalized = normalizeLiveIntentPrediction(prediction);
+  if (!normalized) return "";
+  return LIVE_INTENT_FIELD_ORDER.map((key) => normalized[key] || "-").join("|");
+}
+
+function computeLocalLiveIntentPrediction(rawText) {
+  const normalized = liveIntentNormalizedText(rawText);
+  if (liveIntentSignalChars(normalized) < liveIntentMinimumChars(normalized)) return null;
+  const lowered = ` ${normalized.toLowerCase()} `;
+  const tokenCount = liveIntentTokenCount(lowered);
+  const cjkCount = liveIntentCjkCharCount(normalized);
+  const cjkMode = liveIntentHasMeaningfulCjk(normalized);
+  const lengthScore = Math.max(tokenCount, cjkCount);
+  const taskScores = {
+    compare: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.compare),
+    persuade: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.persuade),
+    troubleshoot: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.troubleshoot),
+    plan: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.plan),
+    create: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.create),
+    explain: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.explain),
+    analyze: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.task_type.analyze),
+  };
+  if (normalized.endsWith("?") || normalized.endsWith("？")) {
+    taskScores.explain += 0.35;
+    taskScores.analyze += 0.2;
+  }
+  if (tokenCount >= 10 || cjkCount >= 10) taskScores.analyze += 0.15;
+  const taskType = liveIntentPick(taskScores, 0.6) || "analyze";
+
+  const sophisticationScores = {
+    intro: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.sophistication.intro),
+    intermediate: 0.3 + (lengthScore >= 12 ? 0.15 : 0),
+    deep: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.sophistication.deep),
+  };
+  if (["compare", "troubleshoot", "plan", "persuade"].includes(taskType)) {
+    sophisticationScores.intermediate += 0.25;
+  }
+  const sophistication = liveIntentPick(sophisticationScores, 0.4) || "intermediate";
+
+  const audienceScores = {
+    senior_management: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.audience.senior_management),
+    mid_management: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.audience.mid_management),
+    academic: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.audience.academic),
+    practitioner: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.audience.practitioner),
+    general_public: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.audience.general_public),
+  };
+  if (taskType === "troubleshoot") audienceScores.practitioner += 0.8;
+  if (taskType === "explain" && sophistication === "intro") audienceScores.general_public += 0.55;
+  const audience = liveIntentPick(audienceScores, 0.5);
+
+  const stakeScores = {
+    high: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.stake_level.high),
+    medium: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.stake_level.medium),
+    low: 0.3,
+  };
+  if (["persuade", "compare", "plan"].includes(taskType)) stakeScores.medium += 0.35;
+  if (taskType === "troubleshoot") stakeScores.high += 0.4;
+  const stakeLevel = liveIntentPick(stakeScores, 0.35) || "low";
+
+  const horizonScores = {
+    immediate: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.time_horizon.immediate),
+    near_term: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.time_horizon.near_term),
+    strategic: liveIntentPhraseScore(lowered, LIVE_INTENT_HINTS.time_horizon.strategic),
+  };
+  if (taskType === "plan") {
+    horizonScores.near_term += 0.35;
+    horizonScores.strategic += 0.25;
+  }
+  const timeHorizon = liveIntentPick(horizonScores, 0.35);
+
+  const scores = [];
+  [taskScores[taskType], sophisticationScores[sophistication], audience ? audienceScores[audience] : 0, stakeScores[stakeLevel], timeHorizon ? horizonScores[timeHorizon] : 0]
+    .forEach((score) => {
+      const n = Number(score || 0);
+      if (Number.isFinite(n) && n > 0) scores.push(n);
+    });
+  const confidence = Math.min(
+    0.88,
+    0.38 + (scores.reduce((sum, value) => sum + value, 0) / Math.max(1, scores.length * 3.8))
+  );
+
+  const prediction = normalizeLiveIntentPrediction({
+    task_type: (taskScores[taskType] >= 0.75 || cjkMode) ? taskType : "",
+    sophistication,
+    audience: audience && audienceScores[audience] >= 0.85 ? audience : "",
+    stake_level: stakeLevel,
+    time_horizon: timeHorizon && horizonScores[timeHorizon] >= 0.75 ? timeHorizon : "",
+    confidence,
+    source: "heuristic",
+  }, "heuristic");
+  if (!prediction) return null;
+  if ((prediction.confidence || 0) < LIVE_INTENT_CONFIDENCE_THRESHOLD) {
+    prediction.audience = "";
+    prediction.time_horizon = "";
+  }
+  return normalizeLiveIntentPrediction(prediction, "heuristic");
+}
+
+function renderLiveIntent(prediction) {
+  if (!liveIntentEl) return;
+  const normalized = normalizeLiveIntentPrediction(prediction);
+  if (!normalized) {
+    liveIntentEl.innerHTML = "";
+    liveIntentEl.classList.add("hidden");
+    liveIntentDisplayedPrediction = null;
+    return;
+  }
+  liveIntentDisplayedPrediction = normalized;
+  const sourceClass = normalized.source === "model" ? "is-model" : "is-local";
+  const parts = [];
+  for (let i = 0; i < LIVE_INTENT_FIELD_ORDER.length; i += 1) {
+    const key = LIVE_INTENT_FIELD_ORDER[i];
+    const value = normalized[key];
+    if (!value) continue;
+    const label = LIVE_INTENT_LABELS[key] || key;
+    const display = (LIVE_INTENT_VALUES[key] && LIVE_INTENT_VALUES[key][value]) || value;
+    parts.push(
+      `<span class="live-intent-chip ${sourceClass}"><span class="live-intent-chip-label">${esc(label)}</span><span class="live-intent-chip-value">${esc(display)}</span></span>`
+    );
+  }
+  if (!parts.length) {
+    liveIntentEl.innerHTML = "";
+    liveIntentEl.classList.add("hidden");
+    liveIntentDisplayedPrediction = null;
+    return;
+  }
+  liveIntentEl.innerHTML = parts.join("");
+  liveIntentEl.classList.remove("hidden");
+}
+
+function clearLiveIntent() {
+  if (liveIntentDebounceTimer) {
+    clearTimeout(liveIntentDebounceTimer);
+    liveIntentDebounceTimer = null;
+  }
+  if (liveIntentFetchController) {
+    try {
+      liveIntentFetchController.abort();
+    } catch (_err) {
+      // no-op
+    }
+    liveIntentFetchController = null;
+  }
+  liveIntentRequestSeq = 0;
+  liveIntentAppliedServerFingerprint = "";
+  liveIntentPendingServerFingerprint = "";
+  liveIntentPendingServerCount = 0;
+  liveIntentAppliedText = "";
+  renderLiveIntent(null);
+}
+
+function mergeLiveIntentPrediction(nextPrediction, source, requestText = "") {
+  const next = normalizeLiveIntentPrediction(nextPrediction, source);
+  if (!next) return;
+  const current = normalizeLiveIntentPrediction(liveIntentDisplayedPrediction || null);
+  const preserveExisting = current && !liveIntentIsMaterialShift(
+    liveIntentAppliedText || requestText,
+    requestText || liveIntentAppliedText || ""
+  );
+  const merged = {
+    source: source === "model" ? "model" : next.source,
+    confidence: next.confidence,
+  };
+  for (let i = 0; i < LIVE_INTENT_FIELD_ORDER.length; i += 1) {
+    const key = LIVE_INTENT_FIELD_ORDER[i];
+    merged[key] = next[key] || ((preserveExisting && current) ? current[key] : "");
+  }
+  const normalized = normalizeLiveIntentPrediction(merged, merged.source);
+  if (!normalized) return;
+  liveIntentAppliedText = requestText || liveIntentAppliedText;
+  renderLiveIntent(normalized);
+}
+
+async function fetchLiveIntentPrediction(requestText) {
+  if (!LIVE_INTENT_ENABLED) return;
+  const normalizedText = liveIntentNormalizedText(requestText);
+  if (liveIntentSignalChars(normalizedText) < liveIntentMinimumChars(normalizedText)) return;
+  const requestSeq = liveIntentRequestSeq + 1;
+  liveIntentRequestSeq = requestSeq;
+  if (liveIntentFetchController) {
+    try {
+      liveIntentFetchController.abort();
+    } catch (_err) {
+      // no-op
+    }
+  }
+  const controller = (typeof AbortController !== "undefined") ? new AbortController() : null;
+  liveIntentFetchController = controller;
+  try {
+    const rsp = await fetch("/api/intent/live", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ text: normalizedText }),
+      signal: controller ? controller.signal : undefined,
+    });
+    if (!rsp.ok) return;
+    const payload = await rsp.json();
+    if (requestSeq !== liveIntentRequestSeq) return;
+    if (liveIntentNormalizedText(taskEl && taskEl.value) !== normalizedText) return;
+    const normalized = normalizeLiveIntentPrediction(payload, "heuristic");
+    if (!normalized) return;
+    const fingerprint = liveIntentFingerprint(normalized);
+    if (fingerprint && fingerprint === liveIntentPendingServerFingerprint) {
+      liveIntentPendingServerCount += 1;
+    } else {
+      liveIntentPendingServerFingerprint = fingerprint;
+      liveIntentPendingServerCount = 1;
+    }
+    const confidence = Number(normalized.confidence || 0);
+    const shouldApply = (
+      !liveIntentDisplayedPrediction
+      || !liveIntentAppliedServerFingerprint
+      || fingerprint === liveIntentAppliedServerFingerprint
+      || liveIntentPendingServerCount >= 2
+      || confidence >= Math.max(0.68, LIVE_INTENT_CONFIDENCE_THRESHOLD + 0.15)
+      || liveIntentIsMaterialShift(liveIntentAppliedText, normalizedText)
+    );
+    if (!shouldApply) return;
+    liveIntentAppliedServerFingerprint = fingerprint;
+    mergeLiveIntentPrediction(normalized, normalized.source || "model", normalizedText);
+  } catch (_err) {
+    // fail-soft for live typing assistance
+  } finally {
+    if (liveIntentFetchController === controller) {
+      liveIntentFetchController = null;
+    }
+  }
+}
+
+function scheduleLiveIntentServerPrediction(rawText) {
+  if (liveIntentDebounceTimer) {
+    clearTimeout(liveIntentDebounceTimer);
+    liveIntentDebounceTimer = null;
+  }
+  const normalizedText = liveIntentNormalizedText(rawText);
+  if (!LIVE_INTENT_ENABLED || liveIntentSignalChars(normalizedText) < liveIntentMinimumChars(normalizedText)) return;
+  liveIntentDebounceTimer = setTimeout(() => {
+    liveIntentDebounceTimer = null;
+    void fetchLiveIntentPrediction(normalizedText);
+  }, LIVE_INTENT_DEBOUNCE_MS);
+}
+
+function updateLiveIntentFromInput() {
+  if (!LIVE_INTENT_ENABLED || !taskEl || taskEl.disabled) {
+    clearLiveIntent();
+    return;
+  }
+  const normalizedText = liveIntentNormalizedText(taskEl.value);
+  if (liveIntentSignalChars(normalizedText) < liveIntentMinimumChars(normalizedText)) {
+    clearLiveIntent();
+    return;
+  }
+  const localPrediction = computeLocalLiveIntentPrediction(normalizedText);
+  if (localPrediction) {
+    mergeLiveIntentPrediction(localPrediction, "heuristic", normalizedText);
+  }
+  scheduleLiveIntentServerPrediction(normalizedText);
 }
 
 function contextStateClass(v) {
@@ -3018,6 +3505,7 @@ async function openSession(runId, opts = {}) {
     es.close();
     es = null;
   }
+  clearLiveIntent();
   currentRunId = sid;
   if (appMainEl) appMainEl.classList.remove("is-empty");
   pauseRequested = false;
@@ -3159,6 +3647,7 @@ async function startRun(idempotencyKey, startMode = "research") {
     showError("Task is required.");
     return;
   }
+  clearLiveIntent();
   setRunConfigLocked(true);
   showError("");
   pauseRequested = false;
@@ -3510,11 +3999,16 @@ taskEl.addEventListener("input", () => {
   }
   updateTaskCharCount();
   alignTaskTextBottom();
+  updateLiveIntentFromInput();
   if (currentRunId || startRunInFlight) return;
   runBtn.disabled = !taskEl.value.trim();
 });
 // Also align on initial load and when value is set programmatically
-requestAnimationFrame(() => { alignTaskTextBottom(); updateTaskCharCount(); });
+requestAnimationFrame(() => {
+  alignTaskTextBottom();
+  updateTaskCharCount();
+  updateLiveIntentFromInput();
+});
 
 taskEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter") {
@@ -3531,6 +4025,7 @@ document.querySelectorAll(".prompt-example-chip").forEach((chip) => {
     taskEl.focus();
     updateTaskCharCount();
     alignTaskTextBottom();
+    updateLiveIntentFromInput();
     runBtn.disabled = false;
   });
 });
