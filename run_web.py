@@ -3,8 +3,8 @@ import uvicorn
 
 
 if __name__ == "__main__":
-    host = os.getenv("BIND_HOST", "0.0.0.0")
-    port = int(os.getenv("BIND_PORT", "8001"))
+    host = os.getenv("BIND_HOST", "127.0.0.1")
+    port = int(os.getenv("BIND_PORT", "8000"))
     ssl_cert = os.getenv("SSL_CERTFILE", "")
     ssl_key = os.getenv("SSL_KEYFILE", "")
     # Agent debug logs are written to logs/agent_debug.log automatically
