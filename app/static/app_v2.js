@@ -19,11 +19,14 @@ const refreshSessionsBtn = document.getElementById("refreshSessionsBtn");
 const contextMetaEl = document.getElementById("contextMeta");
 const contextUploadInput = document.getElementById("contextUploadInput");
 const contextUploadBtn = document.getElementById("contextUploadBtn");
+const contextAddBtn = document.getElementById("contextAddBtn");
+const inlineContextFilesEl = document.getElementById("inlineContextFiles");
 const contextDiffBannerEl = document.getElementById("contextDiffBanner");
 const contextFilesEl = document.getElementById("contextFiles");
 const contextAggregateDigestEl = document.getElementById("contextAggregateDigest");
 const contextFileDigestEl = document.getElementById("contextFileDigest");
 const contextDigestPaneEl = document.querySelector(".context-digest-pane");
+const appMainEl = document.querySelector(".app-main");
 
 const runStatusEl = document.getElementById("runStatus");
 const researchStatusEl = document.getElementById("researchStatus");
@@ -37,10 +40,20 @@ const zoomPctEl = document.getElementById("zoomPct");
 const fitDebugEl = document.getElementById("fitDebug");
 
 const canvasEl = document.getElementById("canvas");
+const canvasTreePanel = document.getElementById("canvasTreePanel");
+const canvasDetailPanel = document.getElementById("canvasDetailPanel");
+const progressSection = document.getElementById("progressSection");
+const progressTitleEl = document.querySelector(".progress-title");
 const thoughtStreamEl = document.getElementById("thoughtStream");
 const latestThoughtEl = document.getElementById("latestThought");
+const progressLog = document.getElementById("progressLog");
 const coverageNoteEl = document.getElementById("coverageNote");
-const reportRenderedEl = document.getElementById("reportRendered");
+const reportRenderedEl = document.getElementById("reportModalBody");
+const viewReportBtn = document.getElementById("viewReportBtn");
+const generateReportBtn = document.getElementById("generateReportBtn");
+const reportModal = document.getElementById("reportModal");
+const reportModalCloseBtn = document.getElementById("reportModalCloseBtn");
+const reportModalDownloadBtn = document.getElementById("reportModalDownloadBtn");
 const usageEl = document.getElementById("usage");
 const reportPrevBtn = document.getElementById("reportPrevBtn");
 const reportNextBtn = document.getElementById("reportNextBtn");
@@ -90,9 +103,12 @@ let startRunInFlight = false;
 const reportGeneratingRunIds = new Set();
 let pauseRequested = false;
 let abortRequested = false;
+let uiClearedByAbort = false;
 let selectedReportVersionIndex = null;
 let autoFollowActiveNode = true;
 let lastAutoFollowNodeKey = "";
+let selectedCanvasNodeKey = "";
+let canvasNodeDataMap = new Map();
 let skipNextCanvasScrollDisable = false;
 const thoughts = [];
 const openDetailKeys = new Set();
@@ -406,30 +422,40 @@ function resetWorkspaceForNewSession() {
     contextEs = null;
   }
   currentRunId = null;
+  if (appMainEl) appMainEl.classList.add("is-empty");
   // Start a truly fresh workspace context for each new session/reset.
   currentWorkspaceId = newWorkspaceId();
   currentSnapshot = null;
   pauseRequested = false;
   abortRequested = false;
+  uiClearedByAbort = false;
   reportGeneratingRunIds.clear();
   activeSessionSwitchToken += 1;
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
+  selectedCanvasNodeKey = "";
+  canvasNodeDataMap = new Map();
   thoughts.length = 0;
   lastDebugReportPhaseKey = "";
   openDetailKeys.clear();
   forceClosedDetailKeys.clear();
-  thoughtStreamEl.innerHTML = "";
+  if (thoughtStreamEl) thoughtStreamEl.innerHTML = "";
+
+  if (progressLog) progressLog.innerHTML = "";
 
   runMeta.textContent = "";
   stopReasonEl.textContent = "";
-  latestThoughtEl.textContent = "";
-  coverageNoteEl.textContent = "";
+  if (latestThoughtEl) latestThoughtEl.textContent = "";
+  if (coverageNoteEl) coverageNoteEl.textContent = "";
   reportRenderedEl.innerHTML = "";
+  viewReportBtn.disabled = true;
+  reportModal.classList.add("hidden");
   tokenSummaryEl.textContent = "-";
   usageEl.textContent = "";
-  taskEl.value = "";
   maxDepthEl.value = String(DEFAULT_MAX_DEPTH);
+  if (depthDropdownValue) depthDropdownValue.textContent = String(DEFAULT_MAX_DEPTH);
+  if (taskEl) taskEl.value = "";
+  updateTaskCharCount();
   setTaskBoxLocked(false);
   setRunConfigLocked(false);
   setContextEnabled(true);
@@ -440,24 +466,25 @@ function resetWorkspaceForNewSession() {
   runStatusEl.textContent = "idle";
   researchStatusEl.textContent = "idle";
   reportStatusEl.textContent = "pending";
-  runBtn.textContent = "Start Research";
-  runBtn.classList.add("primary");
-  runBtn.disabled = false;
+  switchRunBtnToStart();
   if (planningActionBtn) {
     planningActionBtn.textContent = "Start Planning";
     planningActionBtn.disabled = false;
   }
   reportBtn.disabled = true;
+  if (generateReportBtn) generateReportBtn.disabled = true;
   setReportButtonVisual(false);
-  downloadBtn.setAttribute("title", "Download report");
-  downloadBtn.setAttribute("aria-label", "Download report");
-  downloadBtn.disabled = true;
+  if (downloadBtn) {
+    downloadBtn.setAttribute("title", "Download report");
+    downloadBtn.setAttribute("aria-label", "Download report");
+    downloadBtn.disabled = true;
+  }
   pauseBtn.disabled = true;
   resumeBtn.disabled = true;
   abortBtn.disabled = true;
-  reportPrevBtn.disabled = true;
-  reportNextBtn.disabled = true;
-  reportVersionLabel.textContent = "-/-";
+  if (reportPrevBtn) reportPrevBtn.disabled = true;
+  if (reportNextBtn) reportNextBtn.disabled = true;
+  if (reportVersionLabel) reportVersionLabel.textContent = "-/-";
   selectedReportVersionIndex = null;
   currentSnapshot = null;
   renderPlanningPanel(null);
@@ -614,12 +641,30 @@ function setTaskBoxLocked(locked) {
   taskEl.disabled = !!locked;
   taskEl.classList.toggle("locked", !!locked);
   contextInputLocked = !!locked;
+  if (contextAddBtn) contextAddBtn.disabled = !!locked;
+  if (inlineContextFilesEl) inlineContextFilesEl.classList.toggle("is-locked", !!locked);
   refreshContextUploadButtonState();
 }
 
 function setRunConfigLocked(locked) {
   const on = !!locked;
   maxDepthEl.disabled = on;
+  if (depthDropdownBtn) depthDropdownBtn.disabled = on;
+  /* Don't touch runBtn here – managed by switchRunBtnTo* helpers */
+}
+
+function switchRunBtnToAbort() {
+  runBtn.textContent = "Abort";
+  runBtn.classList.remove("primary");
+  runBtn.disabled = false;
+  runBtn.dataset.mode = "abort";
+}
+
+function switchRunBtnToStart() {
+  runBtn.textContent = "Start";
+  runBtn.classList.add("primary");
+  delete runBtn.dataset.mode;
+  runBtn.disabled = false;
 }
 
 function fmtTime(iso) {
@@ -627,7 +672,16 @@ function fmtTime(iso) {
   if (!s) return "-";
   const d = new Date(s);
   if (Number.isNaN(d.getTime())) return s;
-  return d.toLocaleString();
+  const now = new Date();
+  const diffMs = now - d;
+  const diffMin = Math.floor(diffMs / 60000);
+  if (diffMin < 1) return "just now";
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  if (diffDay < 7) return `${diffDay}d ago`;
+  return d.toLocaleDateString();
 }
 
 function showError(msg) {
@@ -701,6 +755,7 @@ function fileSizeLabel(n) {
 }
 
 function setContextEnabled(enabled) {
+  // TODO: implement context pane enable/disable (graying out upload controls when no session is active)
   void enabled;
 }
 
@@ -714,6 +769,7 @@ function clearContextPane(msg = "No context files uploaded.") {
   contextDiffBannerEl.textContent = "";
   contextFilesEl.innerHTML = `<div class="muted">No files.</div>`;
   contextAggregateDigestEl.textContent = "";
+  if (inlineContextFilesEl) inlineContextFilesEl.innerHTML = "";
   if (contextFileDigestEl) {
     contextFileDigestEl.textContent = "";
   }
@@ -894,6 +950,37 @@ function renderContextPane() {
     }).join("");
     contextFilesEl.innerHTML = existingHtml + pendingHtml;
   }
+  renderInlineContextFiles();
+}
+
+function renderInlineContextFiles() {
+  if (!inlineContextFilesEl) return;
+  const set = currentContextSet;
+  const files = (set && Array.isArray(set.files)) ? set.files : [];
+  const pendingRows = Array.isArray(pendingUploadFiles) ? pendingUploadFiles : [];
+  if (!files.length && !pendingRows.length) {
+    inlineContextFilesEl.innerHTML = "";
+    return;
+  }
+  const seenKeys = new Set();
+  let html = "";
+  for (const f of files) {
+    if (!f || typeof f !== "object") continue;
+    const key = `${String(f.filename || "").trim().toLowerCase()}::${String(f.content_hash || "").trim()}`;
+    if (seenKeys.has(key)) continue;
+    seenKeys.add(key);
+    const fid = String(f.file_id || "");
+    const name = String(f.filename || fid);
+    html += `<span class="ctx-file-box" title="${esc(name)}" data-file-id="${esc(fid)}">`;
+    html += `<span class="ctx-file-name">${esc(name)}</span>`;
+    html += `<button class="ctx-file-del" type="button" data-delete-fid="${esc(fid)}" title="Remove">&times;</button>`;
+    html += `</span>`;
+  }
+  for (const name of pendingRows) {
+    const safe = esc(String(name || "file"));
+    html += `<span class="ctx-file-box is-uploading" title="${safe}">${safe}</span>`;
+  }
+  inlineContextFilesEl.innerHTML = html;
 }
 
 function cloneJson(v) {
@@ -975,7 +1062,7 @@ function renderPlanningPanel(snap) {
 
 function refreshPlanningUi(snap) {
   renderPlanningPanel(snap);
-  if (snap && typeof snap === "object" && snap.tree && typeof snap.tree === "object") {
+  if (!uiClearedByAbort && !abortRequested && snap && typeof snap === "object" && snap.tree && typeof snap.tree === "object") {
     renderCanvas(snap.tree);
   }
   refreshPrimaryAndPlanningActionButtonsFromSnapshot(snap);
@@ -1454,16 +1541,19 @@ function renderSessions() {
       const sid = String(s.session_id || "");
       const active = sid && sid === currentRunId ? " active" : "";
       const title = String(s.title || sid || "Untitled");
-      const research = shortStatus(sessionResearchState(s));
-      const report = shortStatus(sessionReportState(s));
+      const research = sessionResearchState(s);
       const updated = fmtTime(s.updated_at);
+      const statusCls = research === "completed" ? "success"
+        : research === "running" ? "running"
+        : research === "failed" ? "failed"
+        : "queued";
       const lockDbg = (UI_DEBUG && s && s.lock_debug && typeof s.lock_debug === "object")
         ? `Locks: mgr=${esc(String(s.lock_debug.manager_lock || "-"))}${s.lock_debug.manager_lock_owner_section ? `(${esc(String(s.lock_debug.manager_lock_owner_section || ""))})` : ""}${Number(s.lock_debug.manager_lock_held_ms || 0) > 0 ? ` ${Math.round(Number(s.lock_debug.manager_lock_held_ms || 0))}ms` : ""} · session=${esc(String(s.lock_debug.session_lock || "-"))} · index=${esc(String(s.lock_debug.index_write_lock || "-"))}`
         : "";
       return `<div class="session-row${active}" data-session-id="${esc(sid)}">
         <div class="session-main">
-          <div class="session-title" title="${esc(title)}">${esc(title)}</div>
-          <div class="session-meta">Research: ${esc(research)} · Report: ${esc(report)} · ${esc(updated)}</div>
+          <div class="session-title" title="${esc(title)}"><span class="session-status-dot ${statusCls}"></span>${esc(title)}</div>
+          <div class="session-meta">${esc(updated)}</div>
           ${lockDbg ? `<div class="session-meta muted">${lockDbg}</div>` : ""}
         </div>
         <div class="session-actions">
@@ -1598,44 +1688,8 @@ function getFitDiagnostics() {
 }
 
 function computeAutoFitZoom() {
-  const rowEls = Array.from(canvasEl.querySelectorAll(".depth-row-nodes"));
-  if (rowEls.length === 0) return 1;
-
-  // Measurement-only search: update scale vars only, avoid UI label churn.
-  const originalZoom = canvasZoom;
-  setCanvasScaleVariables(1);
-  void canvasEl.offsetHeight;
-  if (!hasHorizontalOverflow()) {
-    setCanvasScaleVariables(originalZoom);
-    return 1;
-  }
-
-  setCanvasScaleVariables(MIN_CANVAS_ZOOM);
-  void canvasEl.offsetHeight;
-  if (hasHorizontalOverflow()) {
-    setCanvasScaleVariables(originalZoom);
-    return MIN_CANVAS_ZOOM;
-  }
-
-  let lo = MIN_CANVAS_ZOOM;
-  let hi = 1;
-  let best = MIN_CANVAS_ZOOM;
-  for (let i = 0; i < 18; i += 1) {
-    const mid = (lo + hi) / 2;
-    setCanvasScaleVariables(mid);
-    void canvasEl.offsetHeight;
-    if (hasHorizontalOverflow()) {
-      hi = mid;
-    } else {
-      best = mid;
-      lo = mid;
-    }
-  }
-
-  setCanvasScaleVariables(originalZoom);
-  const viewportWidth = Math.max(1, window.innerWidth || document.documentElement.clientWidth || 1);
-  const safetyFactor = Math.max(0.9, 1 - (AUTO_FIT_SAFETY_PX / viewportWidth));
-  return clamp(best * safetyFactor, MIN_CANVAS_ZOOM, 1);
+  // Split-pane layout handles scrolling per-panel; zoom not needed.
+  return 1;
 }
 
 function applyCanvasZoom() {
@@ -1747,42 +1801,18 @@ function renderTokenSummary(usage) {
   const total = usage.total || {};
   const inTok = Number(total.input_tokens || 0);
   const outTok = Number(total.output_tokens || 0);
-  const tokenCost = Number(total.token_cost_usd || 0);
-  const searchQueryCost = Number(total.search_query_cost_usd || 0);
   const cost = Number(total.estimated_cost_usd || 0);
   tokenSummaryEl.textContent = `${inTok + outTok} tokens | $${cost.toFixed(4)}`;
-  const byToolRaw = usage.by_search_tool_type || {};
-  const byTool = {};
-  if (byToolRaw && typeof byToolRaw === "object") {
-    const toolKeys = Object.keys(byToolRaw).sort();
-    for (const k of toolKeys) {
-      const v = byToolRaw[k];
-      if (!v || typeof v !== "object") continue;
-      byTool[k] = {
-        calls: Number(v.calls || 0),
-        returned_results_raw: Number(v.returned_results_raw || 0),
-        input_tokens: Number(v.input_tokens || 0),
-        output_tokens: Number(v.output_tokens || 0),
-        total_tokens: Number(v.total_tokens || 0),
-        token_cost_usd: Number(v.token_cost_usd || 0),
-        search_query_cost_usd: Number(v.search_query_cost_usd || 0),
-        estimated_cost_usd: Number(v.estimated_cost_usd || 0),
-      };
-    }
-  }
-  const usageView = {
-    total: {
-      calls: Number(total.calls || 0),
-      input_tokens: inTok,
-      output_tokens: outTok,
-      total_tokens: Number(total.total_tokens || (inTok + outTok)),
-      token_cost_usd: tokenCost,
-      search_query_cost_usd: searchQueryCost,
-      estimated_cost_usd: cost,
-    },
-    search_by_tool_type: byTool,
-  };
-  usageEl.textContent = JSON.stringify(usageView, null, 2);
+  const totalCalls = Number(total.calls || 0);
+  const totalTokens = Number(total.total_tokens || (inTok + outTok));
+  const parts = [
+    `Calls: ${totalCalls}`,
+    `In: ${inTok.toLocaleString()}`,
+    `Out: ${outTok.toLocaleString()}`,
+    `Total: ${totalTokens.toLocaleString()}`,
+    `Cost: $${cost.toFixed(4)}`,
+  ];
+  usageEl.textContent = parts.join("  ·  ");
 }
 
 function renderInlineMarkdown(text) {
@@ -1846,17 +1876,30 @@ function markdownToHtml(md) {
 }
 
 function upsertThought(text, meta) {
+  if (abortRequested || uiClearedByAbort) return;
   const msg = String(text || "").trim();
   if (!msg) return;
   thoughts.push({ text: msg, meta: meta || "" });
   if (thoughts.length > 120) {
     thoughts.shift();
   }
-  thoughtStreamEl.innerHTML = thoughts
-    .slice()
-    .reverse()
-    .map((t) => `<div class="thought"><div class="t-meta">${esc(t.meta)}</div>${esc(t.text)}</div>`)
-    .join("");
+
+  /* Append to scrolling log */
+  if (progressLog) {
+    const now = new Date();
+    const ts = [now.getHours(), now.getMinutes(), now.getSeconds()]
+      .map((n) => String(n).padStart(2, "0"))
+      .join(":");
+    const entry = document.createElement("div");
+    entry.className = "progress-log-entry";
+    entry.innerHTML =
+      '<span class="log-time">' + esc(ts) + "</span><span>" + esc(msg) + "</span>";
+    progressLog.appendChild(entry);
+    while (progressLog.children.length > 50) {
+      progressLog.removeChild(progressLog.firstChild);
+    }
+    progressLog.scrollTop = progressLog.scrollHeight;
+  }
 }
 
 function makeDetailKey(parts) {
@@ -1913,7 +1956,15 @@ function restoreAndTrackDetailState() {
   for (const el of els) {
     const key = String(el.getAttribute("data-detail-key") || "");
     if (!key) continue;
+    const parts = parseDetailKey(key);
+    const isDefaultOpenSection =
+      parts.length >= 3 &&
+      parts[0] === "node_section" &&
+      (parts[2] === "query_work" || parts[2] === "node_notes");
+
     if (openDetailKeys.has(key)) {
+      el.open = true;
+    } else if (isDefaultOpenSection && !forceClosedDetailKeys.has(key)) {
       el.open = true;
     }
     el.addEventListener("toggle", () => {
@@ -1922,13 +1973,20 @@ function restoreAndTrackDetailState() {
         parts.length >= 3 &&
         parts[0] === "node_section" &&
         parts[2] === "query_work";
+      const isNodeNotesSection =
+        parts.length >= 3 &&
+        parts[0] === "node_section" &&
+        parts[2] === "node_notes";
       if (el.open) {
         openDetailKeys.add(key);
-        if (isQueryWorkSection) {
+        if (isQueryWorkSection || isNodeNotesSection) {
           forceClosedDetailKeys.delete(key);
         }
       } else {
         openDetailKeys.delete(key);
+        if (isNodeNotesSection) {
+          forceClosedDetailKeys.add(key);
+        }
         // If user collapses "Query Work", also collapse all child query detail states.
         if (isQueryWorkSection) {
           forceClosedDetailKeys.add(key);
@@ -2016,10 +2074,26 @@ function eventNarration(ev) {
   if (et === "report_version_created") return `Saved report version #${Number(p.version_index || 0)}.`;
   if (et === "report_version_selected") return `Switched to report version #${Number(p.version_index || 0)}.`;
   if (et === "run_heartbeat") {
-    const phase = p.phase || "processing";
-    if (p.query) return `Still working (${phase}): ${p.query}`;
-    if (p.sub_question) return `Still working (${phase}): ${p.sub_question}`;
-    return `Still working (${phase})...`;
+    const phaseLabels = {
+      working: "Processing",
+      initializing: "Initializing research",
+      planning_node: "Planning sub-questions",
+      idle: "Waiting for review",
+      searching: "Searching the web",
+      query_decision: "Evaluating queries",
+      synthesizing: "Synthesizing results",
+      node_sufficiency: "Checking evidence sufficiency",
+      decomposing: "Decomposing into sub-tasks",
+      run_sufficiency: "Checking overall sufficiency",
+      writing_report: "Writing report",
+      binding_context: "Loading context files",
+      paused: "Paused",
+    };
+    const rawPhase = p.phase || "working";
+    const label = phaseLabels[rawPhase] || rawPhase;
+    if (p.query) return `${label}: ${p.query}`;
+    if (p.sub_question) return `${label}: ${p.sub_question}`;
+    return `${label}...`;
   }
   if (et === "run_completed") return "Run complete. Final report ready.";
   if (et === "run_failed") return `Run failed: ${p.error || "unknown error"}`;
@@ -2310,7 +2384,9 @@ function buildNodeVisualStateMap(byDepth) {
 function renderCanvas(tree) {
   captureOpenDetailState();
   if (!tree || typeof tree !== "object") {
-    canvasEl.innerHTML = "<em>No run yet.</em>";
+    canvasTreePanel.innerHTML = "";
+    canvasDetailPanel.innerHTML = "";
+    canvasNodeDataMap = new Map();
     return;
   }
   const phase = planningPhase(currentSnapshot || { tree });
@@ -2327,210 +2403,298 @@ function renderCanvas(tree) {
     const nid = String((row && row.node_id) || "").trim();
     if (nid) planningRowByNodeId.set(nid, row);
   }
-  const renderGraph = (questions, scopeKey, passNo = null) => {
-    const byDepth = buildQuestionsByDepth(questions);
-    const nodeIdMap = buildNodeIdMap(byDepth);
-    const visualStateMap = buildNodeVisualStateMap(byDepth);
-    const depths = Array.from(byDepth.keys()).sort((a, b) => a - b);
-    if (depths.length === 0) {
-      return `<div class="muted">No task nodes yet.</div>`;
-    }
-
-    let html = `<div class="depth-rows">`;
-    for (const d of depths) {
-      html += `<section class="depth-row"><p class="depth-title">Depth ${d}</p>`;
-      html += `<div class="depth-row-nodes">`;
-      for (const q of byDepth.get(d).values()) {
-        const key = normalizeQuestionKey(q.sub_question || "");
-        let visualCls = "state-planned";
-        let visualLabel = "planned";
-        if (visualStateMap.activeKeys.has(key)) {
-          visualCls = "state-active";
-          visualLabel = "active";
-        } else if (visualStateMap.visitedKeys.has(key)) {
-          visualCls = "state-visited";
-          visualLabel = "visited";
-        } else if (visualStateMap.plannedKeys.has(key)) {
-          visualCls = "state-planned";
-          visualLabel = "planned";
-        }
-        const st = String(q.status || "queued");
-        const cls = statusClass(st);
-        const solvedStatuses = new Set(["solved", "solved_via_children", "success", "completed"]);
-        const unresolvedStatuses = new Set(["unresolved", "failed", "dead_end", "stopped", "aborted"]);
-        const visitedOutcomeCls =
-          visualCls === "state-visited"
-            ? (solvedStatuses.has(st) ? "visited-solved" : (unresolvedStatuses.has(st) ? "visited-unresolved" : "visited-neutral"))
-            : "";
-        const dim = planningSwapDimAll
-          ? "dimmed"
-          : ((visualCls === "state-planned" && !isPlanningView) ? "dimmed" : "");
-        const parentCls = q.parent ? "has-parent" : "";
-        const stLower = st.toLowerCase();
-        const isRunning = ["running", "researching", "decomposing"].includes(stLower);
-        const isDecomposed = ["decomposed", "decomposed_child"].includes(stLower);
-        const activeStateCls = (visualCls === "state-active" && isRunning)
-          ? "active-running"
-          : ((visualCls === "state-active" && isDecomposed) ? "active-decomposed" : "");
-        const activeEmphasisCls = visualCls === "state-active" ? "active-emphasis" : "";
-        const pathId = String(q.node_id || nodeIdMap.get(key) || "");
-        const nodeId = (passNo !== null && passNo !== undefined && passNo !== "")
-          ? (pathId ? `P${passNo}/${pathId}` : "")
-          : pathId;
-        html += `<article class="node ${esc(cls)} ${esc(dim)} ${esc(parentCls)} ${esc(activeStateCls)} ${esc(activeEmphasisCls)} ${esc(visualCls)} ${esc(visitedOutcomeCls)}" data-node-depth="${Number(d)}" data-node-status="${esc(stLower)}" data-node-id="${esc(nodeId || "")}" data-node-key="${esc(key)}">`;
-        html += `<div class="node-head"><span class="badge ${esc(cls)}">${esc(shortStatus(st))}</span>`;
-        html += `<span class="badge">${esc(visualLabel)}</span>`;
-        html += `<span class="badge">d${d}</span></div>`;
-        if (nodeId) {
-          html += `<div class="query-mini"><strong>Node ${esc(nodeId)}</strong></div>`;
-        }
-        const fullQuestion = String(q.sub_question || "").trim();
-        const displayTitle = String(q.display_title || fullQuestion || "").trim();
-        html += `<p class="node-title" title="${esc(fullQuestion)}">${esc(displayTitle)}</p>`;
-        const researchDepthBonus = !isPlanningView
-          ? researchDepthBonusByQuestion.get(normalizeQuestionKey(q.sub_question || ""))
-          : null;
-        const planningRow = planningUi.inPlanning ? planningRowByNodeId.get(pathId) : null;
-        if (planningRow) {
-          const pinned = !!planningRow.is_pinned;
-          const bonus = Math.max(0, Number(planningRow.pin_depth_bonus || 0));
-          const canEdit = !!planningUi.canEdit;
-          html += `<div class="planning-node-actions">`;
-          html += `<button type="button" class="planning-node-icon-btn ${pinned ? "is-active" : ""}" data-planning-action="${pinned ? "unpin" : "pin"}" data-node-id="${esc(pathId)}" ${canEdit ? "" : "disabled"} title="${pinned ? "Unpin" : "Pin"}" aria-label="${pinned ? "Unpin" : "Pin"}">`;
-          html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8l1 4h-2l-1 5 2 2v1H8v-1l2-2-1-5H7l1-4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 15v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
-          html += `</button>`;
-          html += `<button type="button" class="planning-node-icon-btn" data-planning-action="depth" data-node-id="${esc(pathId)}" ${(canEdit && pinned) ? "" : "disabled"} title="Depth +1" aria-label="Depth +1">`;
-          html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
-          html += `</button>`;
-          const capTail = Number.isFinite(bonusCap) ? ` (<=${Math.max(0, Number(bonusCap))})` : "";
-          html += `<span class="planning-node-depth">depth +${bonus}${esc(capTail)}</span>`;
-          html += `</div>`;
-        } else if (researchDepthBonus && Number.isFinite(researchDepthBonus.bonus) && researchDepthBonus.bonus > 0) {
-          html += `<div class="planning-node-actions">`;
-          html += `<span class="planning-node-depth planning-node-depth-readonly">depth +${Math.max(0, Number(researchDepthBonus.bonus || 0))}</span>`;
-          html += `</div>`;
-        }
-        if (q.parent) {
-          html += `<p class="node-parent"><span class="parent-link">from</span> ${esc(q.parent)}</p>`;
-        }
-        if (q.is_placeholder) {
-          // Keep placeholder node without extra explanatory text.
-        }
-
-        const steps = Array.isArray(q.query_steps) ? q.query_steps : [];
-        if (steps.length > 0) {
-          const queryWorkKey = makeDetailKey(["node_section", q.sub_question, "query_work", scopeKey]);
-          const hasOpenChildDetail = steps.some((step) =>
-            openDetailKeys.has(
-              makeDetailKey(["query_detail", q.sub_question, step.query, scopeKey])
-            )
-          );
-          const forceClosedQueryWork = forceClosedDetailKeys.has(queryWorkKey);
-          const queryWorkOpen = (!forceClosedQueryWork && (openDetailKeys.has(queryWorkKey) || hasOpenChildDetail)) ? " open" : "";
-          html += `<details class="node-section" data-detail-key="${esc(queryWorkKey)}"${queryWorkOpen}><summary>Query Work (${steps.length})</summary>`;
-          html += `<ul class="query-list">`;
-          for (const step of steps) {
-            const qst = String(step.status || "queued");
-            const diag = step.diagnostic || {};
-            const freshness = String(diag.classification || "");
-            const simDisplay = Math.max(
-              Number(diag.similarity || 0),
-              Number(diag.intent_map_similarity || 0)
-            );
-            const queryDetailKey = makeDetailKey(["query_detail", q.sub_question, step.query, scopeKey]);
-            const queryDetailOpen = openDetailKeys.has(queryDetailKey) ? " open" : "";
-            html += `<li><div><span class="badge ${esc(statusClass(qst))}">${esc(queryStepStatusLabel(qst))}</span> ${esc(step.query || "")}</div>`;
-            html += `<div class="query-mini">selected=${Number(step.selected_results_count || 0)} primary=${Number(step.primary_count || 0)} ${freshness ? `| freshness=${esc(freshness)}` : ""}</div>`;
-            html += `<details class="query-details" data-detail-key="${esc(queryDetailKey)}"${queryDetailOpen}><summary>details</summary>`;
-            html += `<div class="query-meta">decision=${esc(diag.decision || "")} sim=${simDisplay.toFixed(2)} intent_mapped=${diag.intent_mapped ? "yes" : "no"}</div>`;
-            if (Array.isArray(diag.new_tokens) && diag.new_tokens.length) {
-              html += `<div class="query-meta">new_tokens: ${diag.new_tokens.map(esc).join(", ")}</div>`;
-            }
-            if (Array.isArray(diag.dropped_tokens) && diag.dropped_tokens.length) {
-              html += `<div class="query-meta">dropped_tokens: ${diag.dropped_tokens.map(esc).join(", ")}</div>`;
-            }
-            if (step.synthesis_summary) {
-              html += `<div class="query-meta">synthesis: ${esc(step.synthesis_summary)}</div>`;
-            }
-            if (step.search_error) {
-              html += `<div class="query-meta">error: ${esc(step.search_error)}</div>`;
-            }
-            const selectedSources = Array.isArray(step.selected_sources) ? step.selected_sources : [];
-            if (selectedSources.length > 0) {
-              html += `<div class="query-meta">picked sources:</div>`;
-              html += `<ul class="source-links">`;
-              for (const src of selectedSources) {
-                if (!src || typeof src !== "object") continue;
-                const srcUrl = toSafeHttpUrl(src.url);
-                if (!srcUrl) continue;
-                const srcTitle = String(src.title || "").trim();
-                const linkLabel = srcTitle || shortSourceLabel(srcUrl);
-                html += `<li><a href="${esc(srcUrl)}" target="_blank" rel="noopener noreferrer">${esc(linkLabel)}</a> <span class="source-host">(${esc(shortSourceLabel(srcUrl))})</span></li>`;
-              }
-              html += `</ul>`;
-            }
-            html += `</details></li>`;
-          }
-          html += `</ul></details>`;
-        }
-
-        if (q.node_sufficiency || q.unresolved_reason) {
-          const nodeNotesKey = makeDetailKey(["node_section", q.sub_question, "node_notes", scopeKey]);
-          html += `<details class="node-section" data-detail-key="${esc(nodeNotesKey)}"><summary>Node Notes</summary>`;
-          if (q.node_sufficiency) {
-            const isSufficient = !!q.node_sufficiency.is_sufficient;
-            html += `<div class="query-mini">node sufficiency: ${isSufficient ? "pass" : "fail"}</div>`;
-            if (!isSufficient) {
-              const reason = String(q.node_sufficiency.reasoning || "").trim();
-              const gaps = Array.isArray(q.node_sufficiency.gaps) ? q.node_sufficiency.gaps : [];
-              if (reason) {
-                html += `<div class="query-meta">reason: ${esc(reason)}</div>`;
-              }
-              if (gaps.length > 0) {
-                html += `<div class="query-meta">gaps: ${gaps.map((g) => esc(g)).join(" | ")}</div>`;
-              }
-            }
-          }
-          if (q.unresolved_reason) {
-            html += `<div class="query-mini">unresolved: ${esc(q.unresolved_reason)}</div>`;
-          }
-          html += `</details>`;
-        }
-        html += `</article>`;
-      }
-      html += `</div></section>`;
-    }
-    html += `</div>`;
-    return html;
-  };
 
   const rounds = (Array.isArray(tree.rounds) ? tree.rounds : [])
     .filter((r) => r && typeof r === "object")
     .sort((a, b) => Number(a.round || 0) - Number(b.round || 0));
-
   const mergedQuestions = collectQuestionsFromRounds(rounds);
-  let html = "";
+
   if (mergedQuestions.length === 0) {
-    html = `<div class="muted">No task nodes yet. The root task is: ${esc(tree.task || "")}</div>`;
-  } else {
-    html = renderGraph(mergedQuestions, "merged", null);
+    canvasTreePanel.innerHTML = "";
+    canvasDetailPanel.innerHTML = `<div class="canvas-detail-empty">${esc(tree.task || "")}</div>`;
+    canvasNodeDataMap = new Map();
+    return;
   }
 
-  canvasEl.innerHTML = html;
-  restoreAndTrackDetailState();
-  refreshCanvasZoomForCurrentLayout();
-  const active = pickAutoFollowTargetNode();
-  if (autoFollowActiveNode && active && typeof active.scrollIntoView === "function") {
-    const nodeKey = String(active.getAttribute("data-node-key") || "");
-    const nodeId = String(active.getAttribute("data-node-id") || "");
-    const followKey = nodeId || nodeKey;
-    const shouldRecenter = followKey !== lastAutoFollowNodeKey || !isNodeMostlyVisibleInCanvas(active);
-    if (shouldRecenter) {
-      skipNextCanvasScrollDisable = true;
-      active.scrollIntoView({ behavior: "auto", block: "nearest", inline: "center" });
-      lastAutoFollowNodeKey = followKey;
+  const byDepth = buildQuestionsByDepth(mergedQuestions);
+  const nodeIdMap = buildNodeIdMap(byDepth);
+  const visualStateMap = buildNodeVisualStateMap(byDepth);
+  const depths = Array.from(byDepth.keys()).sort((a, b) => a - b);
+  const scopeKey = "merged";
+
+  // Build flat ordered node list and store data for detail rendering
+  // We need DFS tree order: 1 → 1.1 → 1.1.1 → 1.1.2 → 1.2 → 2 → ...
+  canvasNodeDataMap = new Map();
+  let autoSelectKey = "";
+
+  // Collect all nodes with their keys into a flat map first
+  const nodeByKey = new Map();
+  for (const d of depths) {
+    for (const q of byDepth.get(d).values()) {
+      const key = normalizeQuestionKey(q.sub_question || "");
+      const pathId = String(q.node_id || nodeIdMap.get(key) || "");
+      const st = String(q.status || "queued").toLowerCase();
+      const cls = statusClass(st);
+      let visualCls = "state-planned";
+      if (visualStateMap.activeKeys.has(key)) visualCls = "state-active";
+      else if (visualStateMap.visitedKeys.has(key)) visualCls = "state-visited";
+      nodeByKey.set(key, { key, depth: Number(d), nodeId: pathId, status: st, cls, visualCls, q });
     }
   }
+
+  // Build parent→children map using the parent field
+  const childrenOf = new Map(); // parentKey → [childEntry, ...]
+  const roots = [];
+  for (const entry of nodeByKey.values()) {
+    const parentQuestion = String(entry.q.parent || "").trim();
+    const parentKey = parentQuestion ? normalizeQuestionKey(parentQuestion) : "";
+    if (parentKey && nodeByKey.has(parentKey)) {
+      if (!childrenOf.has(parentKey)) childrenOf.set(parentKey, []);
+      childrenOf.get(parentKey).push(entry);
+    } else {
+      roots.push(entry);
+    }
+  }
+  // Sort children by node_id for stable ordering
+  const numericIdSort = (a, b) => {
+    const ida = String(a.nodeId || "");
+    const idb = String(b.nodeId || "");
+    if (ida && idb) return ida.localeCompare(idb, undefined, { numeric: true, sensitivity: "base" });
+    return String(a.key).localeCompare(String(b.key));
+  };
+  roots.sort(numericIdSort);
+  for (const children of childrenOf.values()) children.sort(numericIdSort);
+
+  // DFS walk to produce tree-order flat list
+  const orderedNodes = [];
+  const dfsWalk = (entries) => {
+    for (const entry of entries) {
+      orderedNodes.push(entry);
+      const kids = childrenOf.get(entry.key);
+      if (kids && kids.length) dfsWalk(kids);
+    }
+  };
+  dfsWalk(roots);
+
+  // Also append any orphans that weren't reachable (safety net)
+  const visited = new Set(orderedNodes.map((n) => n.key));
+  for (const entry of nodeByKey.values()) {
+    if (!visited.has(entry.key)) orderedNodes.push(entry);
+  }
+
+  // Populate data map and detect auto-select
+  for (const n of orderedNodes) {
+    const isRunning = ["running", "researching", "decomposing"].includes(n.status);
+    if (isRunning && !autoSelectKey) autoSelectKey = n.key;
+    canvasNodeDataMap.set(n.key, {
+      q: n.q, depth: n.depth, nodeId: n.nodeId, status: n.status,
+      cls: n.cls, visualCls: n.visualCls, scopeKey,
+      isPlanningView, planningUi, planningRowByNodeId, bonusCap,
+      researchDepthBonusByQuestion, planningSwapDimAll,
+    });
+  }
+
+  // If no running node, keep current selection; if that's gone, select first
+  if (!autoSelectKey) {
+    if (selectedCanvasNodeKey && canvasNodeDataMap.has(selectedCanvasNodeKey)) {
+      autoSelectKey = selectedCanvasNodeKey;
+    } else if (orderedNodes.length) {
+      autoSelectKey = orderedNodes[0].key;
+    }
+  }
+  selectedCanvasNodeKey = autoSelectKey;
+
+  // ── Left panel: tree directory ──
+  let treeHtml = "";
+  for (const n of orderedNodes) {
+    const indent = Math.max(0, n.depth - 1) * 16;
+    const sel = n.key === selectedCanvasNodeKey ? "is-selected" : "";
+    const displayTitle = String(n.q.display_title || n.q.sub_question || "").trim();
+    treeHtml += `<div class="canvas-tree-item ${sel}" data-tree-key="${esc(n.key)}" style="padding-left:${10 + indent}px">`;
+    treeHtml += `<span class="tree-status-dot ${esc(n.cls)}"></span>`;
+    if (n.nodeId) treeHtml += `<span class="tree-node-id">${esc(n.nodeId)}</span>`;
+    treeHtml += `<span class="tree-node-title" title="${esc(displayTitle)}">${esc(displayTitle)}</span>`;
+    treeHtml += `</div>`;
+  }
+  canvasTreePanel.innerHTML = treeHtml;
+
+  // ── Right panel: detail for selected node ──
+  renderCanvasDetailForKey(selectedCanvasNodeKey);
+
+  // ── Tree click handler ──
+  canvasTreePanel.onclick = (e) => {
+    const item = e.target.closest(".canvas-tree-item");
+    if (!item) return;
+    const key = item.getAttribute("data-tree-key");
+    if (!key || key === selectedCanvasNodeKey) return;
+    selectedCanvasNodeKey = key;
+    // Update selection highlight
+    for (const el of canvasTreePanel.querySelectorAll(".canvas-tree-item")) {
+      el.classList.toggle("is-selected", el.getAttribute("data-tree-key") === key);
+    }
+    renderCanvasDetailForKey(key);
+  };
+
+  // Auto-scroll to selected tree item
+  const selectedTreeItem = canvasTreePanel.querySelector(".canvas-tree-item.is-selected");
+  if (selectedTreeItem) {
+    selectedTreeItem.scrollIntoView({ behavior: "auto", block: "nearest" });
+  }
+}
+
+function renderCanvasDetailForKey(key) {
+  const data = canvasNodeDataMap.get(key);
+  if (!data) {
+    canvasDetailPanel.innerHTML = `<div class="canvas-detail-empty">Select a node to view details</div>`;
+    return;
+  }
+  const { q, depth, nodeId, status, cls, visualCls, scopeKey,
+    isPlanningView, planningUi, planningRowByNodeId, bonusCap,
+    researchDepthBonusByQuestion, planningSwapDimAll } = data;
+  const st = status;
+  const solvedStatuses = new Set(["solved", "solved_via_children", "success", "completed"]);
+  const unresolvedStatuses = new Set(["unresolved", "failed", "dead_end", "stopped", "aborted"]);
+  const visitedOutcomeCls =
+    visualCls === "state-visited"
+      ? (solvedStatuses.has(st) ? "visited-solved" : (unresolvedStatuses.has(st) ? "visited-unresolved" : "visited-neutral"))
+      : "";
+  const dim = planningSwapDimAll
+    ? "dimmed"
+    : ((visualCls === "state-planned" && !isPlanningView) ? "dimmed" : "");
+  const parentCls = q.parent ? "has-parent" : "";
+  const isRunning = ["running", "researching", "decomposing"].includes(st);
+  const isDecomposed = ["decomposed", "decomposed_child"].includes(st);
+  const activeStateCls = (visualCls === "state-active" && isRunning)
+    ? "active-running"
+    : ((visualCls === "state-active" && isDecomposed) ? "active-decomposed" : "");
+  const activeEmphasisCls = visualCls === "state-active" ? "active-emphasis" : "";
+  let visualLabel = "planned";
+  if (visualCls === "state-active") visualLabel = "active";
+  else if (visualCls === "state-visited") visualLabel = "visited";
+
+  let html = `<article class="node ${esc(cls)} ${esc(dim)} ${esc(parentCls)} ${esc(activeStateCls)} ${esc(activeEmphasisCls)} ${esc(visualCls)} ${esc(visitedOutcomeCls)}" data-node-depth="${Number(depth)}" data-node-status="${esc(st)}" data-node-id="${esc(nodeId || "")}" data-node-key="${esc(key)}">`;
+  html += `<div class="node-head"><span class="badge ${esc(cls)}">${esc(shortStatus(st))}</span>`;
+  html += `<span class="badge">${esc(visualLabel)}</span>`;
+  html += `<span class="badge">d${depth}</span></div>`;
+  if (nodeId) {
+    html += `<div class="query-mini"><strong>Node ${esc(nodeId)}</strong></div>`;
+  }
+  const fullQuestion = String(q.sub_question || "").trim();
+  const displayTitle = String(q.display_title || fullQuestion || "").trim();
+  html += `<p class="node-title" title="${esc(fullQuestion)}">${esc(displayTitle)}</p>`;
+
+  const pathId = nodeId;
+  const researchDepthBonus = !isPlanningView
+    ? researchDepthBonusByQuestion.get(normalizeQuestionKey(q.sub_question || ""))
+    : null;
+  const planningRow = planningUi.inPlanning ? planningRowByNodeId.get(pathId) : null;
+  if (planningRow) {
+    const pinned = !!planningRow.is_pinned;
+    const bonus = Math.max(0, Number(planningRow.pin_depth_bonus || 0));
+    const canEdit = !!planningUi.canEdit;
+    html += `<div class="planning-node-actions">`;
+    html += `<button type="button" class="planning-node-icon-btn ${pinned ? "is-active" : ""}" data-planning-action="${pinned ? "unpin" : "pin"}" data-node-id="${esc(pathId)}" ${canEdit ? "" : "disabled"} title="${pinned ? "Unpin" : "Pin"}" aria-label="${pinned ? "Unpin" : "Pin"}">`;
+    html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3h8l1 4h-2l-1 5 2 2v1H8v-1l2-2-1-5H7l1-4z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 15v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>`;
+    html += `</button>`;
+    html += `<button type="button" class="planning-node-icon-btn" data-planning-action="depth" data-node-id="${esc(pathId)}" ${(canEdit && pinned) ? "" : "disabled"} title="Depth +1" aria-label="Depth +1">`;
+    html += `<svg class="icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>`;
+    html += `</button>`;
+    const capTail = Number.isFinite(bonusCap) ? ` (<=${Math.max(0, Number(bonusCap))})` : "";
+    html += `<span class="planning-node-depth">depth +${bonus}${esc(capTail)}</span>`;
+    html += `</div>`;
+  } else if (researchDepthBonus && Number.isFinite(researchDepthBonus.bonus) && researchDepthBonus.bonus > 0) {
+    html += `<div class="planning-node-actions">`;
+    html += `<span class="planning-node-depth planning-node-depth-readonly">depth +${Math.max(0, Number(researchDepthBonus.bonus || 0))}</span>`;
+    html += `</div>`;
+  }
+  if (q.parent) {
+    html += `<p class="node-parent"><span class="parent-link">from</span> ${esc(q.parent)}</p>`;
+  }
+
+  const steps = Array.isArray(q.query_steps) ? q.query_steps : [];
+  if (steps.length > 0) {
+    const queryWorkKey = makeDetailKey(["node_section", q.sub_question, "query_work", scopeKey]);
+    const hasOpenChildDetail = steps.some((step) =>
+      openDetailKeys.has(
+        makeDetailKey(["query_detail", q.sub_question, step.query, scopeKey])
+      )
+    );
+    const forceClosedQueryWork = forceClosedDetailKeys.has(queryWorkKey);
+    const queryWorkOpen = !forceClosedQueryWork ? " open" : "";
+    html += `<details class="node-section" data-detail-key="${esc(queryWorkKey)}"${queryWorkOpen}><summary>Query Work (${steps.length})</summary>`;
+    html += `<ul class="query-list">`;
+    for (const step of steps) {
+      const qst = String(step.status || "queued");
+      const diag = step.diagnostic || {};
+      const freshness = String(diag.classification || "");
+      const simDisplay = Math.max(
+        Number(diag.similarity || 0),
+        Number(diag.intent_map_similarity || 0)
+      );
+      const queryDetailKey = makeDetailKey(["query_detail", q.sub_question, step.query, scopeKey]);
+      const queryDetailOpen = openDetailKeys.has(queryDetailKey) ? " open" : "";
+      html += `<li><div><span class="badge ${esc(statusClass(qst))}">${esc(queryStepStatusLabel(qst))}</span> ${esc(step.query || "")}</div>`;
+      html += `<div class="query-mini">selected=${Number(step.selected_results_count || 0)} primary=${Number(step.primary_count || 0)} ${freshness ? `| freshness=${esc(freshness)}` : ""}</div>`;
+      html += `<details class="query-details" data-detail-key="${esc(queryDetailKey)}"${queryDetailOpen}><summary>details</summary>`;
+      html += `<div class="query-meta">decision=${esc(diag.decision || "")} sim=${simDisplay.toFixed(2)} intent_mapped=${diag.intent_mapped ? "yes" : "no"}</div>`;
+      if (Array.isArray(diag.new_tokens) && diag.new_tokens.length) {
+        html += `<div class="query-meta">new_tokens: ${diag.new_tokens.map(esc).join(", ")}</div>`;
+      }
+      if (Array.isArray(diag.dropped_tokens) && diag.dropped_tokens.length) {
+        html += `<div class="query-meta">dropped_tokens: ${diag.dropped_tokens.map(esc).join(", ")}</div>`;
+      }
+      if (step.synthesis_summary) {
+        html += `<div class="query-meta">synthesis: ${esc(step.synthesis_summary)}</div>`;
+      }
+      if (step.search_error) {
+        html += `<div class="query-meta">error: ${esc(step.search_error)}</div>`;
+      }
+      const selectedSources = Array.isArray(step.selected_sources) ? step.selected_sources : [];
+      if (selectedSources.length > 0) {
+        html += `<div class="query-meta">picked sources:</div>`;
+        html += `<ul class="source-links">`;
+        for (const src of selectedSources) {
+          if (!src || typeof src !== "object") continue;
+          const srcUrl = toSafeHttpUrl(src.url);
+          if (!srcUrl) continue;
+          const srcTitle = String(src.title || "").trim();
+          const linkLabel = srcTitle || shortSourceLabel(srcUrl);
+          html += `<li><a href="${esc(srcUrl)}" target="_blank" rel="noopener noreferrer">${esc(linkLabel)}</a> <span class="source-host">(${esc(shortSourceLabel(srcUrl))})</span></li>`;
+        }
+        html += `</ul>`;
+      }
+      html += `</details></li>`;
+    }
+    html += `</ul></details>`;
+  }
+
+  if (q.node_sufficiency || q.unresolved_reason) {
+    const nodeNotesKey = makeDetailKey(["node_section", q.sub_question, "node_notes", scopeKey]);
+    const nodeNotesOpen = !forceClosedDetailKeys.has(nodeNotesKey) ? " open" : "";
+    html += `<details class="node-section" data-detail-key="${esc(nodeNotesKey)}"${nodeNotesOpen}><summary>Node Notes</summary>`;
+    if (q.node_sufficiency) {
+      const isSufficient = !!q.node_sufficiency.is_sufficient;
+      html += `<div class="query-mini">node sufficiency: ${isSufficient ? "pass" : "fail"}</div>`;
+      if (!isSufficient) {
+        const reason = String(q.node_sufficiency.reasoning || "").trim();
+        const gaps = Array.isArray(q.node_sufficiency.gaps) ? q.node_sufficiency.gaps : [];
+        if (reason) {
+          html += `<div class="query-meta">reason: ${esc(reason)}</div>`;
+        }
+        if (gaps.length > 0) {
+          html += `<div class="query-meta">gaps: ${gaps.map((g) => esc(g)).join(" | ")}</div>`;
+        }
+      }
+    }
+    if (q.unresolved_reason) {
+      html += `<div class="query-mini">unresolved: ${esc(q.unresolved_reason)}</div>`;
+    }
+    html += `</details>`;
+  }
+  html += `</article>`;
+
+  canvasDetailPanel.innerHTML = html;
+  restoreAndTrackDetailState();
 }
 
 function isNodeMostlyVisibleInCanvas(node) {
@@ -2585,9 +2749,7 @@ function setPrimaryAndPlanningActionButtons({
   phase,
   pState,
 }) {
-  runBtn.textContent = "Start Research";
-  runBtn.classList.add("primary");
-  runBtn.disabled = !!(!isNewSessionWorkspace || reportBusy || startRunInFlight);
+  /* runBtn state is managed by switchRunBtnTo* in applySnapshot */
   if (!planningActionBtn) return;
   if (!currentRunId) {
     planningActionBtn.textContent = "Start Planning";
@@ -2668,16 +2830,21 @@ function applySnapshot(snap) {
   reportStatusEl.textContent = shortStatus(snap.report_status || (snap.tree && snap.tree.report_status) || "pending");
   const title = String(snap.title || snap.task || "").trim();
   runMeta.textContent = `${title ? `${title} · ` : ""}Run ID: ${snap.run_id}`;
-  taskEl.value = String(snap.task || "");
   const isDraft = isDraftSnapshot(snap);
-  setTaskBoxLocked(!!sid && !isDraft);
-  setRunConfigLocked(!!sid && !isDraft);
+  const runActive = !!sid && !isDraft;
+  taskEl.value = String(snap.task || "").slice(0, TASK_MAX_CHARS);
+  updateTaskCharCount();
+  alignTaskTextBottom();
+  setTaskBoxLocked(runActive);
+  setRunConfigLocked(runActive);
   if (Number.isFinite(Number(snap.max_depth)) && Number(snap.max_depth) >= 1) {
-    maxDepthEl.value = String(Math.floor(Number(snap.max_depth)));
+    const depthVal = String(Math.floor(Number(snap.max_depth)));
+    maxDepthEl.value = depthVal;
+    if (depthDropdownValue) depthDropdownValue.textContent = depthVal;
   }
   stopReasonEl.textContent = snap.stop_reason ? `Stop rationale: ${snap.stop_reason}` : "";
-  latestThoughtEl.textContent = snap.latest_thought || "";
-  coverageNoteEl.textContent = snap.coverage_note || "";
+  if (latestThoughtEl) latestThoughtEl.textContent = snap.latest_thought || "";
+  if (coverageNoteEl) coverageNoteEl.textContent = snap.coverage_note || "";
   if (UI_DEBUG) {
     const tree = (snap && typeof snap.tree === "object" && snap.tree) ? snap.tree : {};
     const dbgStatus = String(snap.report_status || tree.report_status || "pending").trim() || "pending";
@@ -2697,7 +2864,21 @@ function applySnapshot(snap) {
   }
 
   showError(snap.error || "");
-  renderCanvas(snap.tree || {});
+
+  /* ── Detect execution state early (needed for abort-clear logic) ── */
+  const executionState = String(snap.execution_state || "").toLowerCase();
+  const researchState = String(snap.research_state || "").toLowerCase();
+  const running = researchState ? researchState === "running" : executionState === "running";
+  const paused = researchState ? researchState === "paused" : executionState === "paused";
+  const terminal = researchState ? researchState === "terminal" : ["completed", "aborted", "failed"].includes(executionState);
+
+  if (progressTitleEl) progressTitleEl.style.display = terminal ? "none" : "";
+
+  /* If user clicked Abort, keep page content intact */
+  if (!uiClearedByAbort) {
+    renderCanvas(snap.tree || {});
+  }
+
   const versions = normalizeReportVersions(snap);
   const activeIdx = activeReportVersionIndex(snap);
   selectedReportVersionIndex = activeIdx;
@@ -2721,12 +2902,8 @@ function applySnapshot(snap) {
   }
 
   reportRenderedEl.innerHTML = markdownToHtml(reportText);
+  viewReportBtn.disabled = !reportText.trim();
 
-  const executionState = String(snap.execution_state || "").toLowerCase();
-  const researchState = String(snap.research_state || "").toLowerCase();
-  const running = researchState ? researchState === "running" : executionState === "running";
-  const paused = researchState ? researchState === "paused" : executionState === "paused";
-  const terminal = researchState ? researchState === "terminal" : ["completed", "aborted", "failed"].includes(executionState);
   if (paused || terminal) {
     pauseRequested = false;
   }
@@ -2762,19 +2939,41 @@ function applySnapshot(snap) {
   }
   abortBtn.textContent = abortPending ? "Stopping..." : "Abort";
 
+  /* ── Sync inline run/abort button ── */
+  if (uiClearedByAbort) {
+    switchRunBtnToStart();
+    runBtn.disabled = true;
+    setTaskBoxLocked(true);
+  } else if (running || paused) {
+    switchRunBtnToAbort();
+    if (abortPending) {
+      runBtn.textContent = "Stopping...";
+      runBtn.disabled = true;
+    }
+    setTaskBoxLocked(true);
+  } else if (terminal) {
+    switchRunBtnToStart();
+    runBtn.disabled = true;
+    setTaskBoxLocked(true);
+  } else if (!currentRunId) {
+    switchRunBtnToStart();
+    setTaskBoxLocked(false);
+  }
+
   const hasDownloadableReport = !!reportFilePath;
-  downloadBtn.disabled = !hasDownloadableReport;
+  if (downloadBtn) downloadBtn.disabled = !hasDownloadableReport;
   const allowManualReport = !!sid && !reportBusy && (paused || terminal);
   reportBtn.disabled = !allowManualReport;
+  if (generateReportBtn) generateReportBtn.disabled = !allowManualReport;
   setReportTemplateControlsDisabled(reportBusy || reportTemplateMutationInFlight);
   setReportButtonVisual(reportGeneratingForThisRun);
   if (versions.length && activeIdx) {
-    reportVersionLabel.textContent = `${activeIdx}/${versions.length}`;
+    if (reportVersionLabel) reportVersionLabel.textContent = `${activeIdx}/${versions.length}`;
   } else {
-    reportVersionLabel.textContent = "-/-";
+    if (reportVersionLabel) reportVersionLabel.textContent = "-/-";
   }
-  reportPrevBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx > 1);
-  reportNextBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx < versions.length);
+  if (reportPrevBtn) reportPrevBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx > 1);
+  if (reportNextBtn) reportNextBtn.disabled = !(versions.length > 1 && activeIdx && activeIdx < versions.length);
   renderPlanningPanel(snap);
   renderSessions();
 }
@@ -2812,6 +3011,7 @@ async function scheduleSnapshotRefresh(runId) {
 async function openSession(runId, opts = {}) {
   const sid = String(runId || "").trim();
   if (!sid) return;
+  closeMobileDrawer();
   const updateUrl = opts.updateUrl !== false;
   const switchToken = ++activeSessionSwitchToken;
   if (es) {
@@ -2819,8 +3019,11 @@ async function openSession(runId, opts = {}) {
     es = null;
   }
   currentRunId = sid;
+  if (appMainEl) appMainEl.classList.remove("is-empty");
   pauseRequested = false;
   abortRequested = false;
+  uiClearedByAbort = false;
+  if (progressLog) progressLog.innerHTML = "";
   await fetchSnapshot(sid);
   setContextEnabled(true);
   clearContextPane("Loading context...");
@@ -2940,7 +3143,7 @@ function connectEvents(runId) {
         ) {
           clearStartupParseState(runId);
           pauseRequested = false;
-          abortRequested = false;
+          /* abortRequested is reset inside applySnapshot after clearing the UI */
         }
       } catch (_err) {
         // no-op
@@ -2960,10 +3163,12 @@ async function startRun(idempotencyKey, startMode = "research") {
   showError("");
   pauseRequested = false;
   abortRequested = false;
+  uiClearedByAbort = false;
   autoFollowActiveNode = true;
   lastAutoFollowNodeKey = "";
+  selectedCanvasNodeKey = "";
+  canvasNodeDataMap = new Map();
   thoughts.length = 0;
-  thoughtStreamEl.innerHTML = "";
 
   try {
     const endpoint = "/api/runs/start_from_workspace";
@@ -3000,6 +3205,7 @@ async function startRun(idempotencyKey, startMode = "research") {
       });
     }
     currentRunId = String(data.run_id || currentRunId || "");
+    if (appMainEl) appMainEl.classList.remove("is-empty");
     setRunIdInUrl(currentRunId);
     // Subscribe immediately so startup parsing events are not missed.
     connectEvents(currentRunId);
@@ -3022,6 +3228,7 @@ async function abortRun() {
   const ok = window.confirm("Abort this research session? This cannot be resumed.");
   if (!ok) return;
   abortRequested = true;
+  uiClearedByAbort = true;
   pauseBtn.disabled = true;
   resumeBtn.disabled = true;
   abortBtn.disabled = true;
@@ -3036,6 +3243,11 @@ async function abortRun() {
       abortRequested = false;
       throw new Error(await responseDetail(rsp, `Abort failed: ${rsp.status}`));
     }
+    /* Keep page content intact — just lock UI controls */
+    switchRunBtnToStart();
+    runBtn.disabled = true;
+    setTaskBoxLocked(true);
+    setRunConfigLocked(true);
   } catch (err) {
     abortRequested = false;
     if (currentSnapshot && typeof currentSnapshot === "object") {
@@ -3246,7 +3458,94 @@ async function deleteContextFile(fileId) {
   }
 }
 
+/* ── Bottom-align textarea content ──
+ * Dynamically adjust padding-top so text sits at the bottom of the 3-row
+ * textarea and grows upward as the user types more lines.
+ * Uses a hidden mirror div to measure true content height.
+ */
+const _taskMirror = document.createElement("div");
+_taskMirror.setAttribute("aria-hidden", "true");
+_taskMirror.style.cssText =
+  "position:absolute;top:0;left:0;visibility:hidden;pointer-events:none;" +
+  "white-space:pre-wrap;word-wrap:break-word;overflow-wrap:break-word;";
+document.body.appendChild(_taskMirror);
+
+function alignTaskTextBottom() {
+  const el = taskEl;
+  if (!el) return;
+  const cs = getComputedStyle(el);
+  // Sync mirror sizing with textarea
+  _taskMirror.style.font = cs.font;
+  _taskMirror.style.letterSpacing = cs.letterSpacing;
+  _taskMirror.style.width = el.clientWidth + "px";
+  _taskMirror.style.paddingLeft = cs.paddingLeft;
+  _taskMirror.style.paddingRight = cs.paddingRight;
+  _taskMirror.textContent = el.value || "\u200b";
+  if (el.value.endsWith("\n")) _taskMirror.textContent += "\u200b";
+  const contentH = _taskMirror.offsetHeight;
+  const lineHeight = parseFloat(cs.lineHeight) || (parseFloat(cs.fontSize) * 1.5);
+  const rows = parseInt(el.getAttribute("rows") || "3", 10);
+  const minContentArea = Math.round(lineHeight * rows);
+  const targetH = Math.max(minContentArea, contentH) + 4; /* 4px bottom pad */
+  el.style.height = targetH + "px";
+  const pad = Math.max(0, targetH - 4 - contentH);
+  el.style.paddingTop = pad + "px";
+}
+const TASK_MAX_CHARS = 140;
+const taskCharCountEl = document.getElementById("taskCharCount");
+
+taskEl.setAttribute("maxlength", String(TASK_MAX_CHARS));
+
+function updateTaskCharCount() {
+  const len = taskEl.value.length;
+  if (taskCharCountEl) {
+    taskCharCountEl.textContent = len + "/" + TASK_MAX_CHARS;
+    taskCharCountEl.classList.toggle("over-limit", len >= TASK_MAX_CHARS);
+  }
+}
+
+taskEl.addEventListener("input", () => {
+  if (taskEl.value.length > TASK_MAX_CHARS) {
+    taskEl.value = taskEl.value.slice(0, TASK_MAX_CHARS);
+  }
+  updateTaskCharCount();
+  alignTaskTextBottom();
+  if (currentRunId || startRunInFlight) return;
+  runBtn.disabled = !taskEl.value.trim();
+});
+// Also align on initial load and when value is set programmatically
+requestAnimationFrame(() => { alignTaskTextBottom(); updateTaskCharCount(); });
+
+taskEl.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    if (!e.shiftKey && !runBtn.disabled) runBtn.click();
+  }
+});
+
+/* ── Prompt example chips ── */
+document.querySelectorAll(".prompt-example-chip").forEach((chip) => {
+  chip.addEventListener("click", () => {
+    if (currentRunId || startRunInFlight) return;
+    taskEl.value = chip.textContent.trim().slice(0, TASK_MAX_CHARS);
+    taskEl.focus();
+    updateTaskCharCount();
+    alignTaskTextBottom();
+    runBtn.disabled = false;
+  });
+});
+
 runBtn.addEventListener("click", async () => {
+  /* ── Abort mode: button says "Abort" while a run is active ── */
+  if (currentRunId && !startRunInFlight && runBtn.dataset.mode === "abort") {
+    try {
+      await abortRun();
+    } catch (err) {
+      showError(err.message || String(err));
+    }
+    return;
+  }
+
   if (currentRunId || startRunInFlight) {
     return;
   }
@@ -3257,15 +3556,16 @@ runBtn.addEventListener("click", async () => {
   }
   try {
     await startRun(newIdempotencyKey("start_research"), "research");
+    /* After run starts: lock textarea (keep content visible), switch to Abort */
+    setTaskBoxLocked(true);
+    switchRunBtnToAbort();
   } catch (err) {
     showError(err.message || String(err));
   } finally {
     startRunInFlight = false;
     if (!currentRunId) {
-      runBtn.disabled = false;
-      if (planningActionBtn) {
-        planningActionBtn.disabled = false;
-      }
+      switchRunBtnToStart();
+      setTaskBoxLocked(false);
     }
   }
 });
@@ -3311,6 +3611,7 @@ reportBtn.addEventListener("click", async () => {
     planningActionBtn.disabled = true;
   }
   reportBtn.disabled = true;
+  if (generateReportBtn) generateReportBtn.disabled = true;
   setReportButtonVisual(true);
   showError("");
   upsertThought("Generating report from accumulated findings.", "report");
@@ -3343,6 +3644,10 @@ reportBtn.addEventListener("click", async () => {
     }
   }
 });
+
+if (generateReportBtn) {
+  generateReportBtn.addEventListener("click", () => reportBtn.click());
+}
 
 if (reportTemplateSelectEl) {
   reportTemplateSelectEl.addEventListener("change", () => {
@@ -3504,7 +3809,30 @@ if (reportTplPreviewBtn) {
   });
 }
 
-downloadBtn.addEventListener("click", () => {
+if (downloadBtn) {
+  downloadBtn.addEventListener("click", () => {
+  if (!currentRunId) return;
+  const idx = Number(selectedReportVersionIndex || 0);
+  if (Number.isFinite(idx) && idx > 0) {
+    window.location.href = `/api/runs/${currentRunId}/report/download?version_index=${Math.floor(idx)}`;
+    return;
+  }
+  window.location.href = `/api/runs/${currentRunId}/report/download`;
+  });
+}
+
+/* ── Report modal open / close / download ── */
+viewReportBtn.addEventListener("click", () => {
+  if (viewReportBtn.disabled) return;
+  reportModal.classList.remove("hidden");
+});
+reportModalCloseBtn.addEventListener("click", () => {
+  reportModal.classList.add("hidden");
+});
+reportModal.addEventListener("click", (e) => {
+  if (e.target === reportModal) reportModal.classList.add("hidden");
+});
+reportModalDownloadBtn.addEventListener("click", () => {
   if (!currentRunId) return;
   const idx = Number(selectedReportVersionIndex || 0);
   if (Number.isFinite(idx) && idx > 0) {
@@ -3582,28 +3910,32 @@ canvasEl.addEventListener("click", async (evt) => {
   }
 });
 
-reportPrevBtn.addEventListener("click", async () => {
-  try {
-    const idx = Number(selectedReportVersionIndex || 0);
-    if (idx > 1) {
-      await selectReportVersion(idx - 1);
+if (reportPrevBtn) {
+  reportPrevBtn.addEventListener("click", async () => {
+    try {
+      const idx = Number(selectedReportVersionIndex || 0);
+      if (idx > 1) {
+        await selectReportVersion(idx - 1);
+      }
+    } catch (err) {
+      showError(err.message || String(err));
     }
-  } catch (err) {
-    showError(err.message || String(err));
-  }
-});
+  });
+}
 
-reportNextBtn.addEventListener("click", async () => {
-  try {
-    const idx = Number(selectedReportVersionIndex || 0);
-    const versions = normalizeReportVersions(currentSnapshot || {});
-    if (idx >= 1 && idx < versions.length) {
-      await selectReportVersion(idx + 1);
+if (reportNextBtn) {
+  reportNextBtn.addEventListener("click", async () => {
+    try {
+      const idx = Number(selectedReportVersionIndex || 0);
+      const versions = normalizeReportVersions(currentSnapshot || {});
+      if (idx >= 1 && idx < versions.length) {
+        await selectReportVersion(idx + 1);
+      }
+    } catch (err) {
+      showError(err.message || String(err));
     }
-  } catch (err) {
-    showError(err.message || String(err));
-  }
-});
+  });
+}
 
 zoomOutBtn.addEventListener("click", () => {
   autoFitCanvas = false;
@@ -3628,6 +3960,39 @@ window.addEventListener("resize", () => {
   }
 });
 
+/* ── Depth dropdown ── */
+const depthDropdownBtn = document.getElementById("depthDropdownBtn");
+const depthDropdownValue = document.getElementById("depthDropdownValue");
+const depthDropdownMenu = document.getElementById("depthDropdownMenu");
+
+function syncDepthDropdownActive() {
+  const cur = String(maxDepthEl.value);
+  for (const opt of depthDropdownMenu.querySelectorAll(".depth-dropdown-option")) {
+    opt.classList.toggle("is-active", opt.getAttribute("data-depth") === cur);
+  }
+}
+
+depthDropdownBtn.addEventListener("click", (e) => {
+  e.stopPropagation();
+  const isOpen = !depthDropdownMenu.classList.contains("hidden");
+  depthDropdownMenu.classList.toggle("hidden", isOpen);
+  if (!isOpen) syncDepthDropdownActive();
+});
+
+depthDropdownMenu.addEventListener("click", (e) => {
+  const opt = e.target.closest(".depth-dropdown-option");
+  if (!opt) return;
+  const val = opt.getAttribute("data-depth");
+  maxDepthEl.value = val;
+  depthDropdownValue.textContent = val;
+  depthDropdownMenu.classList.add("hidden");
+  syncDepthDropdownActive();
+});
+
+document.addEventListener("click", () => {
+  depthDropdownMenu.classList.add("hidden");
+});
+
 async function bootstrapFromUrl() {
   const runId = readRunIdFromUrl();
   try {
@@ -3644,7 +4009,6 @@ async function bootstrapFromUrl() {
       return;
     }
     await openSession(selected, { updateUrl: true });
-    upsertThought("Restored session state.", "bootstrap");
   } catch (err) {
     showError(err.message || String(err));
   }
@@ -3747,6 +4111,18 @@ if (sessionRailToggleBtn) {
   });
 }
 
+/* ── Mobile session toggle (collapse / expand) ── */
+const mobileSessionToggle = document.getElementById("mobileSessionToggle");
+const sessionRailEl = document.querySelector(".session-rail");
+function closeMobileDrawer() {
+  if (sessionRailEl) sessionRailEl.classList.remove("mobile-expanded");
+}
+if (mobileSessionToggle) {
+  mobileSessionToggle.addEventListener("click", () => {
+    if (sessionRailEl) sessionRailEl.classList.toggle("mobile-expanded");
+  });
+}
+
 if (refreshSessionsBtn) {
   refreshSessionsBtn.addEventListener("click", async () => {
     try {
@@ -3782,6 +4158,31 @@ if (contextUploadBtn) {
     if (contextMutationInFlight || contextInputLocked) return;
     if (contextUploadInput) {
       contextUploadInput.click();
+    }
+  });
+}
+
+if (contextAddBtn) {
+  contextAddBtn.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (contextMutationInFlight || contextInputLocked) return;
+    if (contextUploadInput) {
+      contextUploadInput.click();
+    }
+  });
+}
+
+if (inlineContextFilesEl) {
+  inlineContextFilesEl.addEventListener("click", async (evt) => {
+    const delBtn = evt.target.closest(".ctx-file-del[data-delete-fid]");
+    if (!delBtn) return;
+    evt.stopPropagation();
+    const fid = String(delBtn.getAttribute("data-delete-fid") || "");
+    if (!fid) return;
+    try {
+      await deleteContextFile(fid);
+    } catch (err) {
+      showError(err && err.message ? err.message : String(err));
     }
   });
 }

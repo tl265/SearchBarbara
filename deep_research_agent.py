@@ -1,6 +1,7 @@
 import argparse
 import copy
 import json
+import logging
 import os
 import time
 import textwrap
@@ -8,6 +9,51 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+
+
+def _setup_agent_logger() -> logging.Logger:
+    """Configure the agent logger with a file handler at module load time.
+
+    This ensures logging works regardless of entry point (CLI, web, import).
+    The log file is always ``<project_root>/logs/agent_debug.log``.
+    """
+    _logger = logging.getLogger("searchbarbara.agent")
+    # Avoid adding duplicate handlers on module reload.
+    if _logger.handlers:
+        return _logger
+
+    _logger.setLevel(logging.DEBUG)
+
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "agent_debug.log"
+
+    fmt = logging.Formatter(
+        "%(asctime)s %(levelname)-7s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # File handler — always DEBUG for full history
+    fh = logging.FileHandler(str(log_file), encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    _logger.addHandler(fh)
+
+    # Console handler — follows AGENT_LOG_LEVEL env var (default WARNING to avoid noise)
+    ch = logging.StreamHandler()
+    _console_level = os.getenv("AGENT_LOG_LEVEL", "WARNING").upper()
+    ch.setLevel(getattr(logging, _console_level, logging.WARNING))
+    ch.setFormatter(fmt)
+    _logger.addHandler(ch)
+
+    return _logger
+
+
+logger = _setup_agent_logger()
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from urllib.parse import urlparse
 
 from openai import OpenAI, RateLimitError
@@ -602,6 +648,10 @@ class LLM:
         self.model = model
         self.max_retries = 3
         self.usage_tracker = usage_tracker
+        logger.info(
+            "[LLM_INIT] model=%s base_url=%s",
+            self.model, self.client.base_url,
+        )
 
     def json(
         self,
@@ -649,10 +699,20 @@ class LLM:
         last_exc: Exception | None = None
         for attempt in range(self.max_retries):
             try:
+                logger.debug(
+                    "[LLM] calling chat.completions: model=%s stage=%s attempt=%d/%d",
+                    self.model, stage, attempt + 1, self.max_retries,
+                )
+                t0 = time.time()
                 rsp = self.client.chat.completions.create(
                     model=self.model,
                     messages=messages,
                     **kwargs,
+                )
+                elapsed = time.time() - t0
+                logger.debug(
+                    "[LLM] chat.completions returned in %.1fs: model=%s stage=%s",
+                    elapsed, self.model, stage,
                 )
                 if self.usage_tracker:
                     self.usage_tracker.record(
@@ -666,9 +726,16 @@ class LLM:
                 return rsp
             except RateLimitError as exc:
                 last_exc = exc
+                wait = 1.2 * (2 ** attempt)
+                logger.warning(
+                    "[LLM] %s on attempt %d/%d for stage=%s model=%s: %s — "
+                    "retrying in %.1fs",
+                    type(exc).__name__, attempt + 1, self.max_retries,
+                    stage, self.model, exc, wait,
+                )
                 # Exponential backoff for transient rate-limit pressure.
                 if attempt < self.max_retries - 1:
-                    time.sleep(1.2 * (2**attempt))
+                    time.sleep(wait)
                     continue
                 raise
         if last_exc:
@@ -681,13 +748,15 @@ class WebSearch:
         self.client = OpenAI()
         self.model = model
         self.usage_tracker = usage_tracker
-        # Default to the current Responses API web search tool first,
-        # with a compatibility fallback.
         tool_types = os.getenv(
-            "OPENAI_WEB_SEARCH_TOOL_TYPES", "web_search_preview,web_search"
+            "OPENAI_WEB_SEARCH_TOOL_TYPES", "web_search"
         )
         self.tool_types = [t.strip() for t in tool_types.split(",") if t.strip()]
         self.last_error = ""
+        logger.info(
+            "[SEARCH_INIT] model=%s tool_types=%s base_url=%s",
+            self.model, self.tool_types, self.client.base_url,
+        )
 
     def search(self, query: str, k: int = 5) -> List[SearchResult]:
         prompt = textwrap.dedent(
@@ -710,15 +779,33 @@ class WebSearch:
         errors: List[str] = []
         for tool_type in self.tool_types:
             try:
+                logger.info(
+                    "[SEARCH] calling responses.create: model=%s tool=%s query=%r k=%d",
+                    self.model, tool_type, query[:120], k,
+                )
+                t0 = time.time()
                 rsp = self.client.responses.create(
                     model=self.model,
                     tools=[{"type": tool_type}],
-                    tool_choice={"type": tool_type},
+                    tool_choice="auto",
                     input=prompt,
                 )
-                data = self._parse_results_json(rsp.output_text)
+                elapsed = time.time() - t0
+                # Extract assistant text from the output array.
+                # The third-party platform returns output as a list containing
+                # web_search_call items and a message item with the final text.
+                text = self._extract_assistant_text(rsp)
+                logger.debug(
+                    "[SEARCH] raw assistant text (first 500 chars): %s",
+                    text[:500],
+                )
+                data = self._parse_results_json(text)
                 raw_items = data.get("results", [])
                 raw_results_count = len(raw_items) if isinstance(raw_items, list) else 0
+                logger.info(
+                    "[SEARCH] responses returned %d results in %.1fs: query=%r",
+                    raw_results_count, elapsed, query[:120],
+                )
                 if self.usage_tracker:
                     self.usage_tracker.record(
                         stage="web_search",
@@ -744,10 +831,55 @@ class WebSearch:
                     and is_valid_absolute_http_url(i.get("url", ""))
                 ]
             except Exception as exc:
+                logger.error(
+                    "[SEARCH] FAILED: tool=%s query=%r error=%s",
+                    tool_type, query[:120], exc,
+                )
                 errors.append(f"{tool_type}: {exc}")
         self.last_error = " | ".join(errors) if errors else "unknown search error"
         # Fail-soft per query; caller decides whether failure rate is fatal.
         return []
+
+    @staticmethod
+    def _extract_assistant_text(rsp: Any) -> str:
+        """Extract the assistant reply text from a Responses API response.
+
+        Handles two formats:
+        1. Official OpenAI SDK: ``rsp.output`` is a list of typed objects;
+           look for a message with role=assistant and read its content blocks.
+        2. Simple/legacy: ``rsp.output_text`` is a plain string.
+        """
+        # Try output_text first (works with the official SDK shortcut).
+        output_text = getattr(rsp, "output_text", None)
+        if output_text and isinstance(output_text, str) and output_text.strip():
+            return output_text
+
+        # Walk the output array for the assistant message.
+        output = getattr(rsp, "output", None) or []
+        if isinstance(output, list):
+            for item in output:
+                # SDK objects have attributes; raw dicts have keys.
+                item_type = getattr(item, "type", None) or (
+                    item.get("type") if isinstance(item, dict) else None
+                )
+                item_role = getattr(item, "role", None) or (
+                    item.get("role") if isinstance(item, dict) else None
+                )
+                if item_type == "message" and item_role == "assistant":
+                    content = getattr(item, "content", None) or (
+                        item.get("content") if isinstance(item, dict) else None
+                    ) or []
+                    for block in (content if isinstance(content, list) else []):
+                        block_type = getattr(block, "type", None) or (
+                            block.get("type") if isinstance(block, dict) else None
+                        )
+                        if block_type == "output_text":
+                            text = getattr(block, "text", None) or (
+                                block.get("text") if isinstance(block, dict) else None
+                            ) or ""
+                            if text.strip():
+                                return text
+        return ""
 
     def _parse_results_json(self, text: str) -> Dict[str, Any]:
         try:
@@ -1439,6 +1571,29 @@ Runtime context (authoritative):
             self.query_memory = qm if isinstance(qm, dict) else {}
             start_round = max(1, int(resume_state.get("next_round", 1)))
             self._log(f"Resuming from {state_path} at round {start_round}.")
+            logger.info(
+                "[RESUME] state_path=%s start_round=%d "
+                "query_memory_size=%d completed_query_steps=%d "
+                "query_history_len=%d",
+                state_path,
+                start_round,
+                len(self.query_memory),
+                len(completed_query_steps),
+                len(query_history),
+            )
+            for qm_key, qm_val in self.query_memory.items():
+                logger.info(
+                    "[RESUME] loaded query_memory: key=%r attempts=%s "
+                    "no_gain_streak=%s last_round=%s age=%.0fs "
+                    "selected=%s error=%r",
+                    qm_key[:120],
+                    qm_val.get("attempts"),
+                    qm_val.get("no_gain_streak"),
+                    qm_val.get("last_round"),
+                    time.time() - float(qm_val.get("last_ts", 0)),
+                    qm_val.get("selected_results_count"),
+                    qm_val.get("search_error", ""),
+                )
         else:
             trace = {
                 "task": task,
@@ -1653,11 +1808,45 @@ Runtime context (authoritative):
                 )
                 if not frontier_questions:
                     self._log("No unresolved questions in frontier; stopping early.")
+                    logger.warning(
+                        "[EARLY_STOP] round=%d no frontier questions. "
+                        "resolved_questions=%d unresolved_questions=%d extra_questions=%d",
+                        round_i,
+                        len(resolved_questions),
+                        len(unresolved_questions),
+                        len(extra_questions),
+                    )
                     break
 
                 self._log(
                     f"Round {round_i}/{self.max_rounds}: processing {len(frontier_questions)} frontier questions."
                 )
+                logger.info(
+                    "[ROUND_START] round=%d/%d frontier_questions=%d "
+                    "query_memory_size=%d completed_query_steps=%d "
+                    "resolved_questions=%d frontier=%r",
+                    round_i,
+                    self.max_rounds,
+                    len(frontier_questions),
+                    len(self.query_memory),
+                    len(completed_query_steps),
+                    len(resolved_questions),
+                    [q[:60] for q in frontier_questions],
+                )
+                if self.query_memory:
+                    for qm_key, qm_val in self.query_memory.items():
+                        logger.debug(
+                            "[ROUND_START] query_memory entry: key=%r "
+                            "attempts=%s no_gain_streak=%s last_round=%s "
+                            "age=%.0fs selected=%s error=%r",
+                            qm_key[:120],
+                            qm_val.get("attempts"),
+                            qm_val.get("no_gain_streak"),
+                            qm_val.get("last_round"),
+                            time.time() - float(qm_val.get("last_ts", 0)),
+                            qm_val.get("selected_results_count"),
+                            qm_val.get("search_error", ""),
+                        )
                 self._emit(
                     "round_started",
                     {
@@ -1712,11 +1901,23 @@ Runtime context (authoritative):
                     self._abort_if_requested("sub_question_start")
                     local_max_depth = max(depth, int(branch_max_depth or self.max_depth))
                     if sq in processed_questions_in_pass:
+                        logger.debug(
+                            "[DFS] sq=%r depth=%d → already processed this pass "
+                            "(resolved=%s)",
+                            sq[:80], depth, sq in resolved_questions,
+                        )
                         return sq in resolved_questions
                     if sq in resolved_questions:
+                        logger.debug(
+                            "[DFS] sq=%r depth=%d → already resolved", sq[:80], depth,
+                        )
                         processed_questions_in_pass.add(sq)
                         return True
                     if sq in active_questions_in_branch:
+                        logger.warning(
+                            "[DFS] sq=%r depth=%d → SKIPPED: active_branch_cycle",
+                            sq[:80], depth,
+                        )
                         self._emit(
                             "node_unresolved",
                             {
@@ -1730,6 +1931,10 @@ Runtime context (authoritative):
                         processed_questions_in_pass.add(sq)
                         return False
                     if sq in ancestry:
+                        logger.warning(
+                            "[DFS] sq=%r depth=%d → SKIPPED: cycle_detected (ancestry=%r)",
+                            sq[:80], depth, [a[:40] for a in ancestry],
+                        )
                         self._emit(
                             "node_unresolved",
                             {
@@ -1753,6 +1958,10 @@ Runtime context (authoritative):
                     node_id = get_or_assign_node_id(sq, question_parents.get(sq, ""))
                     findings.setdefault(sq, SubQuestionFinding(sub_question=sq))
                     self._log(f"Question [{node_id}] (depth {depth}): {sq}")
+                    logger.info(
+                        "[DFS] PROCESSING node_id=%s depth=%d/%d sq=%r parent=%r",
+                        node_id, depth, local_max_depth, sq[:80], parent[:60],
+                    )
                     self._emit(
                         "sub_question_started",
                         {
@@ -1939,6 +2148,14 @@ Runtime context (authoritative):
                         step_key = self._query_step_key(round_i, sq, query)
                         if step_key in completed_query_steps:
                             self._log(f"Skipping already completed query: {query}")
+                            logger.info(
+                                "[SKIP] step_key=%r already in completed_query_steps "
+                                "(round=%d, sub_question=%r, query=%r)",
+                                step_key,
+                                round_i,
+                                sq[:80],
+                                query[:120],
+                            )
                             continue
 
                         explicit_recheck = (
@@ -1980,6 +2197,25 @@ Runtime context (authoritative):
                         )
                         if not should_run:
                             cache_entry = self.query_memory.get(intent_key, {})
+                            logger.warning(
+                                "[QUERY_SKIPPED] round=%d depth=%d decision=%s "
+                                "query=%r sub_question=%r intent_key=%r "
+                                "cache_entry={attempts=%s, no_gain_streak=%s, "
+                                "last_round=%s, age=%.0fs, selected_results_count=%s, "
+                                "search_error=%r}",
+                                round_i,
+                                depth,
+                                decision,
+                                query[:120],
+                                sq[:80],
+                                intent_key[:120],
+                                cache_entry.get("attempts"),
+                                cache_entry.get("no_gain_streak"),
+                                cache_entry.get("last_round"),
+                                time.time() - float(cache_entry.get("last_ts", 0)),
+                                cache_entry.get("selected_results_count"),
+                                cache_entry.get("search_error", ""),
+                            )
                             step_data = {
                                 "node_id": node_id,
                                 "round": round_i,
@@ -2061,6 +2297,10 @@ Runtime context (authoritative):
                             )
 
                         self._log(f"Searching: {query}")
+                        logger.info(
+                            "[QUERY_EXEC] about to search: round=%d query=%r intent=%r effective_k=%d",
+                            round_i, query[:120], intent_key[:120], effective_k,
+                        )
                         self._emit(
                             "query_started",
                             {
@@ -2502,6 +2742,18 @@ Runtime context (authoritative):
                 round_trace["sufficiency"] = suff
                 round_trace["round_new_fact_gain"] = round_new_fact_gain
                 round_trace["frontier_remaining"] = unresolved_questions
+                logger.info(
+                    "[ROUND_END] round=%d round_new_fact_gain=%d "
+                    "resolved=%d unresolved=%d query_memory_size=%d "
+                    "completed_query_steps=%d total_search_calls=%d",
+                    round_i,
+                    round_new_fact_gain,
+                    len(resolved_questions),
+                    len(unresolved_questions),
+                    len(self.query_memory),
+                    len(completed_query_steps),
+                    total_search_calls,
+                )
                 self._emit(
                     "sufficiency_completed",
                     {
@@ -2546,6 +2798,17 @@ Runtime context (authoritative):
                 ):
                     self._log(
                         "Stopping early due to no evidence gain and no targeted follow-up actions."
+                    )
+                    logger.warning(
+                        "[EARLY_STOP] round=%d stopping: round_new_fact_gain=0, "
+                        "no extra_questions, no extra_queries, no recheck_queries. "
+                        "query_memory_size=%d resolved=%d unresolved=%d "
+                        "total_search_calls=%d",
+                        round_i,
+                        len(self.query_memory),
+                        len(resolved_questions),
+                        len(unresolved_questions),
+                        total_search_calls,
                     )
                     break
                 save_checkpoint(status="running", next_round=round_i + 1)
@@ -2612,6 +2875,11 @@ Runtime context (authoritative):
                 evidence_note=evidence_note,
                 search_stats=trace["search_stats"],
                 full_user_context=full_ctx,
+            )
+            logger.info(
+                "[REPORT] prompt size: system=%d chars, user=%d chars, total=%d chars",
+                len(SYSTEM_REPORT), len(report_prompt),
+                len(SYSTEM_REPORT) + len(report_prompt),
             )
             report = self.report_llm.text(
                 SYSTEM_REPORT,
@@ -3520,13 +3788,37 @@ Runtime context (authoritative):
 
     def _resolve_execution_intent(self, raw_intent_key: str) -> tuple[str, float]:
         if raw_intent_key in self.query_memory:
+            logger.debug(
+                "[RESOLVE_INTENT] raw=%r → exact match in query_memory", raw_intent_key[:120]
+            )
             return raw_intent_key, 1.0
         nearest_key, _, score = self._nearest_prior_intent(raw_intent_key)
         collapse_threshold = float(
             self.search_policy.get("intent_collapse_similarity", 0.55)
         )
         if nearest_key and score >= collapse_threshold:
+            logger.info(
+                "[RESOLVE_INTENT] raw=%r → COLLAPSED to existing key=%r "
+                "(similarity=%.2f >= threshold=%.2f)",
+                raw_intent_key[:120],
+                nearest_key[:120],
+                score,
+                collapse_threshold,
+            )
             return nearest_key, score
+        if nearest_key:
+            logger.debug(
+                "[RESOLVE_INTENT] raw=%r → novel (nearest=%r, similarity=%.2f < threshold=%.2f)",
+                raw_intent_key[:120],
+                nearest_key[:120],
+                score,
+                collapse_threshold,
+            )
+        else:
+            logger.debug(
+                "[RESOLVE_INTENT] raw=%r → novel (no prior intents in memory)",
+                raw_intent_key[:120],
+            )
         return raw_intent_key, 0.0
 
     def _log_query_diagnostics(
@@ -3635,28 +3927,73 @@ Runtime context (authoritative):
     ) -> tuple[bool, str]:
         entry = self.query_memory.get(intent_key)
         if not entry:
+            logger.debug(
+                "[DECIDE] intent_key=%r → new_query (no entry in query_memory)",
+                intent_key[:120],
+            )
             return True, "new_query"
 
         max_no_gain = int(self.search_policy.get("max_no_gain_retries_per_intent", 2))
-        if int(entry.get("no_gain_streak", 0)) >= max_no_gain:
+        no_gain_streak = int(entry.get("no_gain_streak", 0))
+        if no_gain_streak >= max_no_gain:
+            logger.warning(
+                "[DECIDE] intent_key=%r → BLOCKED by diminishing returns "
+                "(no_gain_streak=%d >= max=%d, attempts=%d, last_round=%s, "
+                "selected_results_count=%d, new_fact_gain=%d)",
+                intent_key[:120],
+                no_gain_streak,
+                max_no_gain,
+                int(entry.get("attempts", 0)),
+                entry.get("last_round"),
+                int(entry.get("selected_results_count", 0)),
+                int(entry.get("new_fact_gain", 0)),
+            )
             return False, "blocked_diminishing_returns"
 
         if explicit_recheck:
+            logger.debug(
+                "[DECIDE] intent_key=%r → explicit_recheck", intent_key[:120]
+            )
             return True, "explicit_recheck"
 
         if self._is_time_sensitive(entry.get("query", intent_key)):
+            logger.debug(
+                "[DECIDE] intent_key=%r → time_sensitive", intent_key[:120]
+            )
             return True, "time_sensitive"
 
         if bool(entry.get("search_error")) and bool(
             self.search_policy.get("allow_rerun_on_search_error", True)
         ):
+            logger.debug(
+                "[DECIDE] intent_key=%r → previous_search_error (error=%r)",
+                intent_key[:120],
+                entry.get("search_error"),
+            )
             return True, "previous_search_error"
 
         ttl = int(self.search_policy.get("cache_ttl_seconds", 3600))
         last_ts = float(entry.get("last_ts", 0.0))
-        if ttl > 0 and (time.time() - last_ts) > ttl:
+        age = time.time() - last_ts
+        if ttl > 0 and age > ttl:
+            logger.debug(
+                "[DECIDE] intent_key=%r → cache_expired (age=%.0fs > ttl=%ds)",
+                intent_key[:120],
+                age,
+                ttl,
+            )
             return True, "cache_expired"
 
+        logger.warning(
+            "[DECIDE] intent_key=%r → CACHE HIT (age=%.0fs, ttl=%ds, "
+            "attempts=%d, no_gain_streak=%d, selected_results_count=%d)",
+            intent_key[:120],
+            age,
+            ttl,
+            int(entry.get("attempts", 0)),
+            int(entry.get("no_gain_streak", 0)),
+            int(entry.get("selected_results_count", 0)),
+        )
         return False, "cache_hit"
 
     def _effective_results_per_query(self, intent_key: str) -> tuple[int, int]:
@@ -3689,6 +4026,18 @@ Runtime context (authoritative):
             no_gain_streak += 1
         else:
             no_gain_streak = 0
+        logger.info(
+            "[UPDATE_MEMORY] intent_key=%r round=%d attempts=%d "
+            "new_fact_gain=%d (min=%d) no_gain_streak=%d selected=%d error=%r",
+            intent_key[:120],
+            round_i,
+            attempts,
+            new_fact_gain,
+            min_gain,
+            no_gain_streak,
+            len(selected_results),
+            search_error or "",
+        )
         self.query_memory[intent_key] = {
             "query": query,
             "last_round": round_i,
@@ -4014,6 +4363,15 @@ Runtime context (authoritative):
 
 
 def main() -> None:
+    # In CLI mode, promote console output to INFO (module default is WARNING).
+    _cli_level = os.getenv("AGENT_LOG_LEVEL", "INFO").upper()
+    for h in logger.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+            h.setLevel(getattr(logging, _cli_level, logging.INFO))
+
+    log_file = Path(__file__).resolve().parent / "logs" / "agent_debug.log"
+    print(f"[info] Agent debug log: {log_file}")
+
     parser = argparse.ArgumentParser(description="Deep Research Agent")
     parser.add_argument("task", help="Research task prompt")
     parser.add_argument(
