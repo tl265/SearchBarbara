@@ -19,6 +19,7 @@ from fastapi.templating import Jinja2Templates
 from starlette.requests import Request
 
 from app.auth import AuthConfig, AuthService, get_current_user_from_request
+from app.live_intent import LiveIntentClassifier
 from app.models import (
     ContextDigestResponse,
     ContextFileDetailResponse,
@@ -27,6 +28,8 @@ from app.models import (
     GenerateReportRequest,
     CreateRunRequest,
     CreateRunResponse,
+    LiveIntentRequest,
+    LiveIntentResponse,
     PlanningDepthBonusRequest,
     PatchSessionRequest,
     ReportTemplateCreateRequest,
@@ -75,6 +78,14 @@ def _load_web_config() -> Dict[str, Any]:
         "context_preprocess_prompt_path_aggregate": "prompts/context_preprocess_aggregate.system.txt",
         "context_preprocess_prompt_version": "v1.4",
         "context_chunking_version": "context_chunk.v1",
+        "live_intent_enabled": True,
+        "live_intent_min_chars_default": 12,
+        "live_intent_min_chars_cjk": 6,
+        "live_intent_debounce_ms": 320,
+        "live_intent_server_max_chars": 600,
+        "live_intent_model": "gpt-4.1",
+        "live_intent_prompt_path": "prompts/live_intent.system.txt",
+        "live_intent_confidence_threshold": 0.45,
     }
     if not WEB_CONFIG_PATH.exists():
         return default
@@ -201,6 +212,62 @@ def _load_web_config() -> Dict[str, Any]:
         raw.get("context_chunking_version", default["context_chunking_version"])
         or default["context_chunking_version"]
     )
+    live_intent_enabled = bool(
+        raw.get("live_intent_enabled", default["live_intent_enabled"])
+    )
+    legacy_live_intent_min_chars = raw.get(
+        "live_intent_min_chars", default["live_intent_min_chars_default"]
+    )
+    try:
+        live_intent_min_chars_default = int(
+            raw.get(
+                "live_intent_min_chars_default",
+                legacy_live_intent_min_chars,
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_min_chars_default = default["live_intent_min_chars_default"]
+    try:
+        live_intent_min_chars_cjk = int(
+            raw.get(
+                "live_intent_min_chars_cjk",
+                default["live_intent_min_chars_cjk"],
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_min_chars_cjk = default["live_intent_min_chars_cjk"]
+    try:
+        live_intent_debounce_ms = int(
+            raw.get("live_intent_debounce_ms", default["live_intent_debounce_ms"])
+        )
+    except (TypeError, ValueError):
+        live_intent_debounce_ms = default["live_intent_debounce_ms"]
+    try:
+        live_intent_server_max_chars = int(
+            raw.get(
+                "live_intent_server_max_chars",
+                default["live_intent_server_max_chars"],
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_server_max_chars = default["live_intent_server_max_chars"]
+    live_intent_model = str(
+        raw.get("live_intent_model", default["live_intent_model"])
+        or default["live_intent_model"]
+    )
+    live_intent_prompt_path = str(
+        raw.get("live_intent_prompt_path", default["live_intent_prompt_path"])
+        or default["live_intent_prompt_path"]
+    )
+    try:
+        live_intent_confidence_threshold = float(
+            raw.get(
+                "live_intent_confidence_threshold",
+                default["live_intent_confidence_threshold"],
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_confidence_threshold = default["live_intent_confidence_threshold"]
     return {
         "max_rounds": max(1, max_rounds),
         "max_depth_min": max_depth_min,
@@ -225,6 +292,20 @@ def _load_web_config() -> Dict[str, Any]:
         "context_preprocess_prompt_path_aggregate": context_preprocess_prompt_path_aggregate,
         "context_preprocess_prompt_version": context_preprocess_prompt_version,
         "context_chunking_version": context_chunking_version,
+        "live_intent_enabled": live_intent_enabled,
+        "live_intent_min_chars_default": max(
+            1, min(live_intent_min_chars_default, 200)
+        ),
+        "live_intent_min_chars_cjk": max(1, min(live_intent_min_chars_cjk, 40)),
+        "live_intent_debounce_ms": max(80, min(live_intent_debounce_ms, 1500)),
+        "live_intent_server_max_chars": max(
+            64, min(live_intent_server_max_chars, 2000)
+        ),
+        "live_intent_model": live_intent_model,
+        "live_intent_prompt_path": live_intent_prompt_path,
+        "live_intent_confidence_threshold": min(
+            0.95, max(0.0, float(live_intent_confidence_threshold))
+        ),
     }
 
 
@@ -264,6 +345,19 @@ run_manager = RunManager(
     ),
     context_chunking_version=str(
         WEB_CONFIG.get("context_chunking_version", "context_chunk.v1")
+    ),
+)
+live_intent_classifier = LiveIntentClassifier(
+    enabled=bool(WEB_CONFIG.get("live_intent_enabled", True)),
+    min_chars_default=int(WEB_CONFIG.get("live_intent_min_chars_default", 12)),
+    min_chars_cjk=int(WEB_CONFIG.get("live_intent_min_chars_cjk", 6)),
+    max_input_chars=int(WEB_CONFIG.get("live_intent_server_max_chars", 600)),
+    model=str(WEB_CONFIG.get("live_intent_model", "gpt-4.1")),
+    prompt_path=str(
+        WEB_CONFIG.get("live_intent_prompt_path", "prompts/live_intent.system.txt")
+    ),
+    confidence_threshold=float(
+        WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
     ),
 )
 
@@ -436,6 +530,19 @@ def index(request: Request) -> HTMLResponse:
                 WEB_CONFIG.get("default_results_per_query", 3)
             ),
             "ui_debug": bool(WEB_CONFIG.get("ui_debug", False)),
+            "live_intent_enabled": bool(WEB_CONFIG.get("live_intent_enabled", True)),
+            "live_intent_min_chars_default": int(
+                WEB_CONFIG.get("live_intent_min_chars_default", 12)
+            ),
+            "live_intent_min_chars_cjk": int(
+                WEB_CONFIG.get("live_intent_min_chars_cjk", 6)
+            ),
+            "live_intent_debounce_ms": int(
+                WEB_CONFIG.get("live_intent_debounce_ms", 320)
+            ),
+            "live_intent_confidence_threshold": float(
+                WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
+            ),
             "asset_v": _BOOT_TS,
         },
     )
@@ -652,6 +759,12 @@ def _raise_on_idempotency_state(state: str) -> None:
                 "message": "Idempotency key reused with different payload.",
             },
         )
+
+
+@app.post("/api/intent/live", response_model=LiveIntentResponse)
+def live_intent(req: LiveIntentRequest, request: Request) -> LiveIntentResponse:
+    _require_user(request)
+    return live_intent_classifier.classify(req.text)
 
 
 @app.post("/api/runs", response_model=CreateRunResponse)

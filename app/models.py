@@ -8,6 +8,26 @@ RunStatus = Literal["queued", "running", "completed", "failed"]
 ExecutionState = Literal["idle", "running", "paused", "completed", "failed", "aborted"]
 ReportTriggerType = Literal["auto_natural_stop", "manual", "manual_legacy"]
 RunPhase = Literal["planning", "research"]
+LiveIntentSource = Literal["heuristic", "model"]
+LiveIntentTaskType = Literal[
+    "explain",
+    "analyze",
+    "compare",
+    "create",
+    "persuade",
+    "troubleshoot",
+    "plan",
+]
+LiveIntentSophistication = Literal["intro", "intermediate", "deep"]
+LiveIntentAudience = Literal[
+    "general_public",
+    "practitioner",
+    "mid_management",
+    "senior_management",
+    "academic",
+]
+LiveIntentStakeLevel = Literal["low", "medium", "high"]
+LiveIntentTimeHorizon = Literal["immediate", "near_term", "strategic"]
 PlanningState = Literal[
     "idle",
     "running",
@@ -40,6 +60,20 @@ class StartFromWorkspaceRequest(BaseModel):
 
 class PlanningDepthBonusRequest(BaseModel):
     increment: int = Field(default=1, ge=1, le=4)
+
+
+class LiveIntentRequest(BaseModel):
+    text: str = Field(default="", max_length=4000)
+
+
+class LiveIntentResponse(BaseModel):
+    task_type: Optional[LiveIntentTaskType] = None
+    sophistication: Optional[LiveIntentSophistication] = None
+    audience: Optional[LiveIntentAudience] = None
+    stake_level: Optional[LiveIntentStakeLevel] = None
+    time_horizon: Optional[LiveIntentTimeHorizon] = None
+    confidence: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+    source: LiveIntentSource = "heuristic"
 
 
 class CreateRunResponse(BaseModel):

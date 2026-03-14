@@ -197,6 +197,38 @@ body.sessions-collapsed .auth-box-rail {
   width: 100%;
 }
 
+.live-intent {
+  margin-top: 8px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 24px;
+}
+.live-intent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid #d4d4d4;
+  border-radius: 999px;
+  background: #f7f7f7;
+  color: #3a3a3a;
+  padding: 5px 10px;
+  font-size: 0.78rem;
+  line-height: 1.1;
+}
+.live-intent-chip-label {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 0.67rem;
+}
+.live-intent-chip-value {
+  font-weight: 600;
+}
+.live-intent-chip.is-local {
+  opacity: 0.9;
+}
+
 /* ── Inline run button (inside depth-dropdown bar) ── */
 .run-inline-btn {
   padding: 3px 12px;
