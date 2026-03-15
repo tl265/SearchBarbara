@@ -1,4 +1,7 @@
 [Unit]
+# Repo template only.
+# The installed stable unit may live under /etc/systemd/system/searchbarbara-stable.service.
+# Update paths, user, and env file before installing this template.
 Description=SearchBarbara Web Service
 After=network.target
 
