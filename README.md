@@ -1,13 +1,22 @@
 # SearchBarbara
 
-Iterative deep research agent that:
+SearchBarbara is an iterative deep research agent with:
+
+- a CLI for one-off research runs
+- an authenticated web app for sessions, context, reports, and live intent parsing
+- a backend/frontend/agents/config split aimed at maintainability
+
+At a high level, it:
+
 1. starts from the original task as a single root node
-2. searches proactively for external evidence
-3. tries to answer each node directly, then decomposes deeper only if evidence is insufficient
-4. checks sufficiency and runs focused follow-up passes until sufficient or max rounds/depth
+2. searches for external evidence proactively
+3. answers directly when possible, then decomposes only when evidence is insufficient
+4. checks sufficiency and runs focused follow-up passes until sufficient or capped
 5. outputs a final report using Barbara Minto's Pyramid Principle
 
-## Setup
+## Quick Start
+
+Create a virtualenv and install dependencies:
 
 ```bash
 python -m venv .venv
@@ -15,7 +24,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Set API/auth environment variables:
+Set the required environment variables:
 
 ```bash
 export OPENAI_API_KEY=...
@@ -26,174 +35,156 @@ export PUBLIC_BASE_URL=http://localhost:8000
 export AUTH_COOKIE_SECRET=change-me-to-a-long-random-secret
 ```
 
-Optional model override:
+Optional runtime tuning:
 
 ```bash
 export OPENAI_MODEL=gpt-4.1
 export OPENAI_REPORT_MODEL=gpt-5.2
-```
-
-Optional auth tuning:
-
-```bash
 export AUTH0_CONNECTION_NAME=email
 export SESSION_TTL_DAYS=3
 export AUTH_ALLOW_LEGACY=false
 # export AUTH_COOKIE_SECURE=false   # useful for local http dev
 ```
 
-## Usage
-
-```bash
-python deep_research_agent.py "Should our B2B SaaS expand into the German market in 2026?"
-```
-
-## Layout
-
-The codebase is organized by top-level ownership:
-
-- `backend/` web server, API, orchestration, and backend runtime logic
-- `frontend/` templates and static assets for the active web UI
-- `agents/` research implementation plus prompt assets
-- `config/` app config and agent policy/config data
-- `infra/` deploy and observability helpers
-- `app/` compatibility shims for older imports and entrypoints
-
-## Web App (MVP)
-
-Run the local web interface:
+Run the web app:
 
 ```bash
 python run_web.py
 ```
 
-Then open:
+Then open `http://localhost:8000/`.
 
-```text
-http://<your-vm-ip>:8000/
+## Main Workflows
+
+### CLI
+
+Run a research task from the command line:
+
+```bash
+python deep_research_agent.py "Should our B2B SaaS expand into the German market in 2026?"
 ```
 
-The web app is now authenticated:
+Common options:
+
+- `--max-depth` max recursive decomposition depth per node
+- `--max-rounds` max research rounds
+- `--results-per-query` baseline retrieval breadth
+- `--resume-from` resume from a saved checkpoint
+- `--report-file` write the final report to a specific path
+- `--usage-file` write token/cost usage to a specific path
+- `--pricing-file` pricing config path, default `config/agent/pricing.json`
+- `--model` research model, default `OPENAI_MODEL` or `gpt-4.1`
+- `--report-model` report/decomposition model, default `OPENAI_REPORT_MODEL` or `gpt-5.2`
+
+### Web App
+
+The web app is authenticated:
 
 - unauthenticated users are redirected to `/login`
-- login uses Auth0 Universal Login (passwordless email OTP)
+- login uses Auth0 Universal Login with passwordless email OTP
 - all `/api/*` routes require authentication
-- users only see/access their own sessions, runs, context files, SSE streams, and reports
+- users only see their own sessions, runs, context files, SSE streams, and reports
 
-Auth routes:
+Important routes:
 
 - `GET /login`
 - `GET /auth/callback`
 - `POST /logout`
 - `GET /auth/me`
-
-Key web endpoints:
-
 - `POST /api/runs`
 - `GET /api/runs/{run_id}`
-- `GET /api/runs/{run_id}/events` (SSE)
+- `GET /api/runs/{run_id}/events`
 - `GET /api/runs/{run_id}/report/download`
-- `POST /api/runs/{run_id}/abort` (temporary debug control)
 
-Options:
+## Repo Layout
 
-- `--max-depth` max recursive decomposition depth per question node (default `3`)
-- `--max-rounds` max iterative research rounds (default `1`)
-- `--results-per-query` baseline results per web query before adaptive broadening (default `3`)
-- `--state-file` optional custom path for incremental checkpoint state JSON
-- `--resume-from` resume from a previous checkpoint state JSON
-- `--report-file` optional custom path for final report output
-- `--usage-file` optional custom path for standalone token usage JSON
-- `--pricing-file` pricing config JSON for cost estimation (default `config/agent/pricing.json`)
-- `--no-token-breakdown` disable token tracking and usage summary
-- `--no-cost-estimate` disable cost estimation while keeping token tracking
-- `--quiet` disable progress logs
-- `--model` research model for query generation/search/synthesis/sufficiency (defaults to `OPENAI_MODEL` or `gpt-4.1`)
-- `--report-model` report/decomposition model for final report writing and question decomposition (defaults to `OPENAI_REPORT_MODEL` or `gpt-5.2`)
+The codebase is organized by top-level ownership:
 
-## Notes
+- `backend/` web server, API, orchestration, and backend runtime logic
+- `frontend/` templates and static assets for the active web UI
+- `agents/` research implementation and prompt assets
+- `config/` app config and agent policy/config data
+- `infra/` deploy and observability helpers
+- `app/` compatibility shims for older imports and entrypoints
 
-- The agent uses OpenAI web search via the Responses API (no external search provider key required).
-- It tries web-search tool types in this order by default: `web_search_preview`, then `web_search`.
-- Override tool order with `OPENAI_WEB_SEARCH_TOOL_TYPES` (comma-separated).
-- Each run also writes crash-safe incremental state checkpoints to `runs/state_<query-slug>_<timestamp>.json` by default.
-- Use `--resume-from path/to/state.json` to continue from the latest checkpoint.
-- Each run writes the final report to `reports/report_<query-slug>_<timestamp>.md` by default.
-- Use `--report-file path/to/report.md` to override the report output path.
-- Each run records per-call token usage and stage/model aggregates in trace/state by default.
-- Use `--usage-file path/to/usage.json` to export standalone token/cost breakdown.
-- Cost estimates are config-based and loaded from `config/agent/pricing.json` (or `--pricing-file`).
-- Search results are quality-ranked to prioritize official and primary domains before synthesis.
-- Progress messages are printed during execution so you can monitor direction in real time.
-- If a query has no usable evidence, synthesis is skipped and the limitation is logged/traced.
-- Final reports explicitly acknowledge limitations when evidence quality is meager or absent.
-- Sufficiency follow-up queries are deduplicated and assigned once to the best-fit sub-question (no drop, no duplicate fan-out across all sub-questions).
-- Repeated queries are conditionally deduped with cache reuse by intent; reruns require explicit justification (freshness/errors/recheck).
-- When rerunning the same intent, retrieval is broadened progressively to increase information gain.
-- Frontier execution is depth-aware: unresolved nodes can decompose into child sub-questions until `--max-depth`.
-- Task traversal is lazy-first and depth-first: each node tries direct search first, then decomposes and explores children before moving to sibling branches.
-- Large evidence payloads are compacted before sufficiency/report calls to reduce token pressure.
+## Configuration
+
+### App and Web Config
+
+- `config/app/web.json`
+  Web UI and backend feature flags such as live intent, preprocessing, and UI tuning.
+
+### Agent Config
+
+- `config/agent/pricing.json`
+  Token and search cost estimation data.
+- `config/agent/search_policy.json`
+  Query reuse, rerun, and broadening controls.
+- `config/agent/source_policy.json`
+  Domain quality and trust-tier rules.
+- `config/agent/decompose_policy.json`
+  Decomposition behavior settings.
+
+### Prompts
+
+Prompt files live under `agents/prompts/`:
+
+- `agents/prompts/deep_research/`
+- `agents/prompts/context_preprocess/`
+- `agents/prompts/live_intent/`
+
+Edit these files to change LLM behavior without changing Python code.
+
+## Runtime Artifacts
+
+By default the app writes local state here:
+
+- `runs/`
+  checkpoint state, session indexes, context artifacts, and templates
+- `reports/`
+  generated markdown reports
+- `logs/`
+  runtime and agent debug logs
+
+## Research Behavior Notes
+
+- OpenAI web search is used through the Responses API.
+- Search tool order can be overridden with `OPENAI_WEB_SEARCH_TOOL_TYPES`.
+- Each run writes crash-safe checkpoint state under `runs/`.
+- Final reports are written under `reports/` unless overridden.
+- Token usage and cost breakdowns can be exported separately.
+- Search results are quality-ranked to prioritize official and primary sources.
+- Queries are deduplicated and can be rerun only when justified.
+- Traversal is lazy-first and depth-first.
+- Large evidence payloads are compacted before sufficiency and report calls.
 - LLM calls use retry with backoff on rate limits.
-- Web run/session ownership is enforced by `owner_id` (Auth0 `sub`) on backend access paths.
-- Workspace-staged context is user-scoped internally to avoid cross-user collisions.
 
-## Auth0 Dashboard Setup (Web App)
+## Auth0 Setup
 
-Configure your Auth0 Application (Regular Web Application):
+For the web app, configure your Auth0 application as a Regular Web Application.
 
-- Allowed Callback URLs:
-  - `http://localhost:8000/auth/callback`
-  - `https://<your-domain>/auth/callback`
-- Allowed Logout URLs:
-  - `http://localhost:8000/`
-  - `https://<your-domain>/`
-- Allowed Web Origins:
-  - `http://localhost:8000`
-  - `https://<your-domain>`
+Allowed callback URLs:
+
+- `http://localhost:8000/auth/callback`
+- `https://<your-domain>/auth/callback`
+
+Allowed logout URLs:
+
+- `http://localhost:8000/`
+- `https://<your-domain>/`
+
+Allowed web origins:
+
+- `http://localhost:8000`
+- `https://<your-domain>`
 
 Enable passwordless email OTP:
 
-- Authentication -> Passwordless -> Email
-- enable the `email` connection (or your configured `AUTH0_CONNECTION_NAME`) for this app
+- Auth0 Dashboard -> Authentication -> Passwordless -> Email
+- enable the `email` connection, or your configured `AUTH0_CONNECTION_NAME`
 
-## Prompt Customization
+## Deployment Note
 
-System prompts for each sub-agent are stored under `agents/prompts/`:
+`python run_web.py` is the local entrypoint.
 
-- `agents/prompts/deep_research/decompose.system.txt`
-- `agents/prompts/deep_research/query_gen.system.txt`
-- `agents/prompts/deep_research/synthesize.system.txt`
-- `agents/prompts/deep_research/sufficiency_node.system.txt`
-- `agents/prompts/deep_research/sufficiency_pass.system.txt`
-- `agents/prompts/deep_research/report.system.txt`
-- `agents/prompts/context_preprocess/context_split.system.txt`
-
-Edit these files to change sub-agent behavior without changing Python code.
-
-## Search Policy Customization
-
-Query reuse/rerun controls are stored in `config/agent/search_policy.json`:
-
-- `cache_ttl_seconds`
-- `max_broaden_steps`
-- `broaden_k_multipliers`
-- `min_new_fact_gain`
-- `max_no_gain_retries_per_intent`
-- `time_sensitive_terms`
-- `allow_rerun_on_search_error`
-
-## Source Policy Customization
-
-Source-tier rules are stored in `config/agent/source_policy.json`.
-
-- `primary_tlds`: domain suffixes automatically treated as primary/official.
-- `primary_domain_suffixes`: explicit trusted domain rules.
-  - `example.com` means exact domain only.
-  - `*.example.com` means the domain and all subdomains.
-- `secondary_tlds`: suffixes treated as secondary/reputable.
-
-Edit this file to control which sources are considered primary without changing Python code.
-
-## Web Config Customization
-
-Web/UI and runtime feature flags are stored in `config/app/web.json`.
+The repo also contains a systemd template under `infra/deploy/systemd/`, but your installed stable service may use a separate unit and env file outside the repo. Treat the repo unit as a template, not automatically as the live source of truth.
