@@ -7,12 +7,30 @@ from backend import server
 client = TestClient(server.app)
 
 
+def _enable_test_auth(monkeypatch):
+    monkeypatch.setattr(
+        type(server.AUTH_CONFIG),
+        "configured",
+        property(lambda _self: True),
+    )
+    monkeypatch.setattr(
+        server,
+        "get_current_user_from_request",
+        lambda _request, _auth: SimpleNamespace(
+            user_id="test-user",
+            email="test@example.com",
+            session_expires_at=0,
+        ),
+    )
+
+
 def _clear_idempotency_records() -> None:
     with server.run_manager._idempotency_lock:
         server.run_manager._idempotency_records.clear()
 
 
 def test_create_run_replays_same_response_for_same_key(monkeypatch):
+    _enable_test_auth(monkeypatch)
     _clear_idempotency_records()
     created = {"count": 0}
 
@@ -35,6 +53,7 @@ def test_create_run_replays_same_response_for_same_key(monkeypatch):
 
 
 def test_create_run_rejects_same_key_with_different_payload(monkeypatch):
+    _enable_test_auth(monkeypatch)
     _clear_idempotency_records()
     monkeypatch.setattr(server.run_manager, "create_run", lambda **_kwargs: "run-1")
     headers = {"Idempotency-Key": "shared-key"}
@@ -55,7 +74,8 @@ def test_create_run_rejects_same_key_with_different_payload(monkeypatch):
     assert second.json()["detail"]["error_code"] == "idempotency_key_reused"
 
 
-def test_create_run_returns_in_progress_for_pending_same_key():
+def test_create_run_returns_in_progress_for_pending_same_key(monkeypatch):
+    _enable_test_auth(monkeypatch)
     _clear_idempotency_records()
     model = str(server.WEB_CONFIG.get("model", "gpt-4.1"))
     report_model = str(server.WEB_CONFIG.get("report_model", "gpt-5.2"))
@@ -68,7 +88,7 @@ def test_create_run_returns_in_progress_for_pending_same_key():
         "report_model": report_model,
     }
     server.run_manager.idempotency_begin(
-        "create_run",
+        "create_run:test-user",
         key,
         payload,
         ttl_sec=server.RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
@@ -85,10 +105,13 @@ def test_create_run_returns_in_progress_for_pending_same_key():
 
 
 def test_report_endpoint_replays_and_new_key_creates_new_result(monkeypatch):
+    _enable_test_auth(monkeypatch)
     _clear_idempotency_records()
     calls = {"count": 0}
 
-    def fake_generate_partial_report(_run_id, expected_version=None):
+    def fake_generate_partial_report(
+        _run_id, expected_version=None, report_template_id=None
+    ):
         calls["count"] += 1
         return {
             "report_file_path": f"/tmp/r{calls['count']}.md",
@@ -96,6 +119,7 @@ def test_report_endpoint_replays_and_new_key_creates_new_result(monkeypatch):
             "version": 1,
         }
 
+    monkeypatch.setattr(server.run_manager, "get_snapshot", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(server.run_manager, "generate_partial_report", fake_generate_partial_report)
 
     r1 = client.post("/api/runs/run-123/report", headers={"Idempotency-Key": "rep-a"})
@@ -112,6 +136,7 @@ def test_report_endpoint_replays_and_new_key_creates_new_result(monkeypatch):
 
 
 def test_abort_ignores_expected_version_and_replays_with_same_key(monkeypatch):
+    _enable_test_auth(monkeypatch)
     _clear_idempotency_records()
     calls = {"count": 0, "expected_version": "unset"}
 
@@ -120,6 +145,7 @@ def test_abort_ignores_expected_version_and_replays_with_same_key(monkeypatch):
         calls["expected_version"] = expected_version
         return {"status": "aborting", "version": 7}
 
+    monkeypatch.setattr(server.run_manager, "get_snapshot", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(server.run_manager, "abort_run", fake_abort_run)
     headers = {"Idempotency-Key": "abort-key-1"}
 
