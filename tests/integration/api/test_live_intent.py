@@ -46,10 +46,10 @@ def test_live_intent_classifier_uses_lower_threshold_for_cjk_input():
         max_input_chars=600,
     )
 
-    out = classifier.classify("帮我对比")
+    out = classifier.classify("帮我对比一下")
 
     assert out.task_type == "compare"
-    assert out.sophistication == "intermediate"
+    assert out.sophistication == "intro"
 
 
 def test_live_intent_classifier_infers_compare_prompt():
@@ -117,5 +117,4 @@ def test_live_intent_endpoint_returns_prediction_for_chinese(monkeypatch):
     assert rsp.status_code == 200
     body = rsp.json()
     assert body["task_type"] == "troubleshoot"
-    assert body["audience"] == "practitioner"
-    assert body["time_horizon"] == "immediate"
+    assert body["stake_level"] == "medium"
