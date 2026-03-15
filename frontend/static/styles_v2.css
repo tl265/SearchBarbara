@@ -1623,6 +1623,24 @@ details.node-section {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.report-version-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.report-version-nav button {
+  min-width: 56px;
+  padding: 7px 12px;
+  border-radius: 9px;
+}
+.report-version-label {
+  min-width: 44px;
+  text-align: center;
+  font-size: 0.82rem;
+  font-weight: 600;
+  color: var(--ink);
+}
 .report-modal-footer button {
   background: var(--brand);
   border-color: var(--brand);
@@ -1644,5 +1662,11 @@ details.node-section {
   }
   .report-modal-footer {
     padding: 8px 12px 10px;
+    flex-wrap: wrap;
+  }
+  .report-version-nav {
+    order: 3;
+    width: 100%;
+    justify-content: center;
   }
 }
