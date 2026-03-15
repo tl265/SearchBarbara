@@ -1,0 +1,2051 @@
+from pathlib import Path
+from queue import Empty, Queue
+from typing import Any, Dict, Iterator, List
+import json
+import os
+import time
+
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header, Body
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from starlette.requests import Request
+
+from backend.core.live_intent import LiveIntentClassifier
+from backend.core.models import (
+    ContextDigestResponse,
+    ContextFileDetailResponse,
+    ContextMutateResponse,
+    ContextSetResponse,
+    GenerateReportRequest,
+    CreateRunRequest,
+    CreateRunResponse,
+    LiveIntentRequest,
+    LiveIntentResponse,
+    PlanningDepthBonusRequest,
+    PatchSessionRequest,
+    ReportTemplateCreateRequest,
+    ReportTemplateListResponse,
+    ReportTemplate,
+    ReportTemplatePreviewRequest,
+    ReportTemplatePreviewResponse,
+    ReportTemplateUpdateRequest,
+    RunSnapshotResponse,
+    StartFromWorkspaceRequest,
+    SessionListResponse,
+)
+from backend.infra.auth import (
+    AuthConfig,
+    AuthService,
+    UserPrincipal,
+    get_current_user_from_request,
+)
+from backend.infra.sse import format_sse
+from backend.orchestration.run_manager import RunManager
+
+
+BASE_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = BASE_DIR.parent
+WEB_CONFIG_PATH = PROJECT_ROOT / "config" / "app" / "web.json"
+LEGACY_WEB_CONFIG_PATH = PROJECT_ROOT / "web_config.json"
+templates = Jinja2Templates(directory=str(PROJECT_ROOT / "frontend" / "templates"))
+
+_BOOT_TS = str(int(time.time()))
+
+app = FastAPI(title="SearchBarbara Web")
+app.mount(
+    "/static",
+    StaticFiles(directory=str(PROJECT_ROOT / "frontend" / "static")),
+    name="static",
+)
+
+
+def _load_web_config() -> Dict[str, Any]:
+    default = {
+        "max_rounds": 1,
+        "max_depth_min": 1,
+        "max_depth_max": 8,
+        "default_max_depth": 3,
+        "results_per_query_min": 1,
+        "results_per_query_max": 30,
+        "default_results_per_query": 3,
+        "model": "gpt-4.1",
+        "report_model": "gpt-5.2",
+        "ui_debug": False,
+        "min_canvas_zoom": 0.45,
+        "auto_fit_safety_px": 10,
+        "heartbeat_interval_sec": 8,
+        "context_preprocess_enabled": True,
+        "context_preprocess_model": "gpt-4.1",
+        "context_preprocess_prompt_path_common": "agents/prompts/context_preprocess/common.system.txt",
+        "context_preprocess_prompt_path_per_file": "agents/prompts/context_preprocess/per_file.system.txt",
+        "context_preprocess_prompt_path_aggregate": "agents/prompts/context_preprocess/aggregate.system.txt",
+        "context_preprocess_prompt_version": "v1.4",
+        "context_chunking_version": "context_chunk.v1",
+        "live_intent_enabled": True,
+        "live_intent_min_chars_default": 12,
+        "live_intent_min_chars_cjk": 6,
+        "live_intent_debounce_ms": 320,
+        "live_intent_server_max_chars": 600,
+        "live_intent_model": "gpt-4.1",
+        "live_intent_prompt_path": "agents/prompts/live_intent/system.txt",
+        "live_intent_confidence_threshold": 0.45,
+    }
+    config_path = WEB_CONFIG_PATH if WEB_CONFIG_PATH.exists() else LEGACY_WEB_CONFIG_PATH
+    if not config_path.exists():
+        return default
+    try:
+        raw = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+    if not isinstance(raw, dict):
+        return default
+    try:
+        max_rounds = int(raw.get("max_rounds", default["max_rounds"]))
+    except (TypeError, ValueError):
+        max_rounds = default["max_rounds"]
+    try:
+        max_depth_min = int(raw.get("max_depth_min", default["max_depth_min"]))
+    except (TypeError, ValueError):
+        max_depth_min = default["max_depth_min"]
+    try:
+        max_depth_max = int(raw.get("max_depth_max", default["max_depth_max"]))
+    except (TypeError, ValueError):
+        max_depth_max = default["max_depth_max"]
+    max_depth_min = max(1, max_depth_min)
+    max_depth_max = max(max_depth_min, max_depth_max)
+    try:
+        default_max_depth = int(
+            raw.get("default_max_depth", default["default_max_depth"])
+        )
+    except (TypeError, ValueError):
+        default_max_depth = default["default_max_depth"]
+    try:
+        results_per_query_min = int(
+            raw.get("results_per_query_min", default["results_per_query_min"])
+        )
+    except (TypeError, ValueError):
+        results_per_query_min = default["results_per_query_min"]
+    try:
+        results_per_query_max = int(
+            raw.get("results_per_query_max", default["results_per_query_max"])
+        )
+    except (TypeError, ValueError):
+        results_per_query_max = default["results_per_query_max"]
+    results_per_query_min = max(1, results_per_query_min)
+    results_per_query_max = max(results_per_query_min, results_per_query_max)
+    try:
+        default_results_per_query = int(
+            raw.get(
+                "default_results_per_query", default["default_results_per_query"]
+            )
+        )
+    except (TypeError, ValueError):
+        default_results_per_query = default["default_results_per_query"]
+    model = str(raw.get("model", default["model"]) or default["model"])
+    report_model = str(
+        raw.get("report_model", default["report_model"]) or default["report_model"]
+    )
+    ui_debug = bool(raw.get("ui_debug", default["ui_debug"]))
+    try:
+        min_canvas_zoom = float(
+            raw.get("min_canvas_zoom", default["min_canvas_zoom"])
+        )
+    except (TypeError, ValueError):
+        min_canvas_zoom = default["min_canvas_zoom"]
+    try:
+        auto_fit_safety_px = int(
+            raw.get("auto_fit_safety_px", default["auto_fit_safety_px"])
+        )
+    except (TypeError, ValueError):
+        auto_fit_safety_px = default["auto_fit_safety_px"]
+    try:
+        heartbeat_interval_sec = float(
+            raw.get("heartbeat_interval_sec", default["heartbeat_interval_sec"])
+        )
+    except (TypeError, ValueError):
+        heartbeat_interval_sec = default["heartbeat_interval_sec"]
+    context_preprocess_enabled = bool(
+        raw.get(
+            "context_preprocess_enabled", default["context_preprocess_enabled"]
+        )
+    )
+    context_preprocess_model = str(
+        raw.get(
+            "context_preprocess_model", default["context_preprocess_model"]
+        )
+        or default["context_preprocess_model"]
+    )
+    context_preprocess_prompt_path_common = str(
+        raw.get(
+            "context_preprocess_prompt_path_common",
+            default["context_preprocess_prompt_path_common"],
+        )
+        or default["context_preprocess_prompt_path_common"]
+    )
+    legacy_context_preprocess_prompt_path = str(
+        raw.get(
+            "context_preprocess_prompt_path",
+            "agents/prompts/context_preprocess/common.system.txt",
+        )
+        or "agents/prompts/context_preprocess/common.system.txt"
+    )
+    context_preprocess_prompt_path_per_file = str(
+        raw.get(
+            "context_preprocess_prompt_path_per_file",
+            legacy_context_preprocess_prompt_path
+            or default["context_preprocess_prompt_path_per_file"],
+        )
+        or default["context_preprocess_prompt_path_per_file"]
+    )
+    context_preprocess_prompt_path_aggregate = str(
+        raw.get(
+            "context_preprocess_prompt_path_aggregate",
+            legacy_context_preprocess_prompt_path
+            or default["context_preprocess_prompt_path_aggregate"],
+        )
+        or default["context_preprocess_prompt_path_aggregate"]
+    )
+    context_preprocess_prompt_version = str(
+        raw.get(
+            "context_preprocess_prompt_version",
+            default["context_preprocess_prompt_version"],
+        )
+        or default["context_preprocess_prompt_version"]
+    )
+    context_chunking_version = str(
+        raw.get("context_chunking_version", default["context_chunking_version"])
+        or default["context_chunking_version"]
+    )
+    live_intent_enabled = bool(
+        raw.get("live_intent_enabled", default["live_intent_enabled"])
+    )
+    legacy_live_intent_min_chars = raw.get(
+        "live_intent_min_chars", default["live_intent_min_chars_default"]
+    )
+    try:
+        live_intent_min_chars_default = int(
+            raw.get(
+                "live_intent_min_chars_default",
+                legacy_live_intent_min_chars,
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_min_chars_default = default["live_intent_min_chars_default"]
+    try:
+        live_intent_min_chars_cjk = int(
+            raw.get(
+                "live_intent_min_chars_cjk",
+                default["live_intent_min_chars_cjk"],
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_min_chars_cjk = default["live_intent_min_chars_cjk"]
+    try:
+        live_intent_debounce_ms = int(
+            raw.get("live_intent_debounce_ms", default["live_intent_debounce_ms"])
+        )
+    except (TypeError, ValueError):
+        live_intent_debounce_ms = default["live_intent_debounce_ms"]
+    try:
+        live_intent_server_max_chars = int(
+            raw.get(
+                "live_intent_server_max_chars",
+                default["live_intent_server_max_chars"],
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_server_max_chars = default["live_intent_server_max_chars"]
+    live_intent_model = str(
+        raw.get("live_intent_model", default["live_intent_model"])
+        or default["live_intent_model"]
+    )
+    live_intent_prompt_path = str(
+        raw.get("live_intent_prompt_path", default["live_intent_prompt_path"])
+        or default["live_intent_prompt_path"]
+    )
+    try:
+        live_intent_confidence_threshold = float(
+            raw.get(
+                "live_intent_confidence_threshold",
+                default["live_intent_confidence_threshold"],
+            )
+        )
+    except (TypeError, ValueError):
+        live_intent_confidence_threshold = default["live_intent_confidence_threshold"]
+    return {
+        "max_rounds": max(1, max_rounds),
+        "max_depth_min": max_depth_min,
+        "max_depth_max": max_depth_max,
+        "default_max_depth": max(max_depth_min, min(default_max_depth, max_depth_max)),
+        "results_per_query_min": results_per_query_min,
+        "results_per_query_max": results_per_query_max,
+        "default_results_per_query": max(
+            results_per_query_min,
+            min(default_results_per_query, results_per_query_max),
+        ),
+        "model": model,
+        "report_model": report_model,
+        "ui_debug": ui_debug,
+        "min_canvas_zoom": min(max(min_canvas_zoom, 0.1), 0.95),
+        "auto_fit_safety_px": max(0, min(auto_fit_safety_px, 200)),
+        "heartbeat_interval_sec": min(max(heartbeat_interval_sec, 1.0), 120.0),
+        "context_preprocess_enabled": context_preprocess_enabled,
+        "context_preprocess_model": context_preprocess_model,
+        "context_preprocess_prompt_path_common": context_preprocess_prompt_path_common,
+        "context_preprocess_prompt_path_per_file": context_preprocess_prompt_path_per_file,
+        "context_preprocess_prompt_path_aggregate": context_preprocess_prompt_path_aggregate,
+        "context_preprocess_prompt_version": context_preprocess_prompt_version,
+        "context_chunking_version": context_chunking_version,
+        "live_intent_enabled": live_intent_enabled,
+        "live_intent_min_chars_default": max(
+            1, min(live_intent_min_chars_default, 200)
+        ),
+        "live_intent_min_chars_cjk": max(1, min(live_intent_min_chars_cjk, 40)),
+        "live_intent_debounce_ms": max(80, min(live_intent_debounce_ms, 1500)),
+        "live_intent_server_max_chars": max(
+            64, min(live_intent_server_max_chars, 2000)
+        ),
+        "live_intent_model": live_intent_model,
+        "live_intent_prompt_path": live_intent_prompt_path,
+        "live_intent_confidence_threshold": min(
+            0.95, max(0.0, float(live_intent_confidence_threshold))
+        ),
+    }
+
+
+WEB_CONFIG = _load_web_config()
+AUTH_CONFIG = AuthConfig()
+auth_service = AuthService(AUTH_CONFIG)
+run_manager = RunManager(
+    heartbeat_interval_sec=float(WEB_CONFIG.get("heartbeat_interval_sec", 8)),
+    auth_allow_legacy=str(os.getenv("AUTH_ALLOW_LEGACY", "false")).strip().lower()
+    in {"1", "true", "yes"},
+    context_preprocess_enabled=bool(
+        WEB_CONFIG.get("context_preprocess_enabled", True)
+    ),
+    context_preprocess_model=str(
+        WEB_CONFIG.get("context_preprocess_model", "gpt-4.1")
+    ),
+    context_preprocess_prompt_path_common=str(
+        WEB_CONFIG.get(
+            "context_preprocess_prompt_path_common",
+            "agents/prompts/context_preprocess/common.system.txt",
+        )
+    ),
+    context_preprocess_prompt_path_per_file=str(
+        WEB_CONFIG.get(
+            "context_preprocess_prompt_path_per_file",
+            "agents/prompts/context_preprocess/per_file.system.txt",
+        )
+    ),
+    context_preprocess_prompt_path_aggregate=str(
+        WEB_CONFIG.get(
+            "context_preprocess_prompt_path_aggregate",
+            "agents/prompts/context_preprocess/aggregate.system.txt",
+        )
+    ),
+    context_preprocess_prompt_version=str(
+        WEB_CONFIG.get("context_preprocess_prompt_version", "v1.4")
+    ),
+    context_chunking_version=str(
+        WEB_CONFIG.get("context_chunking_version", "context_chunk.v1")
+    ),
+)
+live_intent_classifier = LiveIntentClassifier(
+    enabled=bool(WEB_CONFIG.get("live_intent_enabled", True)),
+    min_chars_default=int(WEB_CONFIG.get("live_intent_min_chars_default", 12)),
+    min_chars_cjk=int(WEB_CONFIG.get("live_intent_min_chars_cjk", 6)),
+    max_input_chars=int(WEB_CONFIG.get("live_intent_server_max_chars", 600)),
+    model=str(WEB_CONFIG.get("live_intent_model", "gpt-4.1")),
+    prompt_path=str(
+        WEB_CONFIG.get("live_intent_prompt_path", "agents/prompts/live_intent/system.txt")
+    ),
+    confidence_threshold=float(
+        WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
+    ),
+)
+
+
+def _current_user(request: Request):
+    user = getattr(request.state, "user", None)
+    if user is None:
+        user = get_current_user_from_request(request, auth_service)
+    return user
+
+
+def _require_user(request: Request):
+    user = _current_user(request)
+    if not user:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return user
+
+
+def _set_session_cookie(response: Response, user_id: str, email: str | None) -> None:
+    token = auth_service.build_session_cookie_value(user_id=user_id, email=email)
+    max_age = int(AUTH_CONFIG.session_ttl_days * 86400)
+    response.set_cookie(
+        key=AuthService.SESSION_COOKIE_NAME,
+        value=token,
+        max_age=max_age,
+        httponly=True,
+        secure=AUTH_CONFIG.cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+
+
+def _clear_auth_cookies(response: Response) -> None:
+    response.delete_cookie(AuthService.SESSION_COOKIE_NAME, path="/")
+    response.delete_cookie(AuthService.STATE_COOKIE_NAME, path="/")
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path or "/"
+    public_paths = {
+        "/login",
+        "/auth/callback",
+        "/logout",
+        "/auth/me",
+    }
+    if path.startswith("/static/") or path in public_paths:
+        return await call_next(request)
+
+    protected = path == "/" or path.startswith("/api/")
+    if not protected:
+        return await call_next(request)
+
+    if not AUTH_CONFIG.configured:
+        # Auth not configured — bypass with a local dev user.
+        import time as _time
+        request.state.user = UserPrincipal(
+            user_id="local-dev-user",
+            email="dev@localhost",
+            session_expires_at=int(_time.time()) + 86400,
+        )
+        return await call_next(request)
+
+    user = get_current_user_from_request(request, auth_service)
+    if not user:
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+        return RedirectResponse(url="/login", status_code=302)
+
+    request.state.user = user
+    response = await call_next(request)
+    # Sliding renewal on authenticated traffic.
+    _set_session_cookie(response, user.user_id, user.email)
+    return response
+
+
+@app.get("/login")
+def login() -> RedirectResponse:
+    auth_service.ensure_configured()
+    state, nonce = auth_service.mint_state_nonce()
+    resp = RedirectResponse(url=auth_service.build_authorize_url(state, nonce), status_code=302)
+    resp.set_cookie(
+        key=AuthService.STATE_COOKIE_NAME,
+        value=auth_service.make_state_cookie_value(state, nonce),
+        max_age=600,
+        httponly=True,
+        secure=AUTH_CONFIG.cookie_secure,
+        samesite="lax",
+        path="/",
+    )
+    return resp
+
+
+@app.get("/auth/callback")
+def auth_callback(request: Request, code: str = "", state: str = "") -> Response:
+    auth_service.ensure_configured()
+    if not code or not state:
+        return HTMLResponse(
+            "<h2>Login failed</h2><p>Missing code/state.</p><p><a href='/login'>Try again</a></p>",
+            status_code=400,
+        )
+    state_cookie = request.cookies.get(AuthService.STATE_COOKIE_NAME, "")
+    saved = auth_service.parse_state_cookie(state_cookie)
+    if not saved or str(saved.get("state", "")).strip() != str(state).strip():
+        return HTMLResponse(
+            "<h2>Login failed</h2><p>State validation failed.</p><p><a href='/login'>Try again</a></p>",
+            status_code=400,
+        )
+    try:
+        tokens = auth_service.exchange_code_for_tokens(code)
+        id_token = str(tokens.get("id_token", "")).strip()
+        if not id_token:
+            raise RuntimeError("Missing id_token in token response.")
+        claims = auth_service.validate_id_token(
+            id_token, nonce=str(saved.get("nonce", ""))
+        )
+        user_id = str(claims.get("sub", "")).strip()
+        email = str(claims.get("email", "")).strip() or None
+        if not user_id:
+            raise RuntimeError("Missing subject claim.")
+        resp = RedirectResponse(url="/", status_code=302)
+        _clear_auth_cookies(resp)
+        _set_session_cookie(resp, user_id, email)
+        return resp
+    except Exception as exc:
+        return HTMLResponse(
+            (
+                "<h2>Login failed</h2>"
+                f"<p>{str(exc)}</p>"
+                "<p><a href='/login'>Try again</a></p>"
+            ),
+            status_code=401,
+        )
+
+
+@app.post("/logout")
+def logout() -> RedirectResponse:
+    resp = RedirectResponse(url=auth_service.cfg.logout_url or "/", status_code=302)
+    _clear_auth_cookies(resp)
+    return resp
+
+
+@app.get("/auth/me")
+def auth_me(request: Request) -> Dict[str, Any]:
+    user = _require_user(request)
+    return {
+        "user_id": user.user_id,
+        "email": user.email,
+        "session_expires_at": user.session_expires_at,
+    }
+
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request) -> HTMLResponse:
+    user = _require_user(request)
+    return templates.TemplateResponse(
+        request,
+        "index_v2.html",
+        {
+            "user_email": user.email or user.user_id,
+            "min_canvas_zoom": float(WEB_CONFIG.get("min_canvas_zoom", 0.45)),
+            "auto_fit_safety_px": int(WEB_CONFIG.get("auto_fit_safety_px", 10)),
+            "max_depth_min": int(WEB_CONFIG.get("max_depth_min", 1)),
+            "max_depth_max": int(WEB_CONFIG.get("max_depth_max", 8)),
+            "default_max_depth": int(WEB_CONFIG.get("default_max_depth", 3)),
+            "results_per_query_min": int(WEB_CONFIG.get("results_per_query_min", 1)),
+            "results_per_query_max": int(WEB_CONFIG.get("results_per_query_max", 30)),
+            "default_results_per_query": int(
+                WEB_CONFIG.get("default_results_per_query", 3)
+            ),
+            "ui_debug": bool(WEB_CONFIG.get("ui_debug", False)),
+            "live_intent_enabled": bool(WEB_CONFIG.get("live_intent_enabled", True)),
+            "live_intent_min_chars_default": int(
+                WEB_CONFIG.get("live_intent_min_chars_default", 12)
+            ),
+            "live_intent_min_chars_cjk": int(
+                WEB_CONFIG.get("live_intent_min_chars_cjk", 6)
+            ),
+            "live_intent_debounce_ms": int(
+                WEB_CONFIG.get("live_intent_debounce_ms", 320)
+            ),
+            "live_intent_confidence_threshold": float(
+                WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
+            ),
+            "asset_v": _BOOT_TS,
+        },
+    )
+
+
+def _compute_research_status(
+    status: str,
+    execution_state: str | None,
+    error: str | None,
+    phase: str | None = None,
+    planning_state: str | None = None,
+) -> str:
+    ph = str(phase or "").strip().lower()
+    ps = str(planning_state or "").strip().lower()
+    if ph == "planning":
+        if ps in {"running", "review", "idle", "committed"}:
+            return f"planning_{ps}"
+        if ps in {"failed", "aborted"}:
+            return ps
+        return "planning_idle"
+    es = str(execution_state or "").strip().lower()
+    if es == "paused":
+        return "paused"
+    if status == "queued":
+        return "idle"
+    if status == "running":
+        return "researching"
+    if status == "completed":
+        return "complete"
+    if status == "failed" and (error or "").strip() == "Run aborted by user":
+        return "aborted"
+    if status == "failed":
+        return "failed"
+    return status
+
+
+def _collect_tree_summaries(tree: Dict[str, Any]) -> tuple[List[str], List[str]]:
+    insights: List[str] = []
+    syntheses: List[str] = []
+    rounds = tree.get("rounds", [])
+    if not isinstance(rounds, list):
+        return insights, syntheses
+    for rnd in rounds:
+        if not isinstance(rnd, dict):
+            continue
+        questions = rnd.get("questions", [])
+        if not isinstance(questions, list):
+            continue
+        for q in questions:
+            if not isinstance(q, dict):
+                continue
+            node_suff = q.get("node_sufficiency", {})
+            if isinstance(node_suff, dict):
+                reasoning = str(node_suff.get("reasoning", "")).strip()
+                if reasoning:
+                    insights.append(reasoning)
+            steps = q.get("query_steps", [])
+            if not isinstance(steps, list):
+                continue
+            for st in steps:
+                if not isinstance(st, dict):
+                    continue
+                summary = str(st.get("synthesis_summary", "")).strip()
+                if summary:
+                    syntheses.append(summary)
+    return insights, syntheses
+
+
+def _coverage_note(tree: Dict[str, Any]) -> str:
+    rounds = tree.get("rounds", [])
+    total_queries = 0
+    evidence_queries = 0
+    if isinstance(rounds, list):
+        for rnd in rounds:
+            if not isinstance(rnd, dict):
+                continue
+            for q in rnd.get("questions", []) if isinstance(rnd.get("questions", []), list) else []:
+                if not isinstance(q, dict):
+                    continue
+                for st in q.get("query_steps", []) if isinstance(q.get("query_steps", []), list) else []:
+                    if not isinstance(st, dict):
+                        continue
+                    total_queries += 1
+                    if int(st.get("selected_results_count", 0)) > 0:
+                        evidence_queries += 1
+    if total_queries == 0:
+        return "No search evidence collected yet."
+    return (
+        f"Evidence-backed queries: {evidence_queries}/{total_queries}. "
+        "Coverage may be partial if unresolved branches remain."
+    )
+
+
+def _latest_thought(events: List[Dict[str, Any]]) -> str:
+    if not events:
+        return ""
+    ev = events[-1]
+    et = str(ev.get("event_type", ""))
+    payload = ev.get("payload", {}) if isinstance(ev.get("payload", {}), dict) else {}
+    if et == "sub_question_started":
+        return f"Working on: {payload.get('sub_question', '')}"
+    if et == "query_started":
+        return f"Searching: {payload.get('query', '')}"
+    if et == "search_completed":
+        return (
+            f"Search returned {int(payload.get('selected_results_count', 0))} selected results "
+            f"for '{payload.get('query', '')}'."
+        )
+    if et == "node_decomposed":
+        return f"Decomposed into {len(payload.get('children', [])) if isinstance(payload.get('children', []), list) else 0} child tasks."
+    if et == "node_decomposition_started":
+        return "Node sufficiency failed; decomposing into child tasks."
+    if et == "sufficiency_completed":
+        return "Pass-level sufficiency check completed."
+    if et == "run_completed":
+        return "Research completed and report generated."
+    if et == "run_aborted":
+        return "Research stopped by user request."
+    if et == "run_failed":
+        return f"Run failed: {payload.get('error', 'unknown error')}"
+    if et == "partial_report_generated":
+        return "Partial report generated from current findings."
+    if et == "report_heartbeat":
+        return "Still writing report..."
+    if et == "run_heartbeat":
+        _phase_labels = {
+            "working": "Processing",
+            "initializing": "Initializing research",
+            "planning_node": "Planning sub-questions",
+            "idle": "Waiting for review",
+            "searching": "Searching the web",
+            "query_decision": "Evaluating queries",
+            "synthesizing": "Synthesizing results",
+            "node_sufficiency": "Checking evidence sufficiency",
+            "decomposing": "Decomposing into sub-tasks",
+            "run_sufficiency": "Checking overall sufficiency",
+            "writing_report": "Writing report",
+            "binding_context": "Loading context files",
+            "paused": "Paused",
+        }
+        phase = str(payload.get("phase", "")).strip()
+        label = _phase_labels.get(phase, phase or "Processing")
+        sq = str(payload.get("sub_question", "")).strip()
+        query = str(payload.get("query", "")).strip()
+        if query:
+            return f"{label}: {query}"
+        if sq:
+            return f"{label}: {sq}"
+        return f"{label}."
+    return et.replace("_", " ").strip().capitalize()
+
+
+def _stop_reason(state: Any) -> str:
+    if state.status == "failed" and (state.error or "").strip() == "Run aborted by user":
+        return "Stopped by user request."
+    if state.status == "failed":
+        return f"Stopped due to error: {state.error or 'unknown error'}"
+    final_suff = state.tree.get("final_sufficiency", {}) if isinstance(state.tree, dict) else {}
+    if state.status == "completed" and isinstance(final_suff, dict):
+        if bool(final_suff.get("is_sufficient", False)):
+            return "Stopped because sufficiency passed."
+        return "Stopped after reaching configured search limits."
+    return ""
+
+
+def _idempotency_key_from_request(request: Request) -> str:
+    raw = str(request.headers.get("Idempotency-Key", "") or "").strip()
+    if not raw:
+        return ""
+    return raw[:200]
+
+
+def _parse_if_match_revision(if_match: str | None) -> int | None:
+    raw = str(if_match or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("W/"):
+        raw = raw[2:].strip()
+    if raw.startswith('"') and raw.endswith('"') and len(raw) >= 2:
+        raw = raw[1:-1].strip()
+    try:
+        val = int(raw)
+        if val >= 1:
+            return val
+    except Exception:
+        pass
+    raise HTTPException(status_code=400, detail="Invalid If-Match revision")
+
+
+def _raise_on_idempotency_state(state: str) -> None:
+    if state == "in_progress":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "idempotency_in_progress",
+                "message": "Request is already in progress.",
+            },
+        )
+    if state == "mismatch":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error_code": "idempotency_key_reused",
+                "message": "Idempotency key reused with different payload.",
+            },
+        )
+
+
+@app.post("/api/intent/live", response_model=LiveIntentResponse)
+def live_intent(req: LiveIntentRequest, request: Request) -> LiveIntentResponse:
+    _require_user(request)
+    return live_intent_classifier.classify(req.text)
+
+
+@app.post("/api/runs", response_model=CreateRunResponse)
+def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
+    user = _require_user(request)
+    max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
+    max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
+    rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
+    rpq_max = int(WEB_CONFIG.get("results_per_query_max", 30))
+    if not (max_depth_min <= req.max_depth <= max_depth_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"max_depth must be between {max_depth_min} and {max_depth_max}",
+        )
+    if not (rpq_min <= req.results_per_query <= rpq_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
+        )
+    model = str(WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"create_run:{user.user_id}"
+    idem_payload = {
+        "task": req.task,
+        "max_depth": int(req.max_depth),
+        "results_per_query": int(req.results_per_query),
+        "model": model,
+        "report_model": report_model,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload") if isinstance(idem.get("payload"), dict) else {}
+        return CreateRunResponse.model_validate(payload)
+    _raise_on_idempotency_state(idem_state)
+    try:
+        run_id = run_manager.create_run(
+            task=req.task,
+            max_depth=req.max_depth,
+            max_depth_cap_snapshot=max_depth_max,
+            max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+            results_per_query=req.results_per_query,
+            model=model,
+            report_model=report_model,
+            owner_id=user.user_id,
+        )
+    except Exception:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise
+    response = CreateRunResponse(run_id=run_id, status="queued")
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response.model_dump(),
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    return response
+
+
+@app.post("/api/runs/start_from_workspace", response_model=CreateRunResponse)
+def create_run_from_workspace(
+    req: StartFromWorkspaceRequest, request: Request
+) -> CreateRunResponse:
+    user = _require_user(request)
+    max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
+    max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
+    rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
+    rpq_max = int(WEB_CONFIG.get("results_per_query_max", 30))
+    if not (max_depth_min <= req.max_depth <= max_depth_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"max_depth must be between {max_depth_min} and {max_depth_max}",
+        )
+    if not (rpq_min <= req.results_per_query <= rpq_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
+        )
+    workspace_id = str(req.workspace_id or "").strip()
+    if not workspace_id:
+        raise HTTPException(status_code=422, detail="workspace_id is required")
+    model = str(WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"start_from_workspace:{user.user_id}:{workspace_id}"
+    idem_payload = {
+        "workspace_id": workspace_id,
+        "task": req.task,
+        "max_depth": int(req.max_depth),
+        "results_per_query": int(req.results_per_query),
+        "start_mode": str(req.start_mode or "planning"),
+        "model": model,
+        "report_model": report_model,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload") if isinstance(idem.get("payload"), dict) else {}
+        return CreateRunResponse.model_validate(payload)
+    _raise_on_idempotency_state(idem_state)
+    try:
+        run_id = run_manager.create_run_from_workspace(
+            workspace_id=workspace_id,
+            task=req.task,
+            max_depth=req.max_depth,
+            max_depth_cap_snapshot=max_depth_max,
+            max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+            results_per_query=req.results_per_query,
+            model=model,
+            report_model=report_model,
+            owner_id=user.user_id,
+            start_mode=req.start_mode,
+        )
+    except Exception:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise
+    response = CreateRunResponse(run_id=run_id, status="queued")
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response.model_dump(),
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    return response
+
+
+@app.post("/api/sessions/draft", response_model=CreateRunResponse)
+def create_draft_session(request: Request) -> CreateRunResponse:
+    user = _require_user(request)
+    run_id = run_manager.create_draft_session(
+        max_depth=int(WEB_CONFIG.get("default_max_depth", 3)),
+        max_depth_cap_snapshot=int(WEB_CONFIG.get("max_depth_max", 8)),
+        max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+        results_per_query=int(WEB_CONFIG.get("default_results_per_query", 3)),
+        model=str(WEB_CONFIG.get("model", "gpt-4.1")),
+        report_model=str(WEB_CONFIG.get("report_model", "gpt-5.2")),
+        owner_id=user.user_id,
+    )
+    return CreateRunResponse(run_id=run_id, status="queued")
+
+
+@app.post("/api/sessions/{session_id}/start", response_model=CreateRunResponse)
+def start_draft_session_run(
+    session_id: str,
+    req: CreateRunRequest,
+    request: Request,
+) -> CreateRunResponse:
+    user = _require_user(request)
+    max_depth_min = int(WEB_CONFIG.get("max_depth_min", 1))
+    max_depth_max = int(WEB_CONFIG.get("max_depth_max", 8))
+    rpq_min = int(WEB_CONFIG.get("results_per_query_min", 1))
+    rpq_max = int(WEB_CONFIG.get("results_per_query_max", 30))
+    if not (max_depth_min <= req.max_depth <= max_depth_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"max_depth must be between {max_depth_min} and {max_depth_max}",
+        )
+    if not (rpq_min <= req.results_per_query <= rpq_max):
+        raise HTTPException(
+            status_code=422,
+            detail=f"results_per_query must be between {rpq_min} and {rpq_max}",
+        )
+    model = str(WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(WEB_CONFIG.get("report_model", "gpt-5.2"))
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"start_draft:{session_id}"
+    idem_payload = {
+        "task": req.task,
+        "max_depth": int(req.max_depth),
+        "results_per_query": int(req.results_per_query),
+        "model": model,
+        "report_model": report_model,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload") if isinstance(idem.get("payload"), dict) else {}
+        return CreateRunResponse.model_validate(payload)
+    _raise_on_idempotency_state(idem_state)
+    out = run_manager.start_draft_session_run(
+        run_id=session_id,
+        task=req.task,
+        max_depth=req.max_depth,
+        max_depth_cap_snapshot=max_depth_max,
+        max_rounds=int(WEB_CONFIG.get("max_rounds", 1)),
+        results_per_query=req.results_per_query,
+        model=model,
+        report_model=report_model,
+        owner_id=user.user_id,
+    )
+    if out is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=404, detail="Session not found")
+    if isinstance(out, dict) and str(out.get("error_code", "")).startswith("conflict_"):
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=409, detail=str(out.get("error", "Session conflict")))
+    response = CreateRunResponse(run_id=session_id, status="queued")
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response.model_dump(),
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+    )
+    return response
+
+
+@app.get("/api/runs/{run_id}", response_model=RunSnapshotResponse)
+def get_run(run_id: str, request: Request) -> RunSnapshotResponse:
+    user = _require_user(request)
+    state = run_manager.get_snapshot(run_id, owner_id=user.user_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Run not found")
+    insights, syntheses = _collect_tree_summaries(state.tree)
+    report_status = str(state.tree.get("report_status", "pending")) if isinstance(state.tree, dict) else "pending"
+    return RunSnapshotResponse(
+        run_id=state.run_id,
+        session_id=state.session_id or state.run_id,
+        title=state.title or state.task,
+        status=state.status,
+        version=max(1, int(getattr(state, "version", 1) or 1)),
+        execution_state=state.execution_state,
+        phase=state.phase,
+        planning_state=state.planning_state,
+        research_state=state.research_state,
+        report_state=state.report_state,
+        terminal_reason=state.terminal_reason,
+        research_status=_compute_research_status(
+            state.status,
+            state.execution_state,
+            state.error,
+            state.phase,
+            state.planning_state,
+        ),
+        report_status=report_status,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        task=state.task,
+        max_depth=state.max_depth,
+        max_rounds=state.max_rounds,
+        results_per_query=state.results_per_query,
+        tree=state.tree,
+        facts=[],
+        insights=insights,
+        syntheses=syntheses,
+        stop_reason=_stop_reason(state),
+        coverage_note=_coverage_note(state.tree if isinstance(state.tree, dict) else {}),
+        latest_thought=_latest_thought(state.events),
+        report_text=state.report_text,
+        report_file_path=state.report_file_path,
+        report_versions=state.report_versions,
+        current_report_version_index=state.current_report_version_index,
+        error=state.error,
+        token_usage=state.token_usage,
+        snapshot_source=state.snapshot_source,
+        snapshot_fallback_reason=state.snapshot_fallback_reason,
+        snapshot_lock_wait_ms=state.snapshot_lock_wait_ms,
+        worker_thread_seen=state.worker_thread_seen,
+    )
+
+
+@app.get("/api/sessions", response_model=SessionListResponse)
+def list_sessions(request: Request) -> SessionListResponse:
+    user = _require_user(request)
+    sessions = run_manager.list_sessions(
+        owner_id=user.user_id,
+        include_lock_debug=bool(WEB_CONFIG.get("ui_debug", False))
+    )
+    return SessionListResponse(sessions=sessions)
+
+
+@app.get("/api/sessions/{session_id}", response_model=RunSnapshotResponse)
+def get_session(session_id: str, request: Request) -> RunSnapshotResponse:
+    user = _require_user(request)
+    state = run_manager.get_snapshot(session_id, owner_id=user.user_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+    insights, syntheses = _collect_tree_summaries(state.tree)
+    report_status = str(state.tree.get("report_status", "pending")) if isinstance(state.tree, dict) else "pending"
+    return RunSnapshotResponse(
+        run_id=state.run_id,
+        session_id=state.session_id or state.run_id,
+        title=state.title or state.task,
+        status=state.status,
+        version=max(1, int(getattr(state, "version", 1) or 1)),
+        execution_state=state.execution_state,
+        phase=state.phase,
+        planning_state=state.planning_state,
+        research_state=state.research_state,
+        report_state=state.report_state,
+        terminal_reason=state.terminal_reason,
+        research_status=_compute_research_status(
+            state.status,
+            state.execution_state,
+            state.error,
+            state.phase,
+            state.planning_state,
+        ),
+        report_status=report_status,
+        created_at=state.created_at,
+        updated_at=state.updated_at,
+        task=state.task,
+        max_depth=state.max_depth,
+        max_rounds=state.max_rounds,
+        results_per_query=state.results_per_query,
+        tree=state.tree,
+        facts=[],
+        insights=insights,
+        syntheses=syntheses,
+        stop_reason=_stop_reason(state),
+        coverage_note=_coverage_note(state.tree if isinstance(state.tree, dict) else {}),
+        latest_thought=_latest_thought(state.events),
+        report_text=state.report_text,
+        report_file_path=state.report_file_path,
+        report_versions=state.report_versions,
+        current_report_version_index=state.current_report_version_index,
+        error=state.error,
+        token_usage=state.token_usage,
+        snapshot_source=state.snapshot_source,
+        snapshot_fallback_reason=state.snapshot_fallback_reason,
+        snapshot_lock_wait_ms=state.snapshot_lock_wait_ms,
+        worker_thread_seen=state.worker_thread_seen,
+    )
+
+
+@app.get("/api/sessions/{session_id}/context", response_model=ContextSetResponse)
+def get_session_context(session_id: str, request: Request) -> ContextSetResponse:
+    user = _require_user(request)
+    context_set = run_manager.get_context_set(session_id, owner_id=user.user_id)
+    if context_set is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return ContextSetResponse.model_validate({"context_set": context_set})
+
+
+@app.get("/api/workspaces/{workspace_id}/context", response_model=ContextSetResponse)
+def get_workspace_context(workspace_id: str, request: Request) -> ContextSetResponse:
+    user = _require_user(request)
+    context_set = run_manager.get_workspace_context_set(
+        workspace_id, owner_id=user.user_id
+    )
+    if context_set is None:
+        raise HTTPException(status_code=404, detail="Workspace context not found")
+    return ContextSetResponse.model_validate({"context_set": context_set})
+
+
+@app.get(
+    "/api/sessions/{session_id}/context/files/{file_id}",
+    response_model=ContextFileDetailResponse,
+)
+def get_context_file_detail(
+    session_id: str, file_id: str, request: Request
+) -> ContextFileDetailResponse:
+    user = _require_user(request)
+    out = run_manager.get_context_file(session_id, file_id, owner_id=user.user_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    return ContextFileDetailResponse.model_validate(out)
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}",
+    response_model=ContextFileDetailResponse,
+)
+def get_workspace_context_file_detail(
+    workspace_id: str, file_id: str, request: Request
+) -> ContextFileDetailResponse:
+    user = _require_user(request)
+    out = run_manager.get_workspace_context_file(
+        workspace_id, file_id, owner_id=user.user_id
+    )
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    return ContextFileDetailResponse.model_validate(out)
+
+
+@app.get("/api/sessions/{session_id}/context/files/{file_id}/download")
+def download_context_file(session_id: str, file_id: str, request: Request) -> Response:
+    user = _require_user(request)
+    out = run_manager.get_context_file(session_id, file_id, owner_id=user.user_id)
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    blob = run_manager.get_context_file_bytes(
+        session_id, file_id, owner_id=user.user_id
+    )
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Context file bytes not found")
+    data, filename, mime_type = blob
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return Response(
+        content=data,
+        media_type=mime_type or "application/octet-stream",
+        headers=headers,
+    )
+
+
+@app.get("/api/workspaces/{workspace_id}/context/files/{file_id}/download")
+def download_workspace_context_file(
+    workspace_id: str, file_id: str, request: Request
+) -> Response:
+    user = _require_user(request)
+    out = run_manager.get_workspace_context_file(
+        workspace_id, file_id, owner_id=user.user_id
+    )
+    if out is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    blob = run_manager.get_workspace_context_file_bytes(
+        workspace_id, file_id, owner_id=user.user_id
+    )
+    if blob is None:
+        raise HTTPException(status_code=404, detail="Context file bytes not found")
+    data, filename, mime_type = blob
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return Response(
+        content=data,
+        media_type=mime_type or "application/octet-stream",
+        headers=headers,
+    )
+
+
+@app.get(
+    "/api/sessions/{session_id}/context/files/{file_id}/digest",
+    response_model=ContextDigestResponse,
+)
+def get_context_file_digest(
+    session_id: str, file_id: str, request: Request
+) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_context_file_digest(
+        session_id, file_id, owner_id=user.user_id
+    )
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Context file digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}/digest",
+    response_model=ContextDigestResponse,
+)
+def get_workspace_context_file_digest(
+    workspace_id: str, file_id: str, request: Request
+) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_workspace_context_file_digest(
+        workspace_id, file_id, owner_id=user.user_id
+    )
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Context file digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.get("/api/sessions/{session_id}/context/digest", response_model=ContextDigestResponse)
+def get_context_aggregate_digest(session_id: str, request: Request) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_context_aggregate_digest(
+        session_id, owner_id=user.user_id
+    )
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Aggregate context digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.get(
+    "/api/workspaces/{workspace_id}/context/digest",
+    response_model=ContextDigestResponse,
+)
+def get_workspace_context_aggregate_digest(
+    workspace_id: str, request: Request
+) -> ContextDigestResponse:
+    user = _require_user(request)
+    digest = run_manager.get_workspace_context_aggregate_digest(
+        workspace_id, owner_id=user.user_id
+    )
+    if digest is None:
+        raise HTTPException(status_code=404, detail="Aggregate context digest not found")
+    return ContextDigestResponse(digest=digest)
+
+
+@app.post("/api/sessions/{session_id}/context/files", response_model=ContextMutateResponse)
+async def upload_context_files(
+    session_id: str,
+    request: Request,
+    files: List[UploadFile] = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    user = _require_user(request)
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    uploads: List[Dict[str, Any]] = []
+    for f in files:
+        data = await f.read()
+        uploads.append(
+            {
+                "filename": f.filename or "",
+                "content_type": f.content_type or "",
+                "size_bytes": len(data),
+                "bytes": data,
+            }
+        )
+    result = run_manager.upload_context_files(
+        session_id=session_id,
+        uploads=uploads,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+        owner_id=user.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.post("/api/workspaces/{workspace_id}/context/files", response_model=ContextMutateResponse)
+async def upload_workspace_context_files(
+    workspace_id: str,
+    request: Request,
+    files: List[UploadFile] = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    user = _require_user(request)
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    uploads: List[Dict[str, Any]] = []
+    for f in files:
+        data = await f.read()
+        uploads.append(
+            {
+                "filename": f.filename or "",
+                "content_type": f.content_type or "",
+                "size_bytes": len(data),
+                "bytes": data,
+            }
+        )
+    result = run_manager.upload_workspace_context_files(
+        workspace_id=workspace_id,
+        uploads=uploads,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+        owner_id=user.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Workspace not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.put(
+    "/api/sessions/{session_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+async def replace_context_file(
+    session_id: str,
+    file_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    user = _require_user(request)
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    data = await file.read()
+    upload = {
+        "filename": file.filename or "",
+        "content_type": file.content_type or "",
+        "size_bytes": len(data),
+        "bytes": data,
+    }
+    result = run_manager.replace_context_file(
+        session_id=session_id,
+        file_id=file_id,
+        upload=upload,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+        owner_id=user.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.put(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+async def replace_workspace_context_file(
+    workspace_id: str,
+    file_id: str,
+    request: Request,
+    file: UploadFile = File(...),
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    user = _require_user(request)
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    data = await file.read()
+    upload = {
+        "filename": file.filename or "",
+        "content_type": file.content_type or "",
+        "size_bytes": len(data),
+        "bytes": data,
+    }
+    result = run_manager.replace_workspace_context_file(
+        workspace_id=workspace_id,
+        file_id=file_id,
+        upload=upload,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+        owner_id=user.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.delete(
+    "/api/sessions/{session_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+def delete_context_file(
+    session_id: str,
+    file_id: str,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    user = _require_user(request)
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    result = run_manager.delete_context_file(
+        session_id=session_id,
+        file_id=file_id,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+        owner_id=user.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+@app.delete(
+    "/api/workspaces/{workspace_id}/context/files/{file_id}",
+    response_model=ContextMutateResponse,
+)
+def delete_workspace_context_file(
+    workspace_id: str,
+    file_id: str,
+    request: Request,
+    if_match: str | None = Header(default=None, alias="If-Match"),
+) -> ContextMutateResponse:
+    user = _require_user(request)
+    expected_revision = _parse_if_match_revision(if_match)
+    idem_key = _idempotency_key_from_request(request)
+    result = run_manager.delete_workspace_context_file(
+        workspace_id=workspace_id,
+        file_id=file_id,
+        expected_revision=expected_revision,
+        idempotency_key=idem_key,
+        owner_id=user.user_id,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Context file not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_revision", "busy"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return ContextMutateResponse.model_validate(result)
+
+
+def _context_event_stream(session_id: str, q: Queue, owner_id: str) -> Iterator[str]:
+    try:
+        while True:
+            try:
+                event = q.get(timeout=15)
+                yield format_sse(event)
+            except Empty:
+                yield ": keep-alive\n\n"
+    finally:
+        run_manager.unsubscribe_context(session_id, q, owner_id=owner_id)
+
+
+@app.get("/api/sessions/{session_id}/context/stream")
+def stream_context_events(session_id: str, request: Request) -> StreamingResponse:
+    user = _require_user(request)
+    q = run_manager.subscribe_context(session_id, owner_id=user.user_id)
+    if q is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return StreamingResponse(
+        _context_event_stream(session_id, q, owner_id=user.user_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.patch("/api/sessions/{session_id}")
+def rename_session(session_id: str, req: PatchSessionRequest, request: Request) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(session_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    clean = " ".join(str(req.title or "").split()).strip()
+    if not clean:
+        raise HTTPException(status_code=422, detail="Title must contain non-whitespace characters.")
+    renamed = run_manager.rename_session(session_id, clean)
+    if renamed is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session": renamed.model_dump()}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: str, request: Request) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(session_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Session not found")
+    result = run_manager.delete_session(session_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if result == "conflict_running":
+        raise HTTPException(
+            status_code=409,
+            detail="Cannot delete an active session. Stop research/report first.",
+        )
+    return {"session_id": session_id, "status": "deleted"}
+
+
+def _event_stream(run_id: str, q: Queue, owner_id: str) -> Iterator[str]:
+    try:
+        while True:
+            try:
+                event = q.get(timeout=15)
+                yield format_sse(event)
+            except Empty:
+                yield ": keep-alive\n\n"
+    finally:
+        run_manager.unsubscribe(run_id, q, owner_id=owner_id)
+
+
+@app.get("/api/runs/{run_id}/events")
+def stream_events(run_id: str, request: Request) -> StreamingResponse:
+    user = _require_user(request)
+    q = run_manager.subscribe(run_id, owner_id=user.user_id)
+    if q is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return StreamingResponse(
+        _event_stream(run_id, q, owner_id=user.user_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )
+
+
+@app.get("/api/runs/{run_id}/report/download")
+def download_report(
+    run_id: str,
+    request: Request,
+    version_index: int | None = Query(default=None, ge=1),
+) -> FileResponse:
+    user = _require_user(request)
+    state = run_manager.get_snapshot(run_id, owner_id=user.user_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Run not found")
+    report_file_path = state.report_file_path
+    if version_index is not None and isinstance(state.report_versions, list):
+        if version_index > len(state.report_versions):
+            raise HTTPException(status_code=404, detail="Report version not available")
+        selected = state.report_versions[version_index - 1]
+        report_file_path = str(selected.get("report_file_path", "") or "")
+    if not report_file_path:
+        raise HTTPException(status_code=404, detail="Report not available")
+    path = Path(report_file_path)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Report file missing")
+    return FileResponse(
+        str(path),
+        media_type="text/markdown",
+        filename=path.name,
+    )
+
+
+@app.get("/api/report/templates", response_model=ReportTemplateListResponse)
+def list_report_templates(request: Request) -> ReportTemplateListResponse:
+    user = _require_user(request)
+    payload = run_manager.list_report_templates(owner_id=user.user_id)
+    return ReportTemplateListResponse(
+        templates=[
+            ReportTemplate.model_validate(tpl)
+            for tpl in payload.get("templates", [])
+            if isinstance(tpl, dict)
+        ],
+        default_manual_template_id=str(
+            payload.get("default_manual_template_id", "executive") or "executive"
+        ),
+    )
+
+
+@app.post("/api/report/templates", response_model=ReportTemplate)
+def create_report_template(
+    request: Request,
+    body: ReportTemplateCreateRequest,
+) -> ReportTemplate:
+    user = _require_user(request)
+    try:
+        created = run_manager.create_report_template(
+            owner_id=user.user_id,
+            name=body.name,
+            background_type=body.background_type,
+            fields=body.fields.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return ReportTemplate.model_validate(created)
+
+
+@app.put("/api/report/templates/{template_id}", response_model=ReportTemplate)
+def update_report_template(
+    template_id: str,
+    request: Request,
+    body: ReportTemplateUpdateRequest,
+) -> ReportTemplate:
+    user = _require_user(request)
+    try:
+        updated = run_manager.update_report_template(
+            owner_id=user.user_id,
+            template_id=template_id,
+            name=body.name,
+            background_type=body.background_type,
+            fields=body.fields.model_dump(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if not updated:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return ReportTemplate.model_validate(updated)
+
+
+@app.delete("/api/report/templates/{template_id}")
+def delete_report_template(template_id: str, request: Request) -> dict:
+    user = _require_user(request)
+    ok = run_manager.delete_report_template(
+        owner_id=user.user_id,
+        template_id=template_id,
+    )
+    if not ok:
+        raise HTTPException(status_code=404, detail="Template not found")
+    return {"ok": True}
+
+
+@app.post(
+    "/api/report/templates/preview",
+    response_model=ReportTemplatePreviewResponse,
+)
+def preview_report_template(
+    request: Request,
+    body: ReportTemplatePreviewRequest,
+) -> ReportTemplatePreviewResponse:
+    user = _require_user(request)
+    preview = run_manager.preview_report_template(
+        owner_id=user.user_id,
+        template_id=body.template_id,
+        draft=body.draft.model_dump() if body.draft else None,
+    )
+    return ReportTemplatePreviewResponse.model_validate(preview)
+
+
+@app.post("/api/runs/{run_id}/abort")
+def abort_run(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"control_abort:{run_id}"
+    idem_payload = {"run_id": run_id, "action": "abort"}
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    _raise_on_idempotency_state(idem_state)
+    # Abort is monotonic best-effort control. Ignore OCC version during retries/session switches.
+    result = run_manager.abort_run(run_id, expected_version=None)
+    if result is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    response = {"run_id": run_id, **result}
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    return response
+
+
+@app.post("/api/runs/{run_id}/pause")
+def pause_run(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.pause_run(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/resume")
+def resume_run(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.resume_run(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/planning/start")
+def planning_start(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.start_planning(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/planning/swap_batch")
+def planning_swap_batch(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.planning_swap_batch(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/planning/commit")
+def planning_commit(
+    run_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.planning_commit(run_id, expected_version=expected_version)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, **result}
+
+
+@app.post("/api/runs/{run_id}/nodes/{node_id}/pin")
+def pin_planning_node(
+    run_id: str,
+    node_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.pin_planning_node(
+        run_id, node_id=node_id, expected_version=expected_version
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run/node not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state", "invalid_node"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, "node_id": node_id, **result}
+
+
+@app.delete("/api/runs/{run_id}/nodes/{node_id}/pin")
+def unpin_planning_node(
+    run_id: str,
+    node_id: str,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.unpin_planning_node(
+        run_id, node_id=node_id, expected_version=expected_version
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run/node not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version", "invalid_state", "invalid_node"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, "node_id": node_id, **result}
+
+
+@app.post("/api/runs/{run_id}/nodes/{node_id}/depth_bonus")
+def increment_planning_depth_bonus(
+    run_id: str,
+    node_id: str,
+    req: PlanningDepthBonusRequest,
+    request: Request,
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.planning_increment_depth_bonus(
+        run_id,
+        node_id=node_id,
+        increment=int(req.increment),
+        expected_version=expected_version,
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run/node not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {
+            "conflict_state_version",
+            "invalid_state",
+            "invalid_node",
+            "invalid_depth_cap",
+        }:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    return {"run_id": run_id, "node_id": node_id, **result}
+
+
+@app.post("/api/runs/{run_id}/report/partial")
+def generate_partial_report(
+    run_id: str,
+    request: Request,
+    body: GenerateReportRequest | None = Body(default=None),
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    selected_template_id = str(
+        (body.template_id if body else "") or ""
+    ).strip() or None
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"report_partial:{run_id}"
+    idem_payload = {
+        "run_id": run_id,
+        "mode": "partial",
+        "template_id": selected_template_id,
+        "expected_version": expected_version,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    _raise_on_idempotency_state(idem_state)
+    result = run_manager.generate_partial_report(
+        run_id,
+        expected_version=expected_version,
+        report_template_id=selected_template_id,
+    )
+    if result is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"busy", "conflict_report_running", "conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        if code in {"invalid_state"}:
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    response = {"run_id": run_id, **result}
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    return response
+
+
+@app.post("/api/runs/{run_id}/report")
+def generate_report_now(
+    run_id: str,
+    request: Request,
+    body: GenerateReportRequest | None = Body(default=None),
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    selected_template_id = str(
+        (body.template_id if body else "") or ""
+    ).strip() or None
+    idem_key = _idempotency_key_from_request(request)
+    idem_scope = f"report_full:{run_id}"
+    idem_payload = {
+        "run_id": run_id,
+        "mode": "full",
+        "template_id": selected_template_id,
+        "expected_version": expected_version,
+    }
+    idem = run_manager.idempotency_begin(
+        idem_scope,
+        idem_key,
+        idem_payload,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    idem_state = str(idem.get("state", "new"))
+    if idem_state == "replay":
+        payload = idem.get("payload")
+        return payload if isinstance(payload, dict) else {}
+    _raise_on_idempotency_state(idem_state)
+    result = run_manager.generate_partial_report(
+        run_id,
+        expected_version=expected_version,
+        report_template_id=selected_template_id,
+    )
+    if result is None:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"busy", "conflict_report_running", "conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        if code in {"invalid_state"}:
+            raise HTTPException(status_code=400, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    response = {"run_id": run_id, **result}
+    run_manager.idempotency_complete(
+        idem_scope,
+        idem_key,
+        response,
+        ttl_sec=RunManager._IDEMPOTENCY_TTL_REPORT_SEC,
+    )
+    return response
+
+
+@app.post("/api/runs/{run_id}/report/select")
+def select_report_version(
+    run_id: str,
+    request: Request,
+    version_index: int = Query(..., ge=1),
+    expected_version: int | None = Query(default=None, ge=1),
+) -> dict:
+    user = _require_user(request)
+    if not run_manager.get_snapshot(run_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="Run not found")
+    result = run_manager.select_report_version(
+        run_id, version_index, expected_version=expected_version
+    )
+    if result is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if "error" in result:
+        code = str(result.get("error_code", "") or "")
+        detail = str(result.get("error", "Unknown error"))
+        if code in {"conflict_state_version"}:
+            raise HTTPException(status_code=409, detail=detail)
+        raise HTTPException(status_code=500, detail=detail)
+    if not result:
+        raise HTTPException(status_code=404, detail="No report versions available")
+    return {"run_id": run_id, **result}

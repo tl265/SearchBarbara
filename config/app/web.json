@@ -14,9 +14,10 @@
   "heartbeat_interval_sec": 8,
   "context_preprocess_enabled": true,
   "context_preprocess_model": "gpt-4.1",
-  "context_preprocess_prompt_path_common": "prompts/context_preprocess_common.system.txt",
-  "context_preprocess_prompt_path_per_file": "prompts/context_preprocess_per_file.system.txt",
-  "context_preprocess_prompt_path_aggregate": "prompts/context_preprocess_aggregate.system.txt",
+  "context_preprocess_prompt_path_common": "agents/prompts/context_preprocess/common.system.txt",
+  "context_preprocess_prompt_path_per_file": "agents/prompts/context_preprocess/per_file.system.txt",
+  "context_preprocess_prompt_path_aggregate": "agents/prompts/context_preprocess/aggregate.system.txt",
   "context_preprocess_prompt_version": "v1.4",
-  "context_chunking_version": "context_chunk.v1"
+  "context_chunking_version": "context_chunk.v1",
+  "live_intent_prompt_path": "agents/prompts/live_intent/system.txt"
 }

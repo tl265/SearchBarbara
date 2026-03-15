@@ -2,21 +2,21 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from app import main
-from app.live_intent import LiveIntentClassifier
+from backend import server
+from backend.core.live_intent import LiveIntentClassifier
 
 
-client = TestClient(main.app)
+client = TestClient(server.app)
 
 
 def _enable_test_auth(monkeypatch):
     monkeypatch.setattr(
-        type(main.AUTH_CONFIG),
+        type(server.AUTH_CONFIG),
         "configured",
         property(lambda _self: True),
     )
     monkeypatch.setattr(
-        main,
+        server,
         "get_current_user_from_request",
         lambda _request, _auth: SimpleNamespace(
             user_id="test-user",
