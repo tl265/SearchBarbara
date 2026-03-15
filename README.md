@@ -48,6 +48,17 @@ export AUTH_ALLOW_LEGACY=false
 python deep_research_agent.py "Should our B2B SaaS expand into the German market in 2026?"
 ```
 
+## Layout
+
+The codebase is organized by top-level ownership:
+
+- `backend/` web server, API, orchestration, and backend runtime logic
+- `frontend/` templates and static assets for the active web UI
+- `agents/` research implementation plus prompt assets
+- `config/` app config and agent policy/config data
+- `infra/` deploy and observability helpers
+- `app/` compatibility shims for older imports and entrypoints
+
 ## Web App (MVP)
 
 Run the local web interface:
@@ -93,7 +104,7 @@ Options:
 - `--resume-from` resume from a previous checkpoint state JSON
 - `--report-file` optional custom path for final report output
 - `--usage-file` optional custom path for standalone token usage JSON
-- `--pricing-file` pricing config JSON for cost estimation (default `pricing.json`)
+- `--pricing-file` pricing config JSON for cost estimation (default `config/agent/pricing.json`)
 - `--no-token-breakdown` disable token tracking and usage summary
 - `--no-cost-estimate` disable cost estimation while keeping token tracking
 - `--quiet` disable progress logs
@@ -111,7 +122,7 @@ Options:
 - Use `--report-file path/to/report.md` to override the report output path.
 - Each run records per-call token usage and stage/model aggregates in trace/state by default.
 - Use `--usage-file path/to/usage.json` to export standalone token/cost breakdown.
-- Cost estimates are config-based and loaded from `pricing.json` (or `--pricing-file`).
+- Cost estimates are config-based and loaded from `config/agent/pricing.json` (or `--pricing-file`).
 - Search results are quality-ranked to prioritize official and primary domains before synthesis.
 - Progress messages are printed during execution so you can monitor direction in real time.
 - If a query has no usable evidence, synthesis is skipped and the limitation is logged/traced.
@@ -147,21 +158,21 @@ Enable passwordless email OTP:
 
 ## Prompt Customization
 
-System prompts for each sub-agent are stored as separate files in `prompts/`:
+System prompts for each sub-agent are stored under `agents/prompts/`:
 
-- `prompts/decompose.system.txt`
-- `prompts/query_gen.system.txt`
-- `prompts/synthesize.system.txt`
-- `prompts/sufficiency_node.system.txt`
-- `prompts/sufficiency_pass.system.txt`
-- `prompts/report.system.txt`
-- `prompts/context_split.system.txt`
+- `agents/prompts/deep_research/decompose.system.txt`
+- `agents/prompts/deep_research/query_gen.system.txt`
+- `agents/prompts/deep_research/synthesize.system.txt`
+- `agents/prompts/deep_research/sufficiency_node.system.txt`
+- `agents/prompts/deep_research/sufficiency_pass.system.txt`
+- `agents/prompts/deep_research/report.system.txt`
+- `agents/prompts/context_preprocess/context_split.system.txt`
 
 Edit these files to change sub-agent behavior without changing Python code.
 
 ## Search Policy Customization
 
-Query reuse/rerun controls are stored in `search_policy.json`:
+Query reuse/rerun controls are stored in `config/agent/search_policy.json`:
 
 - `cache_ttl_seconds`
 - `max_broaden_steps`
@@ -173,7 +184,7 @@ Query reuse/rerun controls are stored in `search_policy.json`:
 
 ## Source Policy Customization
 
-Source-tier rules are stored in `source_policy.json`.
+Source-tier rules are stored in `config/agent/source_policy.json`.
 
 - `primary_tlds`: domain suffixes automatically treated as primary/official.
 - `primary_domain_suffixes`: explicit trusted domain rules.
@@ -182,3 +193,7 @@ Source-tier rules are stored in `source_policy.json`.
 - `secondary_tlds`: suffixes treated as secondary/reputable.
 
 Edit this file to control which sources are considered primary without changing Python code.
+
+## Web Config Customization
+
+Web/UI and runtime feature flags are stored in `config/app/web.json`.

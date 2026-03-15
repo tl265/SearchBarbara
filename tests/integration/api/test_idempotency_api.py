@@ -1,15 +1,15 @@
 from fastapi.testclient import TestClient
 from types import SimpleNamespace
 
-from app import main
+from backend import server
 
 
-client = TestClient(main.app)
+client = TestClient(server.app)
 
 
 def _clear_idempotency_records() -> None:
-    with main.run_manager._idempotency_lock:
-        main.run_manager._idempotency_records.clear()
+    with server.run_manager._idempotency_lock:
+        server.run_manager._idempotency_records.clear()
 
 
 def test_create_run_replays_same_response_for_same_key(monkeypatch):
@@ -20,7 +20,7 @@ def test_create_run_replays_same_response_for_same_key(monkeypatch):
         created["count"] += 1
         return f"run-{created['count']}"
 
-    monkeypatch.setattr(main.run_manager, "create_run", fake_create_run)
+    monkeypatch.setattr(server.run_manager, "create_run", fake_create_run)
     payload = {"task": "topic-a", "max_depth": 2, "results_per_query": 1}
     headers = {"Idempotency-Key": "same-create-key"}
 
@@ -36,7 +36,7 @@ def test_create_run_replays_same_response_for_same_key(monkeypatch):
 
 def test_create_run_rejects_same_key_with_different_payload(monkeypatch):
     _clear_idempotency_records()
-    monkeypatch.setattr(main.run_manager, "create_run", lambda **_kwargs: "run-1")
+    monkeypatch.setattr(server.run_manager, "create_run", lambda **_kwargs: "run-1")
     headers = {"Idempotency-Key": "shared-key"}
 
     first = client.post(
@@ -57,8 +57,8 @@ def test_create_run_rejects_same_key_with_different_payload(monkeypatch):
 
 def test_create_run_returns_in_progress_for_pending_same_key():
     _clear_idempotency_records()
-    model = str(main.WEB_CONFIG.get("model", "gpt-4.1"))
-    report_model = str(main.WEB_CONFIG.get("report_model", "gpt-5.2"))
+    model = str(server.WEB_CONFIG.get("model", "gpt-4.1"))
+    report_model = str(server.WEB_CONFIG.get("report_model", "gpt-5.2"))
     key = "pending-key"
     payload = {
         "task": "topic-a",
@@ -67,11 +67,11 @@ def test_create_run_returns_in_progress_for_pending_same_key():
         "model": model,
         "report_model": report_model,
     }
-    main.run_manager.idempotency_begin(
+    server.run_manager.idempotency_begin(
         "create_run",
         key,
         payload,
-        ttl_sec=main.RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
+        ttl_sec=server.RunManager._IDEMPOTENCY_TTL_CREATE_RUN_SEC,
     )
 
     rsp = client.post(
@@ -96,7 +96,7 @@ def test_report_endpoint_replays_and_new_key_creates_new_result(monkeypatch):
             "version": 1,
         }
 
-    monkeypatch.setattr(main.run_manager, "generate_partial_report", fake_generate_partial_report)
+    monkeypatch.setattr(server.run_manager, "generate_partial_report", fake_generate_partial_report)
 
     r1 = client.post("/api/runs/run-123/report", headers={"Idempotency-Key": "rep-a"})
     r2 = client.post("/api/runs/run-123/report", headers={"Idempotency-Key": "rep-a"})
@@ -120,7 +120,7 @@ def test_abort_ignores_expected_version_and_replays_with_same_key(monkeypatch):
         calls["expected_version"] = expected_version
         return {"status": "aborting", "version": 7}
 
-    monkeypatch.setattr(main.run_manager, "abort_run", fake_abort_run)
+    monkeypatch.setattr(server.run_manager, "abort_run", fake_abort_run)
     headers = {"Idempotency-Key": "abort-key-1"}
 
     r1 = client.post("/api/runs/run-42/abort?expected_version=999", headers=headers)
@@ -135,7 +135,7 @@ def test_abort_ignores_expected_version_and_replays_with_same_key(monkeypatch):
 
 def test_delete_session_blocks_when_report_generating():
     sid = "delete-guard-generating"
-    rm = main.run_manager
+    rm = server.run_manager
     with rm._lock:
         rm._runs[sid] = SimpleNamespace(
             status="completed",
@@ -155,7 +155,7 @@ def test_delete_session_blocks_when_report_generating():
 
 def test_delete_session_blocks_when_report_worker_active():
     sid = "delete-guard-active-worker"
-    rm = main.run_manager
+    rm = server.run_manager
     with rm._lock:
         rm._runs[sid] = SimpleNamespace(
             status="completed",
