@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SearchBarbara - Frontend Preview</title>
+    <link rel="stylesheet" href="/static/styles_v2.css">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .preview-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        .preview-header {
+            background: #2c3e50;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .preview-content {
+            padding: 20px;
+        }
+        .component-preview {
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            margin: 20px 0;
+            padding: 20px;
+        }
+        .component-title {
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #2c3e50;
+        }
+    </style>
+</head>
+<body>
+    <div class="preview-container">
+        <div class="preview-header">
+            <h1>SearchBarbara Frontend Preview</h1>
+            <p>This is a preview of the SearchBarbara user interface components</p>
+        </div>
+
+        <div class="preview-content">
+            <div class="component-preview">
+                <div class="component-title">Top Bar Component</div>
+                <div class="topbar">
+                    <div>
+                        <h1>SearchBarbara</h1>
+                        <p class="subtitle">Thinking-partner mode</p>
+                    </div>
+                    <div class="auth-box">
+                        <span class="muted">user@example.com</span>
+                        <form>
+                            <button type="submit">Logout</button>
+                        </form>
+                    </div>
+                    <div class="top-metrics">
+                        <div><span class="k">Run</span><span>idle</span></div>
+                        <div><span class="k">Research</span><span>idle</span></div>
+                        <div><span class="k">Report</span><span>pending</span></div>
+                        <div><span class="k">Tokens</span><span>-</span></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="component-preview">
+                <div class="component-title">Session Dock Component</div>
+                <div class="session-dock card">
+                    <div class="section-head">
+                        <h2>Sessions</h2>
+                        <div class="dock-controls">
+                            <button type="button">New Session</button>
+                            <button type="button">Refresh</button>
+                        </div>
+                    </div>
+                    <div class="session-list">
+                        <div class="session-item">
+                            <div class="session-title">Market Research: German Expansion</div>
+                            <div class="session-meta">Created: 2024-02-24</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="component-preview">
+                <div class="component-title">Prompt Dock Component</div>
+                <div class="prompt-dock card">
+                    <label for="task" class="dock-label">Research Task</label>
+                    <textarea id="task" rows="3" placeholder="Ask a deep research question...">Should our B2B SaaS expand into the German market in 2026?</textarea>
+                    <div class="dock-controls">
+                        <button class="primary">Start Research</button>
+                        <button disabled>Generate Report From Current Findings</button>
+                        <button disabled>Download Report</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="component-preview">
+                <div class="component-title">Research Canvas Component</div>
+                <div class="research-canvas card">
+                    <div class="canvas-controls">
+                        <button>Zoom Out</button>
+                        <span>100%</span>
+                        <button>Zoom In</button>
+                        <button>Fit to Screen</button>
+                    </div>
+                    <div class="canvas-area">
+                        <div class="node root-node">
+                            <div class="node-content">
+                                <div class="node-title">German Market Expansion</div>
+                                <div class="node-status">Researching...</div>
+                            </div>
+                            <div class="node-children">
+                                <div class="node child-node">
+                                    <div class="node-content">
+                                        <div class="node-title">Market Size</div>
+                                        <div class="node-status">Completed</div>
+                                    </div>
+                                </div>
+                                <div class="node child-node">
+                                    <div class="node-content">
+                                        <div class="node-title">Competition</div>
+                                        <div class="node-status">In Progress</div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        console.log('SearchBarbara frontend preview loaded');
+        console.log('Live application available at: http://127.0.0.1:8080/');
+    </script>
+</body>
+</html>
