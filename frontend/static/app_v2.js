@@ -2869,6 +2869,7 @@ function buildNodeVisualStateMap(byDepth) {
 }
 
 function renderCanvas(tree) {
+  const _renderTracker = (typeof SBTelemetry !== "undefined") ? SBTelemetry.trackRender("canvas_tree") : null;
   captureOpenDetailState();
   if (!tree || typeof tree !== "object") {
     canvasTreePanel.innerHTML = "";
@@ -3027,6 +3028,7 @@ function renderCanvas(tree) {
   if (selectedTreeItem) {
     selectedTreeItem.scrollIntoView({ behavior: "auto", block: "nearest" });
   }
+  if (_renderTracker) _renderTracker.end();
 }
 
 function renderCanvasDetailForKey(key) {
@@ -3507,6 +3509,7 @@ async function openSession(runId, opts = {}) {
   }
   clearLiveIntent();
   currentRunId = sid;
+  if (typeof SBTelemetry !== "undefined") SBTelemetry.setSession(sid);
   if (appMainEl) appMainEl.classList.remove("is-empty");
   pauseRequested = false;
   abortRequested = false;
@@ -3532,6 +3535,7 @@ function connectEvents(runId) {
   if (es) es.close();
   lastEventSeqByRun.set(String(runId), 0);
   es = new EventSource(`/api/runs/${runId}/events`);
+  if (typeof SBTelemetry !== "undefined") SBTelemetry.trackSSE(es, "run_events");
 
   es.onmessage = async (evt) => {
     if (String(runId) !== String(currentRunId || "")) return;
@@ -3694,6 +3698,7 @@ async function startRun(idempotencyKey, startMode = "research") {
       });
     }
     currentRunId = String(data.run_id || currentRunId || "");
+    if (typeof SBTelemetry !== "undefined") SBTelemetry.setSession(currentRunId);
     if (appMainEl) appMainEl.classList.remove("is-empty");
     setRunIdInUrl(currentRunId);
     // Subscribe immediately so startup parsing events are not missed.

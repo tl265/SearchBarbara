@@ -1,10 +1,8 @@
-import logging
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Iterator, List
 import json
 import os
-import time
 
 from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header, Body
 from fastapi.responses import (
@@ -17,20 +15,10 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel
 from starlette.requests import Request
 
-from infra.observability import (
-    setup_global_logger,
-    generate_trace_id,
-    get_current_session_logger,
-)
-
-log = setup_global_logger()
-_server_log = logging.getLogger("searchbarbara.server")
-
-from backend.core.live_intent import LiveIntentClassifier
-from backend.core.models import (
+from app.auth import AuthConfig, AuthService, get_current_user_from_request
+from app.models import (
     ContextDigestResponse,
     ContextFileDetailResponse,
     ContextMutateResponse,
@@ -38,8 +26,6 @@ from backend.core.models import (
     GenerateReportRequest,
     CreateRunRequest,
     CreateRunResponse,
-    LiveIntentRequest,
-    LiveIntentResponse,
     PlanningDepthBonusRequest,
     PatchSessionRequest,
     ReportTemplateCreateRequest,
@@ -52,30 +38,16 @@ from backend.core.models import (
     StartFromWorkspaceRequest,
     SessionListResponse,
 )
-from backend.infra.auth import (
-    AuthConfig,
-    AuthService,
-    UserPrincipal,
-    get_current_user_from_request,
-)
-from backend.infra.sse import format_sse
-from backend.orchestration.run_manager import RunManager
+from app.run_manager import RunManager
+from app.sse import format_sse
 
 
 BASE_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = BASE_DIR.parent
-WEB_CONFIG_PATH = PROJECT_ROOT / "config" / "app" / "web.json"
-LEGACY_WEB_CONFIG_PATH = PROJECT_ROOT / "web_config.json"
-templates = Jinja2Templates(directory=str(PROJECT_ROOT / "frontend" / "templates"))
-
-_BOOT_TS = str(int(time.time()))
+WEB_CONFIG_PATH = BASE_DIR.parent / "web_config.json"
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 app = FastAPI(title="SearchBarbara Web")
-app.mount(
-    "/static",
-    StaticFiles(directory=str(PROJECT_ROOT / "frontend" / "static")),
-    name="static",
-)
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
 
 def _load_web_config() -> Dict[str, Any]:
@@ -95,25 +67,16 @@ def _load_web_config() -> Dict[str, Any]:
         "heartbeat_interval_sec": 8,
         "context_preprocess_enabled": True,
         "context_preprocess_model": "gpt-4.1",
-        "context_preprocess_prompt_path_common": "agents/prompts/context_preprocess/common.system.txt",
-        "context_preprocess_prompt_path_per_file": "agents/prompts/context_preprocess/per_file.system.txt",
-        "context_preprocess_prompt_path_aggregate": "agents/prompts/context_preprocess/aggregate.system.txt",
+        "context_preprocess_prompt_path_common": "prompts/context_preprocess_common.system.txt",
+        "context_preprocess_prompt_path_per_file": "prompts/context_preprocess_per_file.system.txt",
+        "context_preprocess_prompt_path_aggregate": "prompts/context_preprocess_aggregate.system.txt",
         "context_preprocess_prompt_version": "v1.4",
         "context_chunking_version": "context_chunk.v1",
-        "live_intent_enabled": True,
-        "live_intent_min_chars_default": 12,
-        "live_intent_min_chars_cjk": 6,
-        "live_intent_debounce_ms": 320,
-        "live_intent_server_max_chars": 600,
-        "live_intent_model": "gpt-4.1",
-        "live_intent_prompt_path": "agents/prompts/live_intent/system.txt",
-        "live_intent_confidence_threshold": 0.45,
     }
-    config_path = WEB_CONFIG_PATH if WEB_CONFIG_PATH.exists() else LEGACY_WEB_CONFIG_PATH
-    if not config_path.exists():
+    if not WEB_CONFIG_PATH.exists():
         return default
     try:
-        raw = json.loads(config_path.read_text(encoding="utf-8"))
+        raw = json.loads(WEB_CONFIG_PATH.read_text(encoding="utf-8"))
     except Exception:
         return default
     if not isinstance(raw, dict):
@@ -204,9 +167,9 @@ def _load_web_config() -> Dict[str, Any]:
     legacy_context_preprocess_prompt_path = str(
         raw.get(
             "context_preprocess_prompt_path",
-            "agents/prompts/context_preprocess/common.system.txt",
+            "prompts/context_preprocess.system.txt",
         )
-        or "agents/prompts/context_preprocess/common.system.txt"
+        or "prompts/context_preprocess.system.txt"
     )
     context_preprocess_prompt_path_per_file = str(
         raw.get(
@@ -235,62 +198,6 @@ def _load_web_config() -> Dict[str, Any]:
         raw.get("context_chunking_version", default["context_chunking_version"])
         or default["context_chunking_version"]
     )
-    live_intent_enabled = bool(
-        raw.get("live_intent_enabled", default["live_intent_enabled"])
-    )
-    legacy_live_intent_min_chars = raw.get(
-        "live_intent_min_chars", default["live_intent_min_chars_default"]
-    )
-    try:
-        live_intent_min_chars_default = int(
-            raw.get(
-                "live_intent_min_chars_default",
-                legacy_live_intent_min_chars,
-            )
-        )
-    except (TypeError, ValueError):
-        live_intent_min_chars_default = default["live_intent_min_chars_default"]
-    try:
-        live_intent_min_chars_cjk = int(
-            raw.get(
-                "live_intent_min_chars_cjk",
-                default["live_intent_min_chars_cjk"],
-            )
-        )
-    except (TypeError, ValueError):
-        live_intent_min_chars_cjk = default["live_intent_min_chars_cjk"]
-    try:
-        live_intent_debounce_ms = int(
-            raw.get("live_intent_debounce_ms", default["live_intent_debounce_ms"])
-        )
-    except (TypeError, ValueError):
-        live_intent_debounce_ms = default["live_intent_debounce_ms"]
-    try:
-        live_intent_server_max_chars = int(
-            raw.get(
-                "live_intent_server_max_chars",
-                default["live_intent_server_max_chars"],
-            )
-        )
-    except (TypeError, ValueError):
-        live_intent_server_max_chars = default["live_intent_server_max_chars"]
-    live_intent_model = str(
-        raw.get("live_intent_model", default["live_intent_model"])
-        or default["live_intent_model"]
-    )
-    live_intent_prompt_path = str(
-        raw.get("live_intent_prompt_path", default["live_intent_prompt_path"])
-        or default["live_intent_prompt_path"]
-    )
-    try:
-        live_intent_confidence_threshold = float(
-            raw.get(
-                "live_intent_confidence_threshold",
-                default["live_intent_confidence_threshold"],
-            )
-        )
-    except (TypeError, ValueError):
-        live_intent_confidence_threshold = default["live_intent_confidence_threshold"]
     return {
         "max_rounds": max(1, max_rounds),
         "max_depth_min": max_depth_min,
@@ -315,20 +222,6 @@ def _load_web_config() -> Dict[str, Any]:
         "context_preprocess_prompt_path_aggregate": context_preprocess_prompt_path_aggregate,
         "context_preprocess_prompt_version": context_preprocess_prompt_version,
         "context_chunking_version": context_chunking_version,
-        "live_intent_enabled": live_intent_enabled,
-        "live_intent_min_chars_default": max(
-            1, min(live_intent_min_chars_default, 200)
-        ),
-        "live_intent_min_chars_cjk": max(1, min(live_intent_min_chars_cjk, 40)),
-        "live_intent_debounce_ms": max(80, min(live_intent_debounce_ms, 1500)),
-        "live_intent_server_max_chars": max(
-            64, min(live_intent_server_max_chars, 2000)
-        ),
-        "live_intent_model": live_intent_model,
-        "live_intent_prompt_path": live_intent_prompt_path,
-        "live_intent_confidence_threshold": min(
-            0.95, max(0.0, float(live_intent_confidence_threshold))
-        ),
     }
 
 
@@ -348,19 +241,19 @@ run_manager = RunManager(
     context_preprocess_prompt_path_common=str(
         WEB_CONFIG.get(
             "context_preprocess_prompt_path_common",
-            "agents/prompts/context_preprocess/common.system.txt",
+            "prompts/context_preprocess_common.system.txt",
         )
     ),
     context_preprocess_prompt_path_per_file=str(
         WEB_CONFIG.get(
             "context_preprocess_prompt_path_per_file",
-            "agents/prompts/context_preprocess/per_file.system.txt",
+            "prompts/context_preprocess_per_file.system.txt",
         )
     ),
     context_preprocess_prompt_path_aggregate=str(
         WEB_CONFIG.get(
             "context_preprocess_prompt_path_aggregate",
-            "agents/prompts/context_preprocess/aggregate.system.txt",
+            "prompts/context_preprocess_aggregate.system.txt",
         )
     ),
     context_preprocess_prompt_version=str(
@@ -368,19 +261,6 @@ run_manager = RunManager(
     ),
     context_chunking_version=str(
         WEB_CONFIG.get("context_chunking_version", "context_chunk.v1")
-    ),
-)
-live_intent_classifier = LiveIntentClassifier(
-    enabled=bool(WEB_CONFIG.get("live_intent_enabled", True)),
-    min_chars_default=int(WEB_CONFIG.get("live_intent_min_chars_default", 12)),
-    min_chars_cjk=int(WEB_CONFIG.get("live_intent_min_chars_cjk", 6)),
-    max_input_chars=int(WEB_CONFIG.get("live_intent_server_max_chars", 600)),
-    model=str(WEB_CONFIG.get("live_intent_model", "gpt-4.1")),
-    prompt_path=str(
-        WEB_CONFIG.get("live_intent_prompt_path", "agents/prompts/live_intent/system.txt")
-    ),
-    confidence_threshold=float(
-        WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
     ),
 )
 
@@ -430,19 +310,17 @@ async def auth_middleware(request: Request, call_next):
     if path.startswith("/static/") or path in public_paths:
         return await call_next(request)
 
-    protected = path == "/" or path.startswith("/api/") or path == "/observability"
+    protected = path == "/" or path == "/legacy" or path.startswith("/api/")
     if not protected:
         return await call_next(request)
 
     if not AUTH_CONFIG.configured:
-        # Auth not configured — bypass with a local dev user.
-        import time as _time
-        request.state.user = UserPrincipal(
-            user_id="local-dev-user",
-            email="dev@localhost",
-            session_expires_at=int(_time.time()) + 86400,
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=500, content={"error": "auth_not_configured"})
+        return HTMLResponse(
+            "<h2>Auth not configured.</h2><p>Set AUTH0_* and AUTH_COOKIE_SECRET env vars.</p>",
+            status_code=500,
         )
-        return await call_next(request)
 
     user = get_current_user_from_request(request, auth_service)
     if not user:
@@ -454,31 +332,6 @@ async def auth_middleware(request: Request, call_next):
     response = await call_next(request)
     # Sliding renewal on authenticated traffic.
     _set_session_cookie(response, user.user_id, user.email)
-    return response
-
-
-@app.middleware("http")
-async def tracing_middleware(request: Request, call_next):
-    """Inject/propagate X-Trace-ID and log every HTTP request."""
-    trace_id = request.headers.get("x-trace-id") or generate_trace_id()
-    request.state.trace_id = trace_id
-    start = time.perf_counter()
-    response = await call_next(request)
-    duration_ms = (time.perf_counter() - start) * 1000
-    response.headers["X-Trace-ID"] = trace_id
-    path = request.url.path or "/"
-    if not path.startswith("/static/"):
-        _server_log.info(
-            "http_request %s %s %s %.1fms",
-            request.method, path, response.status_code, duration_ms,
-            extra={"structured": {
-                "trace_id": trace_id,
-                "method": request.method,
-                "path": path,
-                "status": response.status_code,
-                "duration_ms": round(duration_ms, 2),
-            }},
-        )
     return response
 
 
@@ -577,21 +430,17 @@ def index(request: Request) -> HTMLResponse:
                 WEB_CONFIG.get("default_results_per_query", 3)
             ),
             "ui_debug": bool(WEB_CONFIG.get("ui_debug", False)),
-            "live_intent_enabled": bool(WEB_CONFIG.get("live_intent_enabled", True)),
-            "live_intent_min_chars_default": int(
-                WEB_CONFIG.get("live_intent_min_chars_default", 12)
-            ),
-            "live_intent_min_chars_cjk": int(
-                WEB_CONFIG.get("live_intent_min_chars_cjk", 6)
-            ),
-            "live_intent_debounce_ms": int(
-                WEB_CONFIG.get("live_intent_debounce_ms", 320)
-            ),
-            "live_intent_confidence_threshold": float(
-                WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
-            ),
-            "asset_v": _BOOT_TS,
         },
+    )
+
+
+@app.get("/legacy", response_class=HTMLResponse)
+def index_legacy(request: Request) -> HTMLResponse:
+    _require_user(request)
+    return templates.TemplateResponse(
+        request,
+        "index.html",
+        {"min_canvas_zoom": float(WEB_CONFIG.get("min_canvas_zoom", 0.45))},
     )
 
 
@@ -715,30 +564,14 @@ def _latest_thought(events: List[Dict[str, Any]]) -> str:
     if et == "report_heartbeat":
         return "Still writing report..."
     if et == "run_heartbeat":
-        _phase_labels = {
-            "working": "Processing",
-            "initializing": "Initializing research",
-            "planning_node": "Planning sub-questions",
-            "idle": "Waiting for review",
-            "searching": "Searching the web",
-            "query_decision": "Evaluating queries",
-            "synthesizing": "Synthesizing results",
-            "node_sufficiency": "Checking evidence sufficiency",
-            "decomposing": "Decomposing into sub-tasks",
-            "run_sufficiency": "Checking overall sufficiency",
-            "writing_report": "Writing report",
-            "binding_context": "Loading context files",
-            "paused": "Paused",
-        }
         phase = str(payload.get("phase", "")).strip()
-        label = _phase_labels.get(phase, phase or "Processing")
         sq = str(payload.get("sub_question", "")).strip()
         query = str(payload.get("query", "")).strip()
         if query:
-            return f"{label}: {query}"
+            return f"Still working ({phase or 'processing'}): {query}"
         if sq:
-            return f"{label}: {sq}"
-        return f"{label}."
+            return f"Still working ({phase or 'processing'}): {sq}"
+        return f"Still working ({phase or 'processing'})."
     return et.replace("_", " ").strip().capitalize()
 
 
@@ -796,12 +629,6 @@ def _raise_on_idempotency_state(state: str) -> None:
                 "message": "Idempotency key reused with different payload.",
             },
         )
-
-
-@app.post("/api/intent/live", response_model=LiveIntentResponse)
-def live_intent(req: LiveIntentRequest, request: Request) -> LiveIntentResponse:
-    _require_user(request)
-    return live_intent_classifier.classify(req.text)
 
 
 @app.post("/api/runs", response_model=CreateRunResponse)
@@ -2085,375 +1912,3 @@ def select_report_version(
     if not result:
         raise HTTPException(status_code=404, detail="No report versions available")
     return {"run_id": run_id, **result}
-
-
-# ---------------------------------------------------------------------------
-# Telemetry ingestion endpoint
-# ---------------------------------------------------------------------------
-
-class TelemetryBatch(BaseModel):
-    session_id: str = ""
-    events: List[Dict[str, Any]] = []
-
-
-@app.post("/api/telemetry")
-def ingest_telemetry(batch: TelemetryBatch, request: Request) -> dict:
-    """Accept a batch of frontend telemetry events.
-
-    Events are written to:
-    1. The matching session log (if session_id maps to an active session).
-    2. The global server log.
-    """
-    trace_id = getattr(request.state, "trace_id", "")
-    session_log = None
-    if batch.session_id:
-        session_log = run_manager.get_session_logger(batch.session_id)
-    count = 0
-    for evt in batch.events:
-        if not isinstance(evt, dict):
-            continue
-        evt.setdefault("trace_id", trace_id)
-        msg = evt.get("type", "frontend_event")
-        if session_log is not None:
-            session_log.info(
-                f"frontend:{msg}",
-                stage="frontend",
-                trace_id=evt.get("trace_id", trace_id),
-                **{k: v for k, v in evt.items() if k not in ("type", "trace_id")},
-            )
-        _server_log.debug(
-            "telemetry %s sid=%s",
-            msg,
-            batch.session_id or "-",
-            extra={"structured": {"event": evt, "session_id": batch.session_id}},
-        )
-        count += 1
-    return {"accepted": count}
-
-
-# ---------------------------------------------------------------------------
-# Observability dashboard — page route + 2 read-only API endpoints
-# ---------------------------------------------------------------------------
-
-_SESSIONS_LOG_DIR = PROJECT_ROOT / "logs" / "sessions"
-
-
-def _categorize_event(message: str, level: str) -> str:
-    """Classify a log entry into a display category."""
-    if level == "ERROR":
-        return "error"
-    msg = message.lower()
-    if msg.startswith("llm_call"):
-        return "llm_call"
-    if "search" in msg and ("completed" in msg or "started" in msg):
-        return "search"
-    if msg.startswith("frontend:"):
-        return "frontend"
-    if msg.startswith("agent_event:"):
-        return "agent_event"
-    return "lifecycle"
-
-
-def _infer_status_from_message(message: str) -> str:
-    """Best-effort status inference from a log message string."""
-    msg = message.lower()
-    if "run_completed" in msg or "run_execute_end" in msg:
-        return "completed"
-    if "run_started" in msg or "run_execute_start" in msg:
-        return "running"
-    if "failed" in msg or "error" in msg:
-        return "failed"
-    return "unknown"
-
-
-def _safe_read_first_last(filepath: Path):
-    """Read first and last few JSON lines from a log file efficiently."""
-    first_line = None
-    last_lines = []
-    try:
-        with open(filepath, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                if first_line is None:
-                    first_line = line
-                last_lines.append(line)
-                if len(last_lines) > 10:
-                    last_lines.pop(0)
-    except Exception:
-        pass
-    first_obj = None
-    if first_line:
-        try:
-            first_obj = json.loads(first_line)
-        except Exception:
-            pass
-    # Scan last N lines to find the best status
-    last_status = "unknown"
-    for raw in reversed(last_lines):
-        try:
-            obj = json.loads(raw)
-            s = _infer_status_from_message(obj.get("message", ""))
-            if s != "unknown":
-                last_status = s
-                break
-        except Exception:
-            pass
-    return first_obj, last_status
-
-
-@app.get("/observability", response_class=HTMLResponse)
-def observability_page(request: Request) -> HTMLResponse:
-    """Serve the observability dashboard page."""
-    user = _require_user(request)
-    return templates.TemplateResponse(
-        request,
-        "observability.html",
-        {
-            "user_email": user.email or user.user_id,
-            "asset_v": _BOOT_TS,
-        },
-    )
-
-
-@app.get("/api/observability/sessions")
-def list_observability_sessions(request: Request) -> dict:
-    """Return metadata for all session log files."""
-    _require_user(request)
-    result = []
-    if not _SESSIONS_LOG_DIR.is_dir():
-        return {"sessions": result}
-
-    for fp in sorted(_SESSIONS_LOG_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        if not fp.name.endswith(".log"):
-            continue
-        stat = fp.stat()
-        first_obj, last_status = _safe_read_first_last(fp)
-
-        session_id = fp.stem
-        task = ""
-        status = last_status
-        entry_count = 0
-
-        if first_obj:
-            payload = first_obj.get("event_payload") or {}
-            task = payload.get("task", "")
-
-        # count lines (fast scan)
-        try:
-            with open(fp, "r", encoding="utf-8") as fh:
-                entry_count = sum(1 for ln in fh if ln.strip())
-        except Exception:
-            pass
-
-        result.append({
-            "session_id": session_id,
-            "file_size": stat.st_size,
-            "modified_at": time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(stat.st_mtime)
-            ),
-            "task": task,
-            "entry_count": entry_count,
-            "status": status,
-        })
-
-    return {"sessions": result}
-
-
-def _truncate_str(val, limit: int = 200):
-    """Truncate string values for summary display."""
-    if isinstance(val, str) and len(val) > limit:
-        return val[:limit] + "…"
-    return val
-
-
-def _summarize_detail(obj: dict, full: bool = False) -> dict:
-    """Return a summary of an entry's detail payload.
-
-    If full=True, return the raw dict without truncation.
-    """
-    if full:
-        return obj
-    out = {}
-    for k, v in obj.items():
-        if isinstance(v, str):
-            out[k] = _truncate_str(v)
-        elif isinstance(v, dict):
-            # recurse one level
-            inner = {}
-            for ik, iv in v.items():
-                inner[ik] = _truncate_str(iv) if isinstance(iv, str) else iv
-            out[k] = inner
-        elif isinstance(v, list) and len(v) > 5 and not full:
-            out[k] = v[:5]
-        else:
-            out[k] = v
-    return out
-
-
-@app.get("/api/observability/sessions/{session_id}/trace")
-def get_observability_trace(
-    session_id: str,
-    request: Request,
-    full: bool = Query(False),
-):
-    """Parse a session log file and return structured trace data."""
-    _require_user(request)
-
-    t_start = time.monotonic()
-
-    fp = _SESSIONS_LOG_DIR / f"{session_id}.log"
-    if not fp.is_file():
-        raise HTTPException(status_code=404, detail="session log not found")
-
-    entries = []
-    raw_lines = []
-    try:
-        with open(fp, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                    raw_lines.append(obj)
-                except Exception:
-                    continue
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-    t_file_read = time.monotonic()
-
-    if not raw_lines:
-        raise HTTPException(status_code=404, detail="empty session log")
-
-    from datetime import datetime, timezone
-
-    first_ts = None
-    task = ""
-    status = "unknown"
-
-    # Parse first timestamp
-    first_obj = raw_lines[0]
-    try:
-        first_ts = datetime.fromisoformat(first_obj["ts"])
-    except Exception:
-        first_ts = None
-
-    payload0 = first_obj.get("event_payload") or {}
-    task = payload0.get("task", "")
-
-    # Infer status from last entry
-    last_obj = raw_lines[-1]
-    status = _infer_status_from_message(last_obj.get("message", ""))
-
-    # Aggregate stats
-    llm_calls = 0
-    searches = 0
-    total_tokens = 0
-    total_llm_ms = 0.0
-    total_search_ms = 0.0
-
-    for obj in raw_lines:
-        msg = obj.get("message", "")
-        cat = _categorize_event(msg, obj.get("level", "INFO"))
-        dur = obj.get("duration_ms")
-
-        # offset
-        offset_ms = None
-        if first_ts:
-            try:
-                cur_ts = datetime.fromisoformat(obj["ts"])
-                offset_ms = (cur_ts - first_ts).total_seconds() * 1000
-            except Exception:
-                offset_ms = None
-
-        # tokens
-        tok = obj.get("tokens")
-        entry_tokens = None
-        if isinstance(tok, dict):
-            entry_tokens = tok.get("total_tokens")
-
-        # Build detail from the full object, minus known top-level keys
-        detail_keys_exclude = {"ts", "level", "logger", "message", "session_id", "stage", "node_id", "trace_id"}
-        detail = {k: v for k, v in obj.items() if k not in detail_keys_exclude}
-        detail = _summarize_detail(detail, full=full)
-
-        entries.append({
-            "ts": obj.get("ts", ""),
-            "offset_ms": round(offset_ms, 1) if offset_ms is not None else None,
-            "message": msg,
-            "level": obj.get("level", "INFO"),
-            "stage": obj.get("stage", ""),
-            "node_id": obj.get("node_id", ""),
-            "duration_ms": round(dur, 1) if dur is not None else None,
-            "tokens": entry_tokens,
-            "category": cat,
-            "detail": detail,
-        })
-
-        # stats
-        if cat == "llm_call":
-            llm_calls += 1
-            if dur:
-                total_llm_ms += dur
-            if entry_tokens:
-                total_tokens += entry_tokens
-        elif cat == "search":
-            searches += 1
-            if dur:
-                total_search_ms += dur
-
-    total_duration_ms = None
-    if first_ts and len(raw_lines) > 1:
-        try:
-            last_ts = datetime.fromisoformat(raw_lines[-1]["ts"])
-            total_duration_ms = round((last_ts - first_ts).total_seconds() * 1000, 1)
-        except Exception:
-            pass
-
-    t_parse = time.monotonic()
-
-    body = {
-        "session_id": session_id,
-        "task": task,
-        "status": status,
-        "total_duration_ms": total_duration_ms,
-        "summary": {
-            "llm_calls": llm_calls,
-            "searches": searches,
-            "total_tokens": total_tokens,
-            "total_llm_ms": round(total_llm_ms, 1),
-            "total_search_ms": round(total_search_ms, 1),
-            "events": len(entries),
-            "response_size_bytes": None,  # patched below after serialization
-        },
-        "entries": entries,
-    }
-
-    t_end = time.monotonic()
-
-    # Serialize once, measure size from that serialization
-    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    body["summary"]["response_size_bytes"] = len(body_bytes)
-    # Re-serialize with the patched size (cheap — only summary field changed)
-    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-
-    file_read_ms = round((t_file_read - t_start) * 1000, 2)
-    parse_ms = round((t_parse - t_file_read) * 1000, 2)
-    total_ms = round((t_end - t_start) * 1000, 2)
-    server_timing = (
-        f"total;dur={total_ms}, "
-        f"file_read;dur={file_read_ms}, "
-        f"parse;dur={parse_ms}"
-    )
-
-    return Response(
-        content=body_bytes,
-        media_type="application/json",
-        headers={
-            "Server-Timing": server_timing,
-            "Access-Control-Expose-Headers": "Server-Timing",
-        },
-    )

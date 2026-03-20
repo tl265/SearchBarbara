@@ -619,11 +619,12 @@ def load_pricing_config(
 
 
 class LLM:
-    def __init__(self, model: str, usage_tracker: UsageTracker | None = None) -> None:
+    def __init__(self, model: str, usage_tracker: UsageTracker | None = None, session_logger: Any = None) -> None:
         self.client = OpenAI()
         self.model = model
         self.max_retries = 3
         self.usage_tracker = usage_tracker
+        self._session_logger = session_logger
         logger.info(
             "[LLM_INIT] model=%s base_url=%s",
             self.model, self.client.base_url,
@@ -699,6 +700,35 @@ class LLM:
                         attempt=attempt + 1,
                         metadata=metadata,
                     )
+                # --- session logger: record full prompt/response ---
+                if self._session_logger is not None:
+                    usage_obj = getattr(rsp, "usage", None)
+                    token_info = {}
+                    if usage_obj:
+                        token_info = {
+                            "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                            "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+                            "total_tokens": getattr(usage_obj, "total_tokens", 0),
+                        }
+                    resp_content = ""
+                    try:
+                        resp_content = rsp.choices[0].message.content or ""
+                    except Exception:
+                        pass
+                    self._session_logger.info(
+                        f"llm_call:{stage}",
+                        stage=stage,
+                        duration_ms=elapsed * 1000,
+                        input_data={"model": self.model, "messages": messages},
+                        output_data={
+                            "content": resp_content[:8000],
+                            "finish_reason": getattr(
+                                rsp.choices[0], "finish_reason", ""
+                            ) if rsp.choices else "",
+                        },
+                        tokens=token_info,
+                        attempt=attempt + 1,
+                    )
                 return rsp
             except RateLimitError as exc:
                 last_exc = exc
@@ -720,10 +750,11 @@ class LLM:
 
 
 class WebSearch:
-    def __init__(self, model: str, usage_tracker: UsageTracker | None = None) -> None:
+    def __init__(self, model: str, usage_tracker: UsageTracker | None = None, session_logger: Any = None) -> None:
         self.client = OpenAI()
         self.model = model
         self.usage_tracker = usage_tracker
+        self._session_logger = session_logger
         tool_types = os.getenv(
             "OPENAI_WEB_SEARCH_TOOL_TYPES", "web_search"
         )
@@ -796,7 +827,7 @@ class WebSearch:
                         },
                     )
                 items = data.get("results", [])[:k]
-                return [
+                results = [
                     SearchResult(
                         title=i.get("title", ""),
                         snippet=i.get("snippet", ""),
@@ -806,6 +837,22 @@ class WebSearch:
                     if isinstance(i, dict)
                     and is_valid_absolute_http_url(i.get("url", ""))
                 ]
+                # --- session logger: record search results ---
+                if self._session_logger is not None:
+                    self._session_logger.info(
+                        "search_completed",
+                        stage="web_search",
+                        duration_ms=elapsed * 1000,
+                        input_data={"query": query, "k": k, "tool_type": tool_type},
+                        output_data={
+                            "results_count": len(results),
+                            "results": [
+                                {"title": r.title, "url": r.url, "snippet": r.snippet[:300]}
+                                for r in results
+                            ],
+                        },
+                    )
+                return results
             except Exception as exc:
                 logger.error(
                     "[SEARCH] FAILED: tool=%s query=%r error=%s",
@@ -888,6 +935,7 @@ class DeepResearchAgent:
         should_abort: Optional[Callable[[], bool]] = None,
         user_context_bundle: Optional[Dict[str, Any]] = None,
         planning_seed: Optional[Dict[str, Any]] = None,
+        session_logger: Any = None,
     ) -> None:
         pricing_error = ""
         if cost_estimate_enabled:
@@ -936,10 +984,10 @@ class DeepResearchAgent:
             pricing_default=pricing_default,
             search_query_pricing=search_query_pricing,
         )
-        self.llm = LLM(model=model, usage_tracker=self.usage_tracker)
-        self.decompose_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
-        self.report_llm = LLM(model=report_model, usage_tracker=self.usage_tracker)
-        self.search = WebSearch(model=model, usage_tracker=self.usage_tracker)
+        self.llm = LLM(model=model, usage_tracker=self.usage_tracker, session_logger=session_logger)
+        self.decompose_llm = LLM(model=report_model, usage_tracker=self.usage_tracker, session_logger=session_logger)
+        self.report_llm = LLM(model=report_model, usage_tracker=self.usage_tracker, session_logger=session_logger)
+        self.search = WebSearch(model=model, usage_tracker=self.usage_tracker, session_logger=session_logger)
         self.max_depth = max(1, int(max_depth))
         self.max_rounds = max_rounds
         self.results_per_query = results_per_query
@@ -960,6 +1008,7 @@ class DeepResearchAgent:
             else {"available": False, "aggregate_digest": {}, "files": []}
         )
         self.planning_seed = planning_seed if isinstance(planning_seed, dict) else {}
+        self._session_logger = session_logger
         self.source_policy = load_source_policy()
         self.search_policy = load_search_policy()
         self.decompose_policy = load_decompose_policy()
@@ -4272,6 +4321,18 @@ Runtime context (authoritative):
             raise RuntimeError("Run aborted by user")
 
     def _emit(self, event_type: str, payload: Dict[str, Any]) -> None:
+        # --- session logger ---
+        if self._session_logger is not None:
+            try:
+                node_id = str(payload.get("node_id", ""))
+                self._session_logger.info(
+                    f"agent_event:{event_type}",
+                    stage=event_type,
+                    node_id=node_id,
+                    event_payload=payload,
+                )
+            except Exception:
+                pass
         if not self.event_callback:
             return
         event = {
