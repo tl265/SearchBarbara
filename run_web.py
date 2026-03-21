@@ -1,9 +1,13 @@
 import os
+from pathlib import Path
+
 import uvicorn
+from dotenv import load_dotenv
 
 from infra.observability import setup_global_logger
 from infra.observability.cleanup import cleanup_old_session_logs
 
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 if __name__ == "__main__":
     log = setup_global_logger()

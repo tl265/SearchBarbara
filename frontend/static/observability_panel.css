@@ -1,0 +1,372 @@
+/* ── Observability Panel (embedded in main page) ── */
+
+/* ── Panel header ── */
+.obs-panel .obs-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  flex: 0 0 auto;
+}
+.obs-panel .obs-panel-header h2 {
+  font-size: 14px;
+  font-weight: 600;
+  margin: 0;
+}
+
+/* ── Status badges ── */
+.obs-panel .obs-status-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.obs-panel .obs-status-badge.completed { background: #dde7dd; color: #5a7a5a; }
+.obs-panel .obs-status-badge.running   { background: #dde4e8; color: #5a7a8a; }
+.obs-panel .obs-status-badge.failed    { background: #e8dddd; color: #8c4a4a; }
+.obs-panel .obs-status-badge.unknown   { background: #e4e4e4; color: #7a7a7a; }
+
+/* ── Main trace area ── */
+.obs-panel .obs-panel-main {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  min-height: 0;
+}
+
+/* ── Placeholder ── */
+.obs-panel .obs-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  min-height: 120px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* ── Loading / empty ── */
+.obs-panel .obs-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 30px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.obs-panel .obs-empty {
+  text-align: center;
+  padding: 30px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ── Summary bar ── */
+.obs-panel .obs-summary {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+}
+.obs-panel .obs-summary-task {
+  font-size: 13px;
+  font-weight: 600;
+  margin-bottom: 6px;
+  word-break: break-all;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.obs-panel .obs-summary-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.obs-panel .obs-metric {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--bg);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+.obs-panel .obs-metric strong {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+/* ── Filter bar ── */
+.obs-panel .obs-filters {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--card);
+  flex-wrap: wrap;
+}
+.obs-panel .obs-filter-btn {
+  padding: 2px 7px;
+  font-size: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted);
+  transition: all 0.15s;
+}
+.obs-panel .obs-filter-btn:hover {
+  background: var(--bg);
+}
+.obs-panel .obs-filter-btn.active {
+  background: var(--running);
+  color: #fff;
+  border-color: var(--running);
+}
+.obs-panel .obs-filter-search {
+  margin-left: auto;
+  padding: 2px 6px;
+  font-size: 10px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  outline: none;
+  width: 120px;
+  background: #fff;
+}
+.obs-panel .obs-filter-search:focus {
+  border-color: var(--running);
+}
+.obs-panel .obs-legend {
+  display: none; /* legend is too wide for 420px panel */
+}
+
+/* ── Timeline table ── */
+.obs-panel .obs-timeline-wrap {
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+.obs-panel .obs-timeline {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  table-layout: fixed;
+}
+.obs-panel .obs-timeline th {
+  position: sticky;
+  top: 0;
+  background: var(--card);
+  border-bottom: 1px solid var(--line);
+  padding: 4px 6px;
+  text-align: left;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  z-index: 5;
+}
+.obs-panel .obs-timeline th:nth-child(1) { width: 56px; }
+.obs-panel .obs-timeline th:nth-child(2) { width: auto; }
+.obs-panel .obs-timeline th:nth-child(3) { width: 48px; }
+.obs-panel .obs-timeline th:nth-child(4) { width: 100px; }
+
+.obs-panel .obs-timeline td {
+  padding: 3px 6px;
+  border-bottom: 1px solid #ececec;
+  vertical-align: middle;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.obs-panel .obs-timeline tr {
+  cursor: pointer;
+  transition: background 0.1s;
+}
+.obs-panel .obs-timeline tr:hover { background: #f5f5f5; }
+.obs-panel .obs-timeline tr.expanded { background: #eef3f7; }
+.obs-panel .obs-timeline tr.obs-group-header { font-weight: 600; }
+.obs-panel .obs-timeline tr.obs-group-header td:nth-child(2) { cursor: pointer; }
+
+/* Indent by node depth */
+.obs-panel .obs-indent-0 { padding-left: 6px !important; }
+.obs-panel .obs-indent-1 { padding-left: 18px !important; }
+.obs-panel .obs-indent-2 { padding-left: 30px !important; }
+.obs-panel .obs-indent-3 { padding-left: 42px !important; }
+.obs-panel .obs-indent-4 { padding-left: 54px !important; }
+
+/* ── Duration bar ── */
+.obs-panel .obs-bar-cell { position: relative; }
+.obs-panel .obs-bar {
+  display: inline-block;
+  height: 12px;
+  border-radius: 2px;
+  min-width: 2px;
+  vertical-align: middle;
+}
+.obs-panel .obs-bar.cat-llm_call    { background: var(--running); }
+.obs-panel .obs-bar.cat-search       { background: var(--success); }
+.obs-panel .obs-bar.cat-lifecycle    { background: #bbb; }
+.obs-panel .obs-bar.cat-error        { background: var(--failed); }
+.obs-panel .obs-bar.cat-frontend     { background: #b87333; }
+.obs-panel .obs-bar.cat-agent_event  { background: #9a8ec2; }
+
+.obs-panel .obs-dot {
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  vertical-align: middle;
+}
+.obs-panel .obs-dot.cat-llm_call    { background: var(--running); }
+.obs-panel .obs-dot.cat-search       { background: var(--success); }
+.obs-panel .obs-dot.cat-lifecycle    { background: #bbb; }
+.obs-panel .obs-dot.cat-error        { background: var(--failed); }
+.obs-panel .obs-dot.cat-frontend     { background: #b87333; }
+.obs-panel .obs-dot.cat-agent_event  { background: #9a8ec2; }
+
+.obs-panel .obs-bar-label {
+  font-size: 9px;
+  color: var(--muted);
+  margin-left: 3px;
+}
+
+/* ── Detail panel (expanded row) ── */
+.obs-panel .obs-detail-row td {
+  padding: 0 !important;
+  border-bottom: 1px solid var(--line) !important;
+}
+.obs-panel .obs-detail-panel {
+  background: #f7f8fa;
+  padding: 8px 10px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.obs-panel .obs-detail-panel pre {
+  font-size: 10px;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 8px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+.obs-panel .obs-copy-btn {
+  float: right;
+  padding: 2px 6px;
+  font-size: 10px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: var(--card);
+  cursor: pointer;
+  margin-bottom: 4px;
+}
+.obs-panel .obs-copy-btn:hover {
+  background: var(--bg);
+}
+
+/* ── Performance Bar (pinned to panel bottom) ── */
+.obs-panel .obs-panel-perfbar {
+  flex: 0 0 auto;
+  border-top: 1px solid var(--line);
+  background: var(--card);
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+  font-size: 11px;
+  color: var(--ink);
+}
+.obs-panel .obs-perfbar-row {
+  display: flex;
+  align-items: center;
+  height: 28px;
+  padding: 0 10px;
+  gap: 3px;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.obs-panel .obs-perfbar-label {
+  font-weight: 600;
+  margin-right: 4px;
+  flex-shrink: 0;
+}
+.obs-panel .obs-perfbar-sep {
+  color: var(--line);
+  margin: 0 4px;
+  flex-shrink: 0;
+}
+.obs-panel .obs-perfbar-item {
+  flex-shrink: 0;
+}
+.obs-panel .obs-perfbar-item .obs-perf-key {
+  color: var(--muted);
+  margin-right: 2px;
+}
+.obs-panel .obs-perfbar-item .obs-perf-val {
+  font-weight: 600;
+}
+.obs-panel .obs-perfbar-item .obs-perf-sub {
+  color: var(--muted);
+  font-size: 10px;
+}
+
+/* Color coding for timing values */
+.obs-panel .obs-perf-green  { color: #3a7a3a; }
+.obs-panel .obs-perf-yellow { color: #9a7a20; }
+.obs-panel .obs-perf-red    { color: #a03030; }
+
+/* History toggle button */
+.obs-panel .obs-perfbar-history-btn {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 1px 6px;
+  font-size: 10px;
+  font-family: inherit;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  color: var(--muted);
+  transition: background 0.15s;
+}
+.obs-panel .obs-perfbar-history-btn:hover {
+  background: var(--bg);
+}
+
+/* History table (expandable) */
+.obs-panel .obs-perfbar-history {
+  max-height: 200px;
+  overflow-y: auto;
+  border-top: 1px solid var(--line);
+  display: none;
+}
+.obs-panel .obs-perfbar-history.open {
+  display: block;
+}
+.obs-panel .obs-perfbar-history table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 10px;
+  font-family: "IBM Plex Mono", "Menlo", monospace;
+}
+.obs-panel .obs-perfbar-history th {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  padding: 3px 6px;
+  text-align: left;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.obs-panel .obs-perfbar-history td {
+  padding: 2px 6px;
+  border-bottom: 1px solid #ececec;
+  white-space: nowrap;
+}
+.obs-panel .obs-perfbar-history tr:hover {
+  background: #f5f5f5;
+}

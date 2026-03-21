@@ -3509,6 +3509,11 @@ async function openSession(runId, opts = {}) {
   }
   clearLiveIntent();
   currentRunId = sid;
+  try {
+    document.dispatchEvent(new CustomEvent("sb:session-selected", {
+      detail: { sessionId: sid }
+    }));
+  } catch (_) {}
   if (typeof SBTelemetry !== "undefined") SBTelemetry.setSession(sid);
   if (appMainEl) appMainEl.classList.remove("is-empty");
   pauseRequested = false;
