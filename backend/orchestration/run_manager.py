@@ -1,7 +1,6 @@
 import json
 import copy
 import hashlib
-import logging
 import mimetypes
 import io
 import os
@@ -26,9 +25,6 @@ from agents.deep_research import (
     slugify_for_filename,
 )
 from backend.core.models import RunState, SessionSummary
-from infra.observability import setup_global_logger, SessionLogger
-
-log = logging.getLogger("searchbarbara.run_manager")
 
 
 def _now() -> datetime:
@@ -87,7 +83,6 @@ class RunManager:
         )
         self._index_writer_thread.start()
         self._lock_debug = str(os.getenv("RUN_MANAGER_LOCK_DEBUG", "0")).strip() in {"1", "true", "yes"}
-        self._session_loggers: Dict[str, SessionLogger] = {}
         self._lock_wait_warn_ms = float(os.getenv("RUN_MANAGER_LOCK_WAIT_WARN_MS", "120"))
         self._lock_hold_warn_ms = float(os.getenv("RUN_MANAGER_LOCK_HOLD_WARN_MS", "150"))
         self._lock_owner_section: str = ""
@@ -143,12 +138,6 @@ class RunManager:
         }
         self._maybe_migrate_legacy_sessions_index_to_shards()
         self._bootstrap_sessions_from_disk()
-
-    # -- session logger helpers -------------------------------------------
-
-    def get_session_logger(self, session_id: str) -> Optional[SessionLogger]:
-        """Return the active SessionLogger for *session_id*, or None."""
-        return self._session_loggers.get(session_id)
 
     def create_run(
         self,
@@ -507,18 +496,26 @@ class RunManager:
                     "expires_at_ts": now + max(1, int(ttl_sec)),
                     "response_payload": None,
                 }
-                log.debug("idempotency scope=%s state=new key=%s", clean_scope, clean_key[:12])
+                print(
+                    f"[idempotency] scope={clean_scope} state=new key={clean_key[:12]}"
+                )
                 return {"state": "new"}
             if str(existing.get("request_hash", "")) != req_hash:
-                log.debug("idempotency scope=%s state=mismatch key=%s", clean_scope, clean_key[:12])
+                print(
+                    f"[idempotency] scope={clean_scope} state=mismatch key={clean_key[:12]}"
+                )
                 return {"state": "mismatch"}
             if str(existing.get("status", "")) == "completed":
-                log.debug("idempotency scope=%s state=replay key=%s", clean_scope, clean_key[:12])
+                print(
+                    f"[idempotency] scope={clean_scope} state=replay key={clean_key[:12]}"
+                )
                 return {
                     "state": "replay",
                     "payload": copy.deepcopy(existing.get("response_payload") or {}),
                 }
-            log.debug("idempotency scope=%s state=in_progress key=%s", clean_scope, clean_key[:12])
+            print(
+                f"[idempotency] scope={clean_scope} state=in_progress key={clean_key[:12]}"
+            )
             return {"state": "in_progress"}
 
     def idempotency_complete(
@@ -2902,7 +2899,7 @@ class RunManager:
                 try:
                     self._persist_run_state_locked(state)
                 except Exception as exc:
-                    log.error("report checkpoint persistence failed: %s", exc)
+                    print(f"[state] report checkpoint persistence failed: {exc}")
 
             with self._lock:
                 self._sync_session_from_state_locked(state)
@@ -2930,7 +2927,7 @@ class RunManager:
             self._lock_owner_thread_id = int(threading.get_ident())
             self._lock_owner_acquired_at = time.perf_counter()
         if self._lock_debug and wait_ms >= self._lock_wait_warn_ms:
-            log.debug("lock wait %.1fms section=%s", wait_ms, section)
+            print(f"[lock] wait {wait_ms:.1f}ms section={section}")
         return acquired, time.perf_counter()
 
     def _lock_release(self, section: str, acquired_at: Optional[float] = None) -> None:
@@ -2938,7 +2935,7 @@ class RunManager:
         if acquired_at is not None:
             hold_ms = (time.perf_counter() - acquired_at) * 1000.0
         if self._lock_debug and acquired_at is not None and hold_ms >= self._lock_hold_warn_ms:
-            log.debug("lock hold %.1fms section=%s", hold_ms, section)
+            print(f"[lock] hold {hold_ms:.1f}ms section={section}")
         self._lock_owner_section = ""
         self._lock_owner_thread_id = 0
         self._lock_owner_acquired_at = 0.0
@@ -3644,11 +3641,6 @@ class RunManager:
         snapshot = self.get_snapshot(run_id)
         if not snapshot:
             return
-        # --- Session logger ---
-        session_log = SessionLogger(session_id=run_id)
-        self._session_loggers[run_id] = session_log
-        session_log.info("event:run_execute_start", stage="run_started",
-                         event_payload={"task": snapshot.task, "model": snapshot.model})
         session_lock = self._session_lock_for(run_id)
         task = snapshot.task
         runs_dir = Path("runs")
@@ -3765,12 +3757,6 @@ class RunManager:
 
         def callback(event: Dict[str, Any]) -> None:
             set_phase(str(event.get("event_type", "")), event.get("payload", {}))
-            event_type = str(event.get("event_type", ""))
-            session_log.info(
-                f"event:{event_type}",
-                stage=event_type,
-                event_payload=event.get("payload"),
-            )
             self._publish_event(run_id, event)
 
         paused_announced = False
@@ -4040,7 +4026,6 @@ class RunManager:
                 should_abort=should_abort,
                 user_context_bundle=user_context_bundle,
                 planning_seed=planning_seed if run_phase == "research" else None,
-                session_logger=session_log,
             )
         except Exception as exc:
             finalize_run_failure(str(exc))
@@ -4540,9 +4525,6 @@ class RunManager:
         finally:
             heartbeat_stop.set()
             heartbeat_thread.join(timeout=1.0)
-            session_log.info("event:run_execute_end", stage="run_ended")
-            session_log.close()
-            self._session_loggers.pop(run_id, None)
 
     def _best_effort_usage_snapshot(self, snapshot: RunState) -> Optional[Dict[str, Any]]:
         if isinstance(snapshot.token_usage, dict):
@@ -4960,7 +4942,7 @@ class RunManager:
                         self._save_sessions_index_manifest()
                 except Exception as exc:
                     # Keep session/runs in memory even if persistence is temporarily unavailable.
-                    log.warning("index flush failed owner=%s: %s", owner_key, exc)
+                    print(f"[sessions] index flush failed owner={owner_key}: {exc}")
 
     def _should_flush_sessions_index(self, event_type: str) -> bool:
         if event_type in {
@@ -5148,10 +5130,12 @@ class RunManager:
                 tmp.replace(path)
             except Exception as exc:
                 migration_failed = True
-                log.warning("shard migration write failed owner=%s: %s", owner_key, exc)
+                print(f"[sessions] shard migration write failed owner={owner_key}: {exc}")
         if migration_failed:
             self._sessions_index_meta["sharding_migration_done"] = False
-            log.warning("shard migration incomplete; keeping legacy sessions_index.json as fallback.")
+            print(
+                "[sessions] shard migration incomplete; keeping legacy sessions_index.json as fallback."
+            )
             return
         self._sessions_index_meta["schema_version"] = int(
             loaded.get("schema_version", self._SESSIONS_INDEX_SCHEMA_VERSION)
@@ -5169,7 +5153,7 @@ class RunManager:
         try:
             self._save_sessions_index_manifest()
         except Exception as exc:
-            log.warning("manifest write failed during migration: %s", exc)
+            print(f"[sessions] manifest write failed during migration: {exc}")
             self._sessions_index_meta["sharding_migration_done"] = False
             return
         bak = self._sessions_index_path.with_suffix(".json.bak")
@@ -5306,16 +5290,16 @@ class RunManager:
             except Exception:
                 pass
         if title_migration_needed:
-            log.info("title migration v1 applied; updated %d session titles.", migrated_titles)
+            print(f"[sessions] title migration v1 applied; updated {migrated_titles} session titles.")
         if execution_state_migration_needed:
-            log.info(
-                "execution-state migration v1 applied; updated %d sessions.",
-                migrated_execution_states,
+            print(
+                "[sessions] execution-state migration v1 applied; "
+                f"updated {migrated_execution_states} sessions."
             )
         if execution_state_backfill_v2_needed:
-            log.info(
-                "execution-state backfill v2 applied; updated %d state files.",
-                backfilled_execution_state_files,
+            print(
+                "[sessions] execution-state backfill v2 applied; "
+                f"updated {backfilled_execution_state_files} state files."
             )
 
     def _load_run_state_from_files(
