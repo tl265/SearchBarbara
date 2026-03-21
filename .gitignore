@@ -4,6 +4,7 @@ __pycache__/
 .DS_Store
 package-lock.json
 CLAUDE.md
+.claude/
 
 runs/
 reports/
