@@ -2220,13 +2220,24 @@ def observability_page(request: Request) -> HTMLResponse:
 @app.get("/api/observability/sessions")
 def list_observability_sessions(request: Request) -> dict:
     """Return metadata for all session log files."""
-    _require_user(request)
+    user = _require_user(request)
     result = []
     if not _SESSIONS_LOG_DIR.is_dir():
         return {"sessions": result}
 
+    # Filter to sessions owned by the current user
+    user_sessions = run_manager.list_sessions(owner_id=user.user_id)
+    user_session_ids = set()
+    for s in user_sessions:
+        sid = getattr(s, "session_id", None) or (s.get("session_id") if isinstance(s, dict) else None)
+        if sid:
+            user_session_ids.add(str(sid).strip())
+
     for fp in sorted(_SESSIONS_LOG_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
         if not fp.name.endswith(".log"):
+            continue
+        session_id = fp.stem
+        if session_id not in user_session_ids:
             continue
         stat = fp.stat()
         first_obj, last_status = _safe_read_first_last(fp)
@@ -2299,7 +2310,10 @@ def get_observability_trace(
     full: bool = Query(False),
 ):
     """Parse a session log file and return structured trace data."""
-    _require_user(request)
+    user = _require_user(request)
+    # Verify session belongs to current user
+    if not run_manager.get_snapshot(session_id, owner_id=user.user_id):
+        raise HTTPException(status_code=404, detail="session not found")
 
     t_start = time.monotonic()
 

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SearchBarbara</title>
   <link rel="stylesheet" href="/static/styles_v2.css?v={{ asset_v }}" />
+  <link rel="stylesheet" href="/static/observability_panel.css?v={{ asset_v }}" />
 </head>
 <body>
   <div class="app-shell">
@@ -69,6 +70,17 @@
         </div>
       </div>
       <div id="sessionList" class="session-list"></div>
+      <div class="obs-toggle-rail">
+        <button id="obsToggleBtn" class="obs-toggle-btn" type="button"
+                aria-label="Toggle observability panel" title="Observability">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"
+                  fill="none" stroke="currentColor" stroke-width="2"/>
+            <circle cx="12" cy="12" r="3" fill="none" stroke="currentColor" stroke-width="2"/>
+          </svg>
+          <span class="obs-toggle-label">Observability</span>
+        </button>
+      </div>
       <div class="auth-box auth-box-rail">
         <span class="muted">{{ user_email }}</span>
         <form method="post" action="/logout">
@@ -204,6 +216,25 @@
       </section>
     </main>
     </div>
+
+    <div id="obsResizeHandle" class="obs-resize-handle hidden"></div>
+
+    <aside id="obsPanel" class="obs-panel hidden">
+      <div class="obs-panel-header">
+        <h2>Observability</h2>
+        <button id="obsPanelCloseBtn" class="icon-btn" type="button" aria-label="Close">
+          <svg class="icon" viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M18 6 6 18M6 6l12 12" fill="none" stroke="currentColor"
+                  stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+      <div id="obsPanelMain" class="obs-panel-main">
+        <div class="obs-placeholder">Select a session to view its trace</div>
+      </div>
+      <div id="obsPanelPerfBar" class="obs-panel-perfbar"></div>
+    </aside>
+
     </div>
   </div>
   <script>
@@ -296,5 +327,6 @@
   </div>
   <script src="/static/telemetry.js?v={{ asset_v }}"></script>
   <script src="/static/app_v2.js?v={{ asset_v }}"></script>
+  <script src="/static/observability_panel.js?v={{ asset_v }}"></script>
 </body>
 </html>

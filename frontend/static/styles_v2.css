@@ -14,6 +14,7 @@
   --stopped: #7a5a3a;
   --sufficient: #5a7a6a;
   --sessions-rail-width: 300px;
+  --obs-panel-width: 420px;
   --touch-target-min: 44px;
 }
 
@@ -39,6 +40,18 @@ body {
   grid-template-columns: var(--sessions-rail-width) minmax(600px, 1fr);
   gap: 0;
   align-items: start;
+  transition: grid-template-columns 0.25s ease;
+}
+body.obs-panel-open .app-layout {
+  grid-template-columns: var(--sessions-rail-width) minmax(500px, 1fr) auto var(--obs-panel-width);
+}
+/* Disable transition during drag for snappy resize */
+body.obs-resizing .app-layout {
+  transition: none;
+}
+body.obs-resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .topbar {
@@ -1668,5 +1681,114 @@ details.node-section {
     order: 3;
     width: 100%;
     justify-content: center;
+  }
+}
+
+/* ── Observability panel (third column) ── */
+.obs-panel {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  max-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--card);
+  border-left: 1px solid var(--line);
+  overflow: hidden;
+  min-width: 0;
+}
+.obs-panel.hidden {
+  display: none;
+}
+
+/* ── Observability toggle button in session rail ── */
+.obs-toggle-rail {
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding: 6px 8px 0;
+}
+.obs-toggle-btn {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.82rem;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+.obs-toggle-btn:hover {
+  background: #ebebeb;
+  color: var(--ink);
+}
+.obs-toggle-btn .icon {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+body.obs-panel-open .obs-toggle-btn {
+  background: #e2e8ed;
+  color: var(--ink);
+  border-color: var(--running);
+}
+body.sessions-collapsed .obs-toggle-btn .obs-toggle-label {
+  display: none;
+}
+body.sessions-collapsed .obs-toggle-btn {
+  justify-content: center;
+  padding: 6px;
+}
+
+/* ── Resize handle between main content and obs panel ── */
+.obs-resize-handle {
+  width: 5px;
+  cursor: col-resize;
+  background: transparent;
+  position: relative;
+  z-index: 10;
+  flex-shrink: 0;
+  /* Span full viewport height inside the grid */
+  height: 100vh;
+  position: sticky;
+  top: 0;
+}
+.obs-resize-handle::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 1px;
+  width: 3px;
+  height: 100%;
+  border-radius: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.obs-resize-handle:hover::after,
+.obs-resize-handle.is-dragging::after {
+  background: var(--running);
+}
+.obs-resize-handle.hidden {
+  display: none;
+}
+
+/* ── Responsive: obs panel as overlay on narrow screens ── */
+@media (max-width: 1024px) {
+  .obs-resize-handle {
+    display: none !important;
+  }
+  .obs-panel:not(.hidden) {
+    position: fixed;
+    right: 0;
+    top: 0;
+    z-index: 8000;
+    width: var(--obs-panel-width);
+    box-shadow: -4px 0 16px rgba(0, 0, 0, 0.15);
+  }
+  body.obs-panel-open .app-layout {
+    grid-template-columns: var(--sessions-rail-width) minmax(600px, 1fr);
   }
 }
