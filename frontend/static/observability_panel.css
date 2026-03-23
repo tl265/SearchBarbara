@@ -208,6 +208,7 @@
 }
 .obs-panel .obs-bar.cat-llm_call    { background: var(--running); }
 .obs-panel .obs-bar.cat-search       { background: var(--success); }
+.obs-panel .obs-bar.cat-report       { background: #e6853e; }
 .obs-panel .obs-bar.cat-lifecycle    { background: #bbb; }
 .obs-panel .obs-bar.cat-error        { background: var(--failed); }
 .obs-panel .obs-bar.cat-frontend     { background: #b87333; }
@@ -222,6 +223,7 @@
 }
 .obs-panel .obs-dot.cat-llm_call    { background: var(--running); }
 .obs-panel .obs-dot.cat-search       { background: var(--success); }
+.obs-panel .obs-dot.cat-report       { background: #e6853e; }
 .obs-panel .obs-dot.cat-lifecycle    { background: #bbb; }
 .obs-panel .obs-dot.cat-error        { background: var(--failed); }
 .obs-panel .obs-dot.cat-frontend     { background: #b87333; }
@@ -278,6 +280,35 @@
   font-family: "IBM Plex Mono", "Menlo", monospace;
   font-size: 11px;
   color: var(--ink);
+  overflow-y: auto;
+  min-height: 28px;
+  max-height: 80vh;
+}
+
+/* ── Perf resize handle (between main and perfbar) ── */
+.obs-perf-resize-handle {
+  flex: 0 0 5px;
+  cursor: row-resize;
+  background: transparent;
+  position: relative;
+  z-index: 2;
+}
+.obs-perf-resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 20%; right: 20%; top: 50%;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--line);
+  transition: background 0.15s;
+}
+.obs-perf-resize-handle:hover::after,
+body.obs-perf-resizing .obs-perf-resize-handle::after {
+  background: var(--accent, #4a90d9);
+}
+body.obs-perf-resizing {
+  cursor: row-resize !important;
+  user-select: none !important;
 }
 .obs-panel .obs-perfbar-row {
   display: flex;
