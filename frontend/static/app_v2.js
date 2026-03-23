@@ -3468,12 +3468,22 @@ function applySnapshot(snap) {
 }
 
 async function fetchSnapshot(runId) {
+  const _perfT0 = performance.now();
   const rsp = await fetch(`/api/sessions/${runId}`);
   if (!rsp.ok) throw new Error(`Failed to fetch snapshot: ${rsp.status}`);
+  const _perfT1 = performance.now();
   const data = await rsp.json();
-  if (String(currentRunId || "") !== String(runId || "")) return;
+  const _perfT2 = performance.now();
+  if (String(currentRunId || "") !== String(runId || "")) return null;
   applySnapshot(data);
   renderSessions();
+  const _perfT3 = performance.now();
+
+  return {
+    api_ms: _perfT1 - _perfT0,
+    parse_ms: _perfT2 - _perfT1,
+    render_ms: _perfT3 - _perfT2,
+  };
 }
 
 async function scheduleSnapshotRefresh(runId) {
@@ -3498,6 +3508,7 @@ async function scheduleSnapshotRefresh(runId) {
 }
 
 async function openSession(runId, opts = {}) {
+  const _perfT0 = performance.now();
   const sid = String(runId || "").trim();
   if (!sid) return;
   closeMobileDrawer();
@@ -3520,7 +3531,13 @@ async function openSession(runId, opts = {}) {
   abortRequested = false;
   uiClearedByAbort = false;
   if (progressLog) progressLog.innerHTML = "";
-  await fetchSnapshot(sid);
+  // Show loading state immediately before fetching
+  if (typeof renderCanvas === "function") renderCanvas({});
+  if (typeof reportRenderedEl !== "undefined" && reportRenderedEl) reportRenderedEl.innerHTML = "";
+  await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+  const _perfT1 = performance.now();
+  const _snapshotPerf = await fetchSnapshot(sid);
+  const _perfT2 = performance.now();
   setContextEnabled(true);
   clearContextPane("Loading context...");
   void scheduleContextRefresh(sid);
@@ -3534,6 +3551,24 @@ async function openSession(runId, opts = {}) {
   // and version-selection events are visible even when research is not running.
   connectEvents(sid);
   connectContextEvents(sid);
+  const _perfT3 = performance.now();
+
+  // Report page load perf to Observability Panel (single merged record)
+  if (window.ObsPanel && typeof window.ObsPanel.recordPerf === "function") {
+    var rec = {
+      action: "page_load",
+      total_ms: _perfT3 - _perfT0,
+      ui_prep_ms: _perfT1 - _perfT0,
+      snapshot_ms: _perfT2 - _perfT1,
+      connect_ms: _perfT3 - _perfT2,
+    };
+    if (_snapshotPerf) {
+      rec.api_ms = _snapshotPerf.api_ms;
+      rec.parse_ms = _snapshotPerf.parse_ms;
+      rec.render_ms = _snapshotPerf.render_ms;
+    }
+    window.ObsPanel.recordPerf(rec);
+  }
 }
 
 function connectEvents(runId) {
@@ -3704,6 +3739,11 @@ async function startRun(idempotencyKey, startMode = "research") {
     }
     currentRunId = String(data.run_id || currentRunId || "");
     if (typeof SBTelemetry !== "undefined") SBTelemetry.setSession(currentRunId);
+    try {
+      document.dispatchEvent(new CustomEvent("sb:session-selected", {
+        detail: { sessionId: currentRunId }
+      }));
+    } catch (_) {}
     if (appMainEl) appMainEl.classList.remove("is-empty");
     setRunIdInUrl(currentRunId);
     // Subscribe immediately so startup parsing events are not missed.

@@ -9,6 +9,7 @@
   var mainEl       = document.getElementById("obsPanelMain");
   var perfBarEl    = document.getElementById("obsPanelPerfBar");
   var resizeHandle = document.getElementById("obsResizeHandle");
+  var perfResizeHandle = document.getElementById("obsPerfResizeHandle");
 
   if (!panel || !toggleBtn) return; // safety: not on the right page
 
@@ -19,8 +20,8 @@
   var textFilter = "";
   var expandedRow = null;
   var collapsedGroups = {};
-  var refreshTimer = null;
   var _searchDebounceTimer = null;
+  var refreshTimer = null;
 
   // ── Resize constraints ──
   var MIN_PANEL_W = 280;
@@ -56,24 +57,7 @@
     return nodeId.split(".").length;
   }
 
-  // ── Performance helpers (ported from observability.js) ──
-
-  /** Parse Server-Timing header into { total, file_read, parse } in ms */
-  function parseServerTiming(resp) {
-    var header = resp.headers.get("Server-Timing");
-    if (!header) return null;
-    var result = {};
-    var parts = header.split(",");
-    for (var i = 0; i < parts.length; i++) {
-      var seg = parts[i].trim();
-      var nameMatch = seg.match(/^([^;]+)/);
-      var durMatch = seg.match(/dur=([\d.]+)/);
-      if (nameMatch && durMatch) {
-        result[nameMatch[1].trim()] = parseFloat(durMatch[1]);
-      }
-    }
-    return result;
-  }
+  // ── Performance helpers ──
 
   /** Color class for a timing value */
   function perfColor(ms) {
@@ -81,12 +65,6 @@
     if (ms < 100) return "obs-perf-green";
     if (ms <= 500) return "obs-perf-yellow";
     return "obs-perf-red";
-  }
-
-  /** Format KB value */
-  function fmtKB(kb) {
-    if (kb == null) return "\u2014";
-    return Math.round(kb) + "KB";
   }
 
   /** Record a perf measurement and update the bar */
@@ -106,15 +84,15 @@
       '<span class="obs-perf-val ' + perfColor(ms) + '">' + val + '</span></span>';
   }
 
-  /** Render the Performance Bar UI */
+  /** Render the Performance Bar UI — tracks middle-page (conversation + canvas) load times */
   function updatePerfBar() {
     if (!perfBarEl) return;
 
     if (!perfHistory.length) {
       perfBarEl.innerHTML = '<div class="obs-perfbar-row">' +
-        '<span class="obs-perfbar-label">\u26a1 Perf</span>' +
+        '<span class="obs-perfbar-label">\u26a1 Page Load</span>' +
         '<span class="obs-perfbar-sep">\u2502</span>' +
-        '<span style="color:var(--muted)">\u2014</span>' +
+        '<span style="color:var(--muted)">Switch a session to see load times</span>' +
         '</div>';
       return;
     }
@@ -122,42 +100,32 @@
     var latest = perfHistory[perfHistory.length - 1];
 
     var html = '<div class="obs-perfbar-row">';
-    html += '<span class="obs-perfbar-label">\u26a1 Perf</span>';
-    html += '<span class="obs-perfbar-sep">\u2502</span>';
-
-    // Action
-    html += '<span class="obs-perfbar-item"><span class="obs-perf-key">' +
-      esc(latest.action) + '</span></span>';
+    html += '<span class="obs-perfbar-label">\u26a1 Page Load</span>';
     html += '<span class="obs-perfbar-sep">\u2502</span>';
 
     // Total
     html += perfItem("Total", latest.total_ms);
     html += '<span class="obs-perfbar-sep">\u2502</span>';
 
-    // API (only for load_session)
-    if (latest.api_ms != null) {
-      var serverSub = "";
-      if (latest.server_ms && latest.server_ms.total != null) {
-        serverSub = ' <span class="obs-perf-sub">(srv:' + Math.round(latest.server_ms.total) + 'ms)</span>';
-      }
-      html += '<span class="obs-perfbar-item"><span class="obs-perf-key">API:</span> ' +
-        '<span class="obs-perf-val ' + perfColor(latest.api_ms) + '">' + Math.round(latest.api_ms) + 'ms</span>' +
-        serverSub + '</span>';
-      html += '<span class="obs-perfbar-sep">\u2502</span>';
-    }
-
-    // Render
-    html += perfItem("Render", latest.render_ms);
+    // Phase 1: UI Prep
+    html += perfItem("UI Prep", latest.ui_prep_ms);
     html += '<span class="obs-perfbar-sep">\u2502</span>';
 
-    // Rows
-    if (latest.entry_count != null) {
-      html += '<span class="obs-perfbar-item"><span class="obs-perf-key">Rows:</span> ' +
-        '<span class="obs-perf-val">' + latest.entry_count + '</span></span>';
-      html += '<span class="obs-perfbar-sep">\u2502</span>';
+    // Phase 2: Snapshot (with API/Parse/Render sub-breakdown)
+    html += perfItem("Snapshot", latest.snapshot_ms);
+    if (latest.api_ms != null) {
+      html += ' <span class="obs-perf-sub">(' +
+        'API:' + Math.round(latest.api_ms) + 'ms ' +
+        'Parse:' + Math.round(latest.parse_ms || 0) + 'ms ' +
+        'Render:' + Math.round(latest.render_ms || 0) + 'ms)</span>';
     }
+    html += '<span class="obs-perfbar-sep">\u2502</span>';
+
+    // Phase 3: Connect
+    html += perfItem("Connect", latest.connect_ms);
 
     // History toggle
+    html += '<span class="obs-perfbar-sep">\u2502</span>';
     html += '<button class="obs-perfbar-history-btn" id="obsPanelPerfHistoryToggle">' +
       'History ' + (perfHistoryOpen ? '\u25b4' : '\u25be') + '</button>';
 
@@ -166,21 +134,21 @@
     // History table
     html += '<div class="obs-perfbar-history' + (perfHistoryOpen ? ' open' : '') + '" id="obsPanelPerfHistoryPanel">';
     html += '<table><thead><tr>' +
-      '<th>Time</th><th>Action</th><th>Total</th><th>API</th><th>Server</th>' +
-      '<th>Render</th><th>Rows</th>' +
+      '<th>Time</th><th>Total</th>' +
+      '<th>UI Prep</th><th>Snapshot</th><th>API</th><th>Parse</th><th>Render</th><th>Connect</th>' +
       '</tr></thead><tbody>';
 
     for (var i = perfHistory.length - 1; i >= 0; i--) {
       var r = perfHistory[i];
-      var serverTotal = (r.server_ms && r.server_ms.total != null) ? Math.round(r.server_ms.total) + "ms" : "\u2014";
       html += '<tr>' +
         '<td>' + esc(r.timestamp) + '</td>' +
-        '<td>' + esc(r.action) + '</td>' +
         '<td class="' + perfColor(r.total_ms) + '">' + (r.total_ms != null ? Math.round(r.total_ms) + 'ms' : '\u2014') + '</td>' +
+        '<td class="' + perfColor(r.ui_prep_ms) + '">' + (r.ui_prep_ms != null ? Math.round(r.ui_prep_ms) + 'ms' : '\u2014') + '</td>' +
+        '<td class="' + perfColor(r.snapshot_ms) + '">' + (r.snapshot_ms != null ? Math.round(r.snapshot_ms) + 'ms' : '\u2014') + '</td>' +
         '<td class="' + perfColor(r.api_ms) + '">' + (r.api_ms != null ? Math.round(r.api_ms) + 'ms' : '\u2014') + '</td>' +
-        '<td>' + serverTotal + '</td>' +
+        '<td class="' + perfColor(r.parse_ms) + '">' + (r.parse_ms != null ? Math.round(r.parse_ms) + 'ms' : '\u2014') + '</td>' +
         '<td class="' + perfColor(r.render_ms) + '">' + (r.render_ms != null ? Math.round(r.render_ms) + 'ms' : '\u2014') + '</td>' +
-        '<td>' + (r.entry_count != null ? r.entry_count : '\u2014') + '</td>' +
+        '<td class="' + perfColor(r.connect_ms) + '">' + (r.connect_ms != null ? Math.round(r.connect_ms) + 'ms' : '\u2014') + '</td>' +
         '</tr>';
     }
 
@@ -289,10 +257,54 @@
     });
   }
 
-  // ── Select session & load trace (with perf timing) ──
-  async function selectSession(sid) {
-    var t0 = performance.now();
+  // ── Perf bar vertical resize drag logic ──
+  var MIN_PERF_H = 28;
+  var MAX_PERF_H = 600;
+  var PERF_H_KEY = "sb:obs-perf-height";
 
+  if (perfResizeHandle && perfBarEl) {
+    // Restore persisted height
+    var savedPerfH = parseInt(localStorage.getItem(PERF_H_KEY), 10);
+    if (savedPerfH >= MIN_PERF_H) {
+      perfBarEl.style.height = savedPerfH + "px";
+    }
+
+    var isPerfDragging = false;
+
+    perfResizeHandle.addEventListener("mousedown", function (e) {
+      e.preventDefault();
+      isPerfDragging = true;
+      document.body.classList.add("obs-perf-resizing");
+
+      var panelRect = panel.getBoundingClientRect();
+      var panelBottom = panelRect.bottom;
+
+      function onMouseMove(e) {
+        if (!isPerfDragging) return;
+        var newH = panelBottom - e.clientY;
+        if (newH < MIN_PERF_H) newH = MIN_PERF_H;
+        if (newH > MAX_PERF_H) newH = MAX_PERF_H;
+        perfBarEl.style.height = newH + "px";
+        perfBarEl.style.flex = "0 0 " + newH + "px";
+      }
+
+      function onMouseUp() {
+        isPerfDragging = false;
+        document.body.classList.remove("obs-perf-resizing");
+        document.removeEventListener("mousemove", onMouseMove);
+        document.removeEventListener("mouseup", onMouseUp);
+        // Persist height
+        var finalH = perfBarEl.offsetHeight;
+        if (finalH) localStorage.setItem(PERF_H_KEY, String(finalH));
+      }
+
+      document.addEventListener("mousemove", onMouseMove);
+      document.addEventListener("mouseup", onMouseUp);
+    });
+  }
+
+  // ── Select session & load trace ──
+  async function selectSession(sid) {
     activeSessionId = sid;
     expandedRow = null;
     collapsedGroups = {};
@@ -307,51 +319,35 @@
       var resp = await fetch(url);
       if (!resp.ok) throw new Error("HTTP " + resp.status);
 
-      var serverTiming = parseServerTiming(resp);
-      var t2 = performance.now();
-
       traceData = await resp.json();
-      var t3 = performance.now();
-
       renderTrace();
-      var t4 = performance.now();
 
-      var responseKB = null;
-      if (traceData.summary && traceData.summary.response_size_bytes != null) {
-        responseKB = traceData.summary.response_size_bytes / 1024;
-      }
-
-      recordPerf({
-        action: "load_session",
-        total_ms: t4 - t0,
-        api_ms: t2 - t0,
-        server_ms: serverTiming,
-        parse_ms: t3 - t2,
-        render_ms: t4 - t3,
-        response_kb: responseKB,
-        entry_count: (traceData.entries || []).length,
-      });
-
-      // auto-refresh if running
+      // Auto-refresh trace while session is running
       var status = (traceData.status || "").toLowerCase();
       if (status === "running" || status === "started" || status === "unknown") {
         refreshTimer = setInterval(async function () {
+          if (activeSessionId !== sid) {
+            clearInterval(refreshTimer);
+            refreshTimer = null;
+            return;
+          }
           try {
-            traceData = await (await fetch("/api/observability/sessions/" + encodeURIComponent(sid) + "/trace")).json();
-            var rt0 = performance.now();
+            var r = await fetch("/api/observability/sessions/" + encodeURIComponent(sid) + "/trace");
+            if (!r.ok) return;
+            traceData = await r.json();
             renderTrace();
-            var rt1 = performance.now();
-            recordPerf({
-              action: "auto_refresh",
-              total_ms: rt1 - rt0,
-              render_ms: rt1 - rt0,
-              entry_count: (traceData.entries || []).length,
-            });
+            // Stop refreshing once session completes
+            var newStatus = (traceData.status || "").toLowerCase();
+            if (newStatus === "completed" || newStatus === "failed" || newStatus === "aborted") {
+              clearInterval(refreshTimer);
+              refreshTimer = null;
+            }
           } catch (_) {}
         }, 3000);
       }
+
     } catch (e) {
-      mainEl.innerHTML = '<div class="obs-empty">Failed to load trace</div>';
+      mainEl.innerHTML = '<div class="obs-empty">No trace data available for this session</div>';
     }
   }
 
@@ -378,6 +374,7 @@
       filterBtn("all", "All") +
       filterBtn("llm_call", "LLM") +
       filterBtn("search", "Search") +
+      filterBtn("report", "Report") +
       filterBtn("agent_event", "Agent") +
       filterBtn("lifecycle", "Lifecycle") +
       filterBtn("error", "Error") +
@@ -509,15 +506,7 @@
         // if it's a group header, toggle group
         if (this.classList.contains("obs-group-header") && nid) {
           collapsedGroups[nid] = !collapsedGroups[nid];
-          var rt0 = performance.now();
           renderTrace();
-          var rt1 = performance.now();
-          recordPerf({
-            action: "toggle_group",
-            total_ms: rt1 - rt0,
-            render_ms: rt1 - rt0,
-            entry_count: (traceData.entries || []).length,
-          });
           return;
         }
 
@@ -527,15 +516,7 @@
         } else {
           expandedRow = idx;
         }
-        var rt0 = performance.now();
         renderTrace();
-        var rt1 = performance.now();
-        recordPerf({
-          action: "toggle_row",
-          total_ms: rt1 - rt0,
-          render_ms: rt1 - rt0,
-          entry_count: (traceData.entries || []).length,
-        });
       });
     }
 
@@ -546,15 +527,7 @@
         ev.stopPropagation();
         activeCategory = this.getAttribute("data-cat");
         expandedRow = null;
-        var rt0 = performance.now();
         renderTrace();
-        var rt1 = performance.now();
-        recordPerf({
-          action: "filter",
-          total_ms: rt1 - rt0,
-          render_ms: rt1 - rt0,
-          entry_count: (traceData.entries || []).length,
-        });
       });
     }
 
@@ -567,15 +540,7 @@
         _searchDebounceTimer = setTimeout(function () {
           textFilter = self.value.toLowerCase().trim();
           expandedRow = null;
-          var rt0 = performance.now();
           renderTrace();
-          var rt1 = performance.now();
-          recordPerf({
-            action: "filter",
-            total_ms: rt1 - rt0,
-            render_ms: rt1 - rt0,
-            entry_count: (traceData.entries || []).length,
-          });
         }, 300);
       });
       // keep focus after re-render
@@ -621,6 +586,7 @@
     toggle: togglePanel,
     isOpen: isPanelOpen,
     selectSession: selectSession,
+    recordPerf: recordPerf,
   };
 
 })();

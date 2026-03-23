@@ -12,3 +12,8 @@ reports/
 logs/
 certs/
 .env
+
+# Stray standalone files (not part of the app)
+deep-research-flow.jsx
+demo_frontend.html
+test_frontend.html

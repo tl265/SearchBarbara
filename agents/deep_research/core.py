@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agents.prompts import load_prompt_text
-from infra.observability import AGENT_LOG_FILE, setup_agent_logger
+from infra.observability import setup_agent_logger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -4405,8 +4405,6 @@ def main() -> None:
     for h in logger.handlers:
         if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
             h.setLevel(getattr(logging, _cli_level, logging.INFO))
-
-    print(f"[info] Agent debug log: {AGENT_LOG_FILE}")
 
     parser = argparse.ArgumentParser(description="Deep Research Agent")
     parser.add_argument("task", help="Research task prompt")

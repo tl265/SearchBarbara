@@ -2147,6 +2147,8 @@ def _categorize_event(message: str, level: str) -> str:
         return "llm_call"
     if "search" in msg and ("completed" in msg or "started" in msg):
         return "search"
+    if "report" in msg:
+        return "report"
     if msg.startswith("frontend:"):
         return "frontend"
     if msg.startswith("agent_event:"):
