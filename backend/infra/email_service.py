@@ -30,6 +30,7 @@ def _cfg():
         SMTP_USERNAME,
         SMTP_PASSWORD,
         SMTP_USE_TLS,
+        SMTP_USE_SSL,
         EMAIL_FROM_ADDRESS,
         EMAIL_FROM_NAME,
     )
@@ -40,6 +41,7 @@ def _cfg():
         "username": SMTP_USERNAME,
         "password": SMTP_PASSWORD,
         "use_tls": SMTP_USE_TLS,
+        "use_ssl": SMTP_USE_SSL,
         "from_address": EMAIL_FROM_ADDRESS,
         "from_name": EMAIL_FROM_NAME,
     }
@@ -158,7 +160,10 @@ def _send_smtp(msg: MIMEMultipart) -> None:
     host = cfg["host"]
     port = cfg["port"]
     try:
-        if cfg["use_tls"]:
+        if cfg["use_ssl"]:
+            server = smtplib.SMTP_SSL(host, port, timeout=30)
+            server.ehlo()
+        elif cfg["use_tls"]:
             server = smtplib.SMTP(host, port, timeout=30)
             server.ehlo()
             server.starttls()
