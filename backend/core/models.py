@@ -131,6 +131,7 @@ class RunState(BaseModel):
     run_id: str
     session_id: Optional[str] = None
     owner_id: Optional[str] = None
+    owner_email: Optional[str] = None
     title: Optional[str] = None
     status: RunStatus
     version: int = 1
