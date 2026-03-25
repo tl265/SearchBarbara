@@ -853,6 +853,7 @@ def create_run(req: CreateRunRequest, request: Request) -> CreateRunResponse:
             model=model,
             report_model=report_model,
             owner_id=user.user_id,
+            owner_email=user.email,
         )
     except Exception:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)
@@ -925,6 +926,7 @@ def create_run_from_workspace(
             report_model=report_model,
             owner_id=user.user_id,
             start_mode=req.start_mode,
+            owner_email=user.email,
         )
     except Exception:
         run_manager.idempotency_clear_in_progress(idem_scope, idem_key)

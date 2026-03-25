@@ -160,6 +160,7 @@ class RunManager:
         report_model: str,
         owner_id: Optional[str] = None,
         max_depth_cap_snapshot: Optional[int] = None,
+        owner_email: Optional[str] = None,
     ) -> str:
         run_id = str(uuid.uuid4())
         return self._create_run_with_id(
@@ -174,6 +175,7 @@ class RunManager:
             owner_id=owner_id,
             start_worker=True,
             is_draft=False,
+            owner_email=owner_email,
         )
 
     def create_draft_session(
@@ -215,6 +217,7 @@ class RunManager:
         start_worker: bool,
         is_draft: bool,
         phase: str = "research",
+        owner_email: Optional[str] = None,
     ) -> str:
         now = _now()
         runs_dir = Path("runs")
@@ -249,6 +252,7 @@ class RunManager:
             run_id=run_id,
             session_id=run_id,
             owner_id=str(owner_id or "").strip() or None,
+            owner_email=str(owner_email or "").strip() or None,
             title=self._default_title_from_task(task),
             status="queued",
             version=1,
@@ -296,6 +300,7 @@ class RunManager:
         owner_id: Optional[str] = None,
         start_mode: str = "planning",
         max_depth_cap_snapshot: Optional[int] = None,
+        owner_email: Optional[str] = None,
     ) -> str:
         run_id = str(uuid.uuid4())
         mode = str(start_mode or "planning").strip().lower()
@@ -313,6 +318,7 @@ class RunManager:
             start_worker=False,
             is_draft=False,
             phase="planning" if planning_mode else "research",
+            owner_email=owner_email,
         )
         wid = str(workspace_id or "").strip()
         session_lock = self._session_lock_for(run_id)
@@ -2658,6 +2664,17 @@ class RunManager:
                 },
             },
         )
+        # Email notification (fire-and-forget)
+        try:
+            from backend.infra.email_service import send_report_email
+            send_report_email(
+                to_addr=state.owner_email,
+                report_markdown=report_text,
+                report_title=snapshot.task,
+                run_id=run_id,
+            )
+        except Exception as _email_exc:
+            log.warning("Email notification failed (suppressed): %s", _email_exc)
         return {
             "report_file_path": str(report_path),
             "version_index": int(created.get("version_index", 1)),
@@ -4534,6 +4551,17 @@ class RunManager:
                     },
                 },
             )
+            # Email notification (fire-and-forget)
+            try:
+                from backend.infra.email_service import send_report_email
+                send_report_email(
+                    to_addr=state.owner_email,
+                    report_markdown=report,
+                    report_title=state.task,
+                    run_id=run_id,
+                )
+            except Exception as _email_exc:
+                log.warning("Email notification failed (suppressed): %s", _email_exc)
         except Exception as exc:
             error_text = str(exc)
             finalize_run_failure(error_text, token_usage=agent.usage_tracker.to_dict())
