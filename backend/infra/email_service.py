@@ -7,7 +7,6 @@ the main research workflow.
 """
 
 import logging
-import os
 import smtplib
 import threading
 from email.mime.multipart import MIMEMultipart
@@ -57,7 +56,6 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "templates" / "email"
 def _render_html(
     report_title: str,
     preview_text: str,
-    download_url: str,
 ) -> str:
     """Render the HTML email body from a template file, or fall back to inline."""
     template_path = _TEMPLATE_DIR / "report_ready.html"
@@ -66,12 +64,11 @@ def _render_html(
         html = (
             raw.replace("{{ report_title }}", _html_escape(report_title))
             .replace("{{ preview_text }}", _html_escape(preview_text))
-            .replace("{{ download_url }}", _html_escape(download_url))
         )
         return html
     except Exception as exc:
         log.warning("Email template rendering failed, using inline fallback: %s", exc)
-        return _inline_fallback_html(report_title, preview_text, download_url)
+        return _inline_fallback_html(report_title, preview_text)
 
 
 def _html_escape(text: str) -> str:
@@ -85,7 +82,7 @@ def _html_escape(text: str) -> str:
 
 
 def _inline_fallback_html(
-    report_title: str, preview_text: str, download_url: str
+    report_title: str, preview_text: str,
 ) -> str:
     title = _html_escape(report_title)
     preview = _html_escape(preview_text)
@@ -93,16 +90,9 @@ def _inline_fallback_html(
 <html>
 <body style="font-family:sans-serif;color:#333;">
 <h2>Your SearchBarbara Report is Ready</h2>
+<p>The complete Markdown report is attached to this email.</p>
 <p><strong>{title}</strong></p>
 <p>{preview}</p>
-<p><a href="{download_url}"
-       style="display:inline-block;padding:10px 20px;background:#2563eb;color:#fff;
-              text-decoration:none;border-radius:6px;">
-   Download Full Report
-</a></p>
-<p style="font-size:12px;color:#888;">
-  The complete Markdown report is also attached to this email.
-</p>
 </body>
 </html>"""
 
@@ -123,8 +113,6 @@ def _build_message(
     run_id: str,
 ) -> MIMEMultipart:
     cfg = _cfg()
-    public_base = str(os.getenv("PUBLIC_BASE_URL", "")).strip().rstrip("/")
-    download_url = f"{public_base}/api/runs/{run_id}/report/download"
 
     preview_text = report_markdown[:500].strip()
     if len(report_markdown) > 500:
@@ -140,7 +128,7 @@ def _build_message(
     msg["To"] = to_addr
 
     # HTML body
-    html_body = _render_html(report_title, preview_text, download_url)
+    html_body = _render_html(report_title, preview_text)
     html_part = MIMEText(html_body, "html", "utf-8")
     msg.attach(html_part)
 
@@ -189,21 +177,23 @@ def send_report_email(
     report_markdown: str,
     report_title: str,
     run_id: str,
-) -> None:
+) -> bool:
     """
     Fire-and-forget email notification.
 
     Immediately returns. The actual sending happens in a daemon thread.
     All exceptions are caught internally and logged — this function
     **never** raises or blocks the caller.
+
+    Returns True if the email was queued for sending, False otherwise.
     """
     try:
         if not _is_configured():
             log.debug("Email notification skipped: EMAIL_ENABLED is false or SMTP not configured.")
-            return
+            return False
         if not to_addr or not str(to_addr).strip():
             log.warning("Email notification skipped: no recipient address available.")
-            return
+            return False
         to_addr = str(to_addr).strip()
         msg = _build_message(to_addr, report_markdown, report_title, run_id)
 
@@ -215,5 +205,7 @@ def send_report_email(
 
         t = threading.Thread(target=_worker, daemon=True, name="email-send")
         t.start()
+        return True
     except Exception as exc:
         log.error("send_report_email outer error (suppressed): %s", exc)
+        return False

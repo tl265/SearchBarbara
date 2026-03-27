@@ -1141,6 +1141,7 @@ def get_session(session_id: str, request: Request) -> RunSnapshotResponse:
         snapshot_fallback_reason=state.snapshot_fallback_reason,
         snapshot_lock_wait_ms=state.snapshot_lock_wait_ms,
         worker_thread_seen=state.worker_thread_seen,
+        email_sent_at=state.email_sent_at,
     )
 
 

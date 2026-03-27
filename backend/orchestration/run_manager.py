@@ -2667,12 +2667,21 @@ class RunManager:
         # Email notification (fire-and-forget)
         try:
             from backend.infra.email_service import send_report_email
-            send_report_email(
+            email_queued = send_report_email(
                 to_addr=state.owner_email,
                 report_markdown=report_text,
                 report_title=snapshot.task,
                 run_id=run_id,
             )
+            if email_queued:
+                session_lock = self._session_lock_for(run_id)
+                with session_lock:
+                    state = self._ensure_run_loaded_session_locked(run_id)
+                    if state:
+                        state.email_sent_at = _now()
+                        with self._lock:
+                            self._sync_session_from_state_locked(state)
+                            self._save_sessions_index_locked()
         except Exception as _email_exc:
             log.warning("Email notification failed (suppressed): %s", _email_exc)
         return {
@@ -4554,12 +4563,20 @@ class RunManager:
             # Email notification (fire-and-forget)
             try:
                 from backend.infra.email_service import send_report_email
-                send_report_email(
+                email_queued = send_report_email(
                     to_addr=state.owner_email,
                     report_markdown=report,
                     report_title=state.task,
                     run_id=run_id,
                 )
+                if email_queued:
+                    with session_lock:
+                        state = self._ensure_run_loaded_session_locked(run_id)
+                        if state:
+                            state.email_sent_at = _now()
+                            with self._lock:
+                                self._sync_session_from_state_locked(state)
+                                self._save_sessions_index_locked()
             except Exception as _email_exc:
                 log.warning("Email notification failed (suppressed): %s", _email_exc)
         except Exception as exc:
@@ -4877,6 +4894,7 @@ class RunManager:
             "latest_report_at": latest_report_at,
             "current_report_version_index": state.current_report_version_index,
             "has_manual_edits": bool(state.has_manual_edits),
+            "email_sent_at": state.email_sent_at.isoformat() if state.email_sent_at else None,
         })
         self._mark_owner_dirty_locked(state.owner_id)
 

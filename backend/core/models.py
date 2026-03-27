@@ -118,6 +118,7 @@ class RunSnapshotResponse(BaseModel):
     snapshot_fallback_reason: Optional[str] = None
     snapshot_lock_wait_ms: Optional[float] = None
     worker_thread_seen: Optional[bool] = None
+    email_sent_at: Optional[datetime] = None
 
 
 class RunEvent(BaseModel):
@@ -162,6 +163,7 @@ class RunState(BaseModel):
     token_usage: Optional[Dict[str, Any]] = None
     manual_edit_log: List[Dict[str, Any]] = Field(default_factory=list)
     manual_assertions: Dict[str, Any] = Field(default_factory=dict)
+    email_sent_at: Optional[datetime] = None
     snapshot_source: Optional[str] = None
     snapshot_fallback_reason: Optional[str] = None
     snapshot_lock_wait_ms: Optional[float] = None
@@ -187,6 +189,7 @@ class SessionSummary(BaseModel):
     latest_report_at: Optional[datetime] = None
     has_manual_edits: bool = False
     lock_debug: Optional[Dict[str, Any]] = None
+    email_sent_at: Optional[datetime] = None
 
 
 class SessionListResponse(BaseModel):
