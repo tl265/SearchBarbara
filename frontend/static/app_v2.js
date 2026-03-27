@@ -2030,6 +2030,7 @@ function renderSessions() {
       const title = String(s.title || sid || "Untitled");
       const research = sessionResearchState(s);
       const updated = fmtTime(s.updated_at);
+      const emailSent = s.email_sent_at ? fmtTime(s.email_sent_at) : "";
       const statusCls = research === "completed" ? "success"
         : research === "running" ? "running"
         : research === "failed" ? "failed"
@@ -2041,6 +2042,7 @@ function renderSessions() {
         <div class="session-main">
           <div class="session-title" title="${esc(title)}"><span class="session-status-dot ${statusCls}"></span>${esc(title)}</div>
           <div class="session-meta">${esc(updated)}</div>
+          ${emailSent ? `<div class="session-meta muted" title="Email sent at ${esc(emailSent)}">📧 ${esc(emailSent)}</div>` : ""}
           ${lockDbg ? `<div class="session-meta muted">${lockDbg}</div>` : ""}
         </div>
         <div class="session-actions">
