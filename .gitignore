@@ -5,6 +5,7 @@ __pycache__/
 package-lock.json
 CLAUDE.md
 .claude/
+.codex
 .codex/
 docs/
 
