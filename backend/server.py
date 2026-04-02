@@ -1,12 +1,16 @@
 import logging
+import base64
+import importlib.util
+from functools import partial
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any, Dict, Iterator, List
 import json
 import os
 import time
+from http.cookies import SimpleCookie
 
-from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header, Body
+from fastapi import FastAPI, HTTPException, Query, UploadFile, File, Header, Body, WebSocket, WebSocketDisconnect
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -18,6 +22,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
 
 from infra.observability import (
@@ -58,8 +63,22 @@ from backend.infra.auth import (
     UserPrincipal,
     get_current_user_from_request,
 )
+from backend.infra.asr import AsrError, OpenAIAsrTranscriber
 from backend.infra.sse import format_sse
 from backend.orchestration.run_manager import RunManager
+from config.env import (
+    ASR_CALIBRATION_MS,
+    ASR_MAX_SESSION_SEC,
+    ASR_MAX_AMBIENT_RMS,
+    ASR_MODEL,
+    ASR_MIN_SPEECH_RMS,
+    ASR_PARTIAL_INTERVAL_MS,
+    ASR_SILENCE_TIMEOUT_MS,
+    ASR_SPEECH_END_HOLD_MS,
+    ASR_SPEECH_START_HOLD_MS,
+    ASR_SPEECH_THRESHOLD_MULTIPLIER,
+    ASR_TIMEOUT_SEC,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -78,6 +97,13 @@ app.mount(
 )
 
 
+def _websocket_runtime_backend() -> str:
+    for name in ("websockets", "wsproto"):
+        if importlib.util.find_spec(name) is not None:
+            return name
+    return ""
+
+
 def _load_web_config() -> Dict[str, Any]:
     default = {
         "max_rounds": 1,
@@ -90,6 +116,7 @@ def _load_web_config() -> Dict[str, Any]:
         "model": "gpt-4.1",
         "report_model": "gpt-5.2",
         "ui_debug": False,
+        "asr_enabled": False,
         "min_canvas_zoom": 0.45,
         "auto_fit_safety_px": 10,
         "heartbeat_interval_sec": 8,
@@ -165,6 +192,7 @@ def _load_web_config() -> Dict[str, Any]:
         raw.get("report_model", default["report_model"]) or default["report_model"]
     )
     ui_debug = bool(raw.get("ui_debug", default["ui_debug"]))
+    asr_enabled = bool(raw.get("asr_enabled", default["asr_enabled"]))
     try:
         min_canvas_zoom = float(
             raw.get("min_canvas_zoom", default["min_canvas_zoom"])
@@ -305,6 +333,7 @@ def _load_web_config() -> Dict[str, Any]:
         "model": model,
         "report_model": report_model,
         "ui_debug": ui_debug,
+        "asr_enabled": asr_enabled,
         "min_canvas_zoom": min(max(min_canvas_zoom, 0.1), 0.95),
         "auto_fit_safety_px": max(0, min(auto_fit_safety_px, 200)),
         "heartbeat_interval_sec": min(max(heartbeat_interval_sec, 1.0), 120.0),
@@ -383,6 +412,11 @@ live_intent_classifier = LiveIntentClassifier(
         WEB_CONFIG.get("live_intent_confidence_threshold", 0.45)
     ),
 )
+asr_transcriber = OpenAIAsrTranscriber(
+    model=ASR_MODEL,
+    timeout_sec=float(ASR_TIMEOUT_SEC),
+    logger=logging.getLogger("searchbarbara.asr"),
+)
 
 
 def _current_user(request: Request):
@@ -397,6 +431,62 @@ def _require_user(request: Request):
     if not user:
         raise HTTPException(status_code=401, detail="unauthorized")
     return user
+
+
+def _current_user_from_websocket(websocket: WebSocket) -> UserPrincipal | None:
+    if not AUTH_CONFIG.configured:
+        return UserPrincipal(
+            user_id="local-dev-user",
+            email="dev@localhost",
+            session_expires_at=int(time.time()) + 86400,
+        )
+    raw = websocket.cookies.get(AuthService.SESSION_COOKIE_NAME, "")
+    if not raw:
+        cookie_header = str(websocket.headers.get("cookie", "") or "")
+        if cookie_header:
+            jar = SimpleCookie()
+            jar.load(cookie_header)
+            morsel = jar.get(AuthService.SESSION_COOKIE_NAME)
+            raw = str(morsel.value if morsel is not None else "")
+    if not raw:
+        return None
+    return auth_service.parse_session_cookie(raw)
+
+
+async def _send_asr_event(websocket: WebSocket, event_type: str, **payload: Any) -> None:
+    await websocket.send_json({"type": event_type, **payload})
+
+
+async def _transcribe_asr_snapshot(
+    audio_bytes: bytes,
+    *,
+    mime_type: str,
+    language: str,
+) -> Any:
+    return await run_in_threadpool(
+        partial(
+            asr_transcriber.transcribe_snapshot,
+            audio_bytes,
+            mime_type=mime_type,
+            language=language,
+        )
+    )
+
+
+@app.on_event("startup")
+async def validate_runtime_dependencies() -> None:
+    if not bool(WEB_CONFIG.get("asr_enabled", False)):
+        return
+    ws_backend = _websocket_runtime_backend()
+    if ws_backend:
+        _server_log.info("ASR websocket runtime backend: %s", ws_backend)
+        return
+    msg = (
+        "ASR dictation is enabled, but no websocket runtime backend is installed. "
+        "Install 'websockets' or 'wsproto' in the app environment."
+    )
+    _server_log.error(msg)
+    raise RuntimeError(msg)
 
 
 def _set_session_cookie(response: Response, user_id: str, email: str | None) -> None:
@@ -577,6 +667,18 @@ def index(request: Request) -> HTMLResponse:
                 WEB_CONFIG.get("default_results_per_query", 3)
             ),
             "ui_debug": bool(WEB_CONFIG.get("ui_debug", False)),
+            "asr_enabled": bool(WEB_CONFIG.get("asr_enabled", False)),
+            "asr_silence_timeout_ms": int(ASR_SILENCE_TIMEOUT_MS),
+            "asr_partial_interval_ms": int(ASR_PARTIAL_INTERVAL_MS),
+            "asr_max_session_sec": int(ASR_MAX_SESSION_SEC),
+            "asr_calibration_ms": int(ASR_CALIBRATION_MS),
+            "asr_speech_start_hold_ms": int(ASR_SPEECH_START_HOLD_MS),
+            "asr_speech_end_hold_ms": int(ASR_SPEECH_END_HOLD_MS),
+            "asr_speech_threshold_multiplier": float(
+                ASR_SPEECH_THRESHOLD_MULTIPLIER
+            ),
+            "asr_min_speech_rms": float(ASR_MIN_SPEECH_RMS),
+            "asr_max_ambient_rms": float(ASR_MAX_AMBIENT_RMS),
             "live_intent_enabled": bool(WEB_CONFIG.get("live_intent_enabled", True)),
             "live_intent_min_chars_default": int(
                 WEB_CONFIG.get("live_intent_min_chars_default", 12)
@@ -593,6 +695,194 @@ def index(request: Request) -> HTMLResponse:
             "asset_v": _BOOT_TS,
         },
     )
+
+
+@app.websocket("/api/asr/stream")
+async def asr_stream(websocket: WebSocket) -> None:
+    if not bool(WEB_CONFIG.get("asr_enabled", False)):
+        await websocket.close(code=4404)
+        return
+    user = _current_user_from_websocket(websocket)
+    if not user:
+        await websocket.close(code=4401)
+        return
+    await websocket.accept()
+    trace_id = websocket.headers.get("x-trace-id") or generate_trace_id()
+    audio_buffer = b""
+    mime_type = "audio/webm"
+    language = ""
+    source_session_id = ""
+    started_at = time.perf_counter()
+    try:
+        while True:
+            message = await websocket.receive_json()
+            if not isinstance(message, dict):
+                await _send_asr_event(
+                    websocket,
+                    "asr.error",
+                    code="bad_request",
+                    message="Invalid ASR payload.",
+                )
+                continue
+            event_type = str(message.get("type", "") or "").strip().lower()
+            if event_type == "asr.start":
+                mime_type = str(message.get("mime_type", "audio/webm") or "audio/webm")
+                language = str(message.get("language", "") or "").strip()
+                source_session_id = str(message.get("session_id", "") or "").strip()
+                audio_buffer = b""
+                started_at = time.perf_counter()
+                _server_log.info(
+                    "asr.start uid=%s sid=%s trace=%s",
+                    user.user_id,
+                    source_session_id or "-",
+                    trace_id,
+                )
+                await _send_asr_event(
+                    websocket,
+                    "asr.ready",
+                    model=ASR_MODEL,
+                    silence_timeout_ms=int(ASR_SILENCE_TIMEOUT_MS),
+                )
+                continue
+            if event_type == "asr.audio_chunk":
+                if (time.perf_counter() - started_at) > float(ASR_MAX_SESSION_SEC):
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code="session_timeout",
+                        message="Voice dictation timed out.",
+                    )
+                    await _send_asr_event(websocket, "asr.done")
+                    break
+                incoming_session_id = str(message.get("session_id", "") or "").strip()
+                if source_session_id and incoming_session_id and incoming_session_id != source_session_id:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code="session_mismatch",
+                        message="Session changed during dictation.",
+                    )
+                    await _send_asr_event(websocket, "asr.done")
+                    break
+                audio_b64 = str(message.get("audio", "") or "").strip()
+                if not audio_b64:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code="bad_request",
+                        message="Missing audio payload.",
+                    )
+                    continue
+                try:
+                    snapshot = base64.b64decode(audio_b64, validate=True)
+                except Exception:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code="bad_request",
+                        message="Invalid audio payload encoding.",
+                    )
+                    continue
+                if bool(message.get("replace_buffer", False)):
+                    audio_buffer = snapshot
+                else:
+                    audio_buffer += snapshot
+                if not audio_buffer:
+                    continue
+                try:
+                    result = await _transcribe_asr_snapshot(
+                        audio_buffer,
+                        mime_type=mime_type,
+                        language=language,
+                    )
+                except AsrError as exc:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code=exc.code,
+                        message=exc.message,
+                    )
+                    continue
+                if result.text:
+                    _server_log.info(
+                        "asr.partial uid=%s sid=%s trace=%s chars=%s audio_bytes=%s duration_ms=%s",
+                        user.user_id,
+                        source_session_id or "-",
+                        trace_id,
+                        len(result.text),
+                        result.audio_bytes,
+                        result.duration_ms,
+                    )
+                    await _send_asr_event(
+                        websocket,
+                        "asr.partial",
+                        text=result.text,
+                        seq=int(message.get("seq", 0) or 0),
+                        chars=len(result.text),
+                        duration_ms=result.duration_ms,
+                    )
+                continue
+            if event_type == "asr.stop":
+                if not audio_buffer:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code="no_speech",
+                        message="No speech detected.",
+                    )
+                    await _send_asr_event(websocket, "asr.done")
+                    break
+                try:
+                    result = await _transcribe_asr_snapshot(
+                        audio_buffer,
+                        mime_type=mime_type,
+                        language=language,
+                    )
+                except AsrError as exc:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code=exc.code,
+                        message=exc.message,
+                    )
+                    await _send_asr_event(websocket, "asr.done")
+                    break
+                if not result.text:
+                    await _send_asr_event(
+                        websocket,
+                        "asr.error",
+                        code="no_speech",
+                        message="No speech detected.",
+                    )
+                    await _send_asr_event(websocket, "asr.done")
+                    break
+                _server_log.info(
+                    "asr.final uid=%s sid=%s trace=%s chars=%s audio_bytes=%s duration_ms=%s",
+                    user.user_id,
+                    source_session_id or "-",
+                    trace_id,
+                    len(result.text),
+                    result.audio_bytes,
+                    result.duration_ms,
+                )
+                await _send_asr_event(
+                    websocket,
+                    "asr.final",
+                    text=result.text,
+                    chars=len(result.text),
+                    duration_ms=result.duration_ms,
+                    reason=str(message.get("reason", "") or "user_stop"),
+                )
+                await _send_asr_event(websocket, "asr.done")
+                break
+            await _send_asr_event(
+                websocket,
+                "asr.error",
+                code="bad_request",
+                message="Unknown ASR event type.",
+            )
+    except WebSocketDisconnect:
+        return
 
 
 def _compute_research_status(

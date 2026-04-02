@@ -28,6 +28,11 @@ const contextFileDigestEl = document.getElementById("contextFileDigest");
 const contextDigestPaneEl = document.querySelector(".context-digest-pane");
 const appMainEl = document.querySelector(".app-main");
 const liveIntentEl = document.getElementById("liveIntent");
+const asrBtn = document.getElementById("asrBtn");
+const asrStatusRow = document.getElementById("asrStatusRow");
+const asrStatusEl = document.getElementById("asrStatus");
+const asrInterimEl = document.getElementById("asrInterim");
+const asrNoticeEl = document.getElementById("asrNotice");
 
 const runStatusEl = document.getElementById("runStatus");
 const researchStatusEl = document.getElementById("researchStatus");
@@ -154,6 +159,54 @@ const MIN_NODE_FONT_SCALE = 0.72;
 const MAX_NODE_FONT_SCALE = 1.25;
 const AUTO_FIT_SAFETY_PX = Math.max(0, Math.floor(Number(APP_CONFIG.auto_fit_safety_px ?? 10)));
 const UI_DEBUG = !!APP_CONFIG.ui_debug;
+const ASR_ENABLED = !!APP_CONFIG.asr_enabled;
+const ASR_SILENCE_TIMEOUT_MS = Math.max(
+  1000,
+  Math.floor(Number(APP_CONFIG.asr_silence_timeout_ms ?? 5000))
+);
+const ASR_PARTIAL_INTERVAL_MS = Math.max(
+  600,
+  Math.floor(Number(APP_CONFIG.asr_partial_interval_ms ?? 1400))
+);
+const ASR_MAX_SESSION_MS = Math.max(
+  10000,
+  Math.floor(Number(APP_CONFIG.asr_max_session_sec ?? 120) * 1000)
+);
+const ASR_CALIBRATION_MS = Math.max(
+  0,
+  Math.floor(Number(APP_CONFIG.asr_calibration_ms ?? 450))
+);
+const ASR_SPEECH_START_HOLD_MS = Math.max(
+  0,
+  Math.floor(Number(APP_CONFIG.asr_speech_start_hold_ms ?? 180))
+);
+const ASR_SPEECH_END_HOLD_MS = Math.max(
+  0,
+  Math.floor(Number(APP_CONFIG.asr_speech_end_hold_ms ?? 700))
+);
+const ASR_SPEECH_THRESHOLD_MULTIPLIER = Math.max(
+  1.1,
+  Number(APP_CONFIG.asr_speech_threshold_multiplier ?? 2.4)
+);
+const ASR_MIN_SPEECH_RMS = clamp(
+  Number(APP_CONFIG.asr_min_speech_rms ?? 0.04),
+  0.005,
+  0.2
+);
+const ASR_MAX_AMBIENT_RMS = clamp(
+  Number(APP_CONFIG.asr_max_ambient_rms ?? 0.025),
+  0.005,
+  0.2
+);
+const ASR_SUPPORTED = !!(
+  ASR_ENABLED
+  && window.isSecureContext !== false
+  && window.WebSocket
+  && window.MediaRecorder
+  && window.AudioContext
+  && navigator.mediaDevices
+  && typeof navigator.mediaDevices.getUserMedia === "function"
+);
 let lastDebugReportPhaseKey = "";
 let contextEs = null;
 let currentContextSet = null;
@@ -193,6 +246,43 @@ let liveIntentPendingServerFingerprint = "";
 let liveIntentPendingServerCount = 0;
 let liveIntentDisplayedPrediction = null;
 let liveIntentFetchController = null;
+const asrState = {
+  supported: ASR_SUPPORTED,
+  enabled: ASR_ENABLED,
+  isListening: false,
+  isProcessing: false,
+  permissionState: "unknown",
+  partialText: "",
+  lastSpeechAt: null,
+  lastError: "",
+  ws: null,
+  mediaRecorder: null,
+  stream: null,
+  mimeType: "audio/webm",
+  audioChunks: [],
+  audioContext: null,
+  sourceNode: null,
+  analyser: null,
+  silenceMonitorTimer: null,
+  partialFlushTimer: null,
+  sessionStartedAt: 0,
+  sessionId: "",
+  seq: 0,
+  pendingStopReason: "",
+  lastSentBytes: 0,
+  isStopping: false,
+  speechActive: false,
+  speechDetectedAt: null,
+  speechCandidateAt: null,
+  silenceCandidateAt: null,
+  calibrationStartedAt: 0,
+  ambientRms: 0,
+  ambientRmsSamples: 0,
+  insertAnchorStart: null,
+  insertAnchorEnd: null,
+  lastKnownSelectionStart: null,
+  lastKnownSelectionEnd: null,
+};
 if (document && document.body) {
   document.body.classList.toggle("ui-debug-on", UI_DEBUG);
 }
@@ -672,6 +762,7 @@ function setTaskBoxLocked(locked) {
   if (contextAddBtn) contextAddBtn.disabled = !!locked;
   if (inlineContextFilesEl) inlineContextFilesEl.classList.toggle("is-locked", !!locked);
   refreshContextUploadButtonState();
+  refreshAsrUiState();
 }
 
 function setRunConfigLocked(locked) {
@@ -733,6 +824,605 @@ function showTransientError(msg, ms = 2000) {
       showError("");
     }
   }, Math.max(200, Number(ms) || 2000));
+}
+
+function trackAsrEvent(type, fields = {}) {
+  if (
+    typeof SBTelemetry === "undefined"
+    || !SBTelemetry
+    || typeof SBTelemetry.track !== "function"
+  ) {
+    return;
+  }
+  SBTelemetry.track(type, fields);
+}
+
+function asrWsUrl() {
+  const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${protocol}//${window.location.host}/api/asr/stream`;
+}
+
+function pickAsrMimeType() {
+  if (!window.MediaRecorder || typeof window.MediaRecorder.isTypeSupported !== "function") {
+    return "";
+  }
+  const candidates = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/mp4",
+  ];
+  for (let i = 0; i < candidates.length; i += 1) {
+    if (window.MediaRecorder.isTypeSupported(candidates[i])) {
+      return candidates[i];
+    }
+  }
+  return "";
+}
+
+function setAsrStatus(text, opts = {}) {
+  if (!asrStatusEl) return;
+  const msg = String(text || "").trim();
+  asrState.lastError = opts.error ? msg : "";
+  asrStatusEl.textContent = msg;
+  asrStatusEl.classList.toggle("is-error", !!opts.error && !!msg);
+  if (asrStatusRow) {
+    const visible = !!(ASR_ENABLED && (msg || asrState.partialText || (asrNoticeEl && !asrNoticeEl.classList.contains("hidden"))));
+    asrStatusRow.classList.toggle("hidden", !visible);
+  }
+}
+
+function isAsrBusy() {
+  return !!(ASR_ENABLED && (asrState.isListening || asrState.isProcessing));
+}
+
+function refreshStartActionAvailability() {
+  if (!runBtn) return;
+  if (currentRunId || startRunInFlight || runBtn.dataset.mode === "abort") return;
+  runBtn.disabled = !taskEl.value.trim() || isAsrBusy();
+  if (planningActionBtn) {
+    planningActionBtn.disabled = isAsrBusy();
+  }
+}
+
+function updateAsrInterim(text) {
+  asrState.partialText = String(text || "").trim();
+  if (!asrInterimEl) return;
+  asrInterimEl.textContent = asrState.partialText;
+  asrInterimEl.classList.toggle("hidden", !asrState.partialText);
+  if (asrStatusRow) {
+    asrStatusRow.classList.toggle("hidden", !ASR_ENABLED);
+  }
+}
+
+function refreshAsrUiState() {
+  if (!asrBtn) return;
+  if (!ASR_ENABLED) {
+    asrBtn.classList.add("hidden");
+    return;
+  }
+  asrBtn.classList.remove("hidden");
+  if (asrNoticeEl) {
+    asrNoticeEl.classList.remove("hidden");
+  }
+  const disabled = !asrState.supported || !!taskEl.disabled || !!startRunInFlight;
+  asrBtn.disabled = disabled;
+  asrBtn.classList.toggle("is-listening", !!asrState.isListening);
+  asrBtn.classList.toggle("is-processing", !!asrState.isProcessing);
+  asrBtn.setAttribute(
+    "aria-label",
+    asrState.isListening ? "Stop voice dictation" : "Start voice dictation"
+  );
+  asrBtn.setAttribute("aria-pressed", asrState.isListening ? "true" : "false");
+  const label = asrState.isListening ? "Listening" : (asrState.isProcessing ? "Processing" : "Dictate");
+  const labelEl = asrBtn.querySelector(".asr-btn-label");
+  if (labelEl) labelEl.textContent = label;
+  if (!asrState.supported) {
+    asrBtn.title = "Voice dictation is not supported in this browser.";
+  } else if (taskEl.disabled) {
+    asrBtn.title = "Voice dictation is unavailable while a run is active.";
+  } else if (asrState.isListening) {
+    asrBtn.title = "Stop voice dictation";
+  } else if (asrState.isProcessing) {
+    asrBtn.title = "Finishing transcription";
+  } else {
+    asrBtn.title = "Start voice dictation";
+  }
+  refreshStartActionAvailability();
+}
+
+function bytesToBase64(buffer) {
+  const bytes = new Uint8Array(buffer || new ArrayBuffer(0));
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const slice = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, slice);
+  }
+  return window.btoa(binary);
+}
+
+function computeAsrRms(analyser, sample) {
+  analyser.getByteTimeDomainData(sample);
+  let total = 0;
+  for (let i = 0; i < sample.length; i += 1) {
+    const centered = (sample[i] - 128) / 128;
+    total += centered * centered;
+  }
+  return Math.sqrt(total / sample.length);
+}
+
+function updateAsrAmbientRms(rms) {
+  const clipped = clamp(Number(rms) || 0, 0, ASR_MAX_AMBIENT_RMS);
+  if (!asrState.ambientRmsSamples) {
+    asrState.ambientRms = clipped;
+    asrState.ambientRmsSamples = 1;
+    return;
+  }
+  asrState.ambientRms = (asrState.ambientRms * 0.82) + (clipped * 0.18);
+  asrState.ambientRmsSamples += 1;
+}
+
+function currentAsrSpeechThreshold() {
+  const ambient = clamp(Number(asrState.ambientRms) || 0, 0, ASR_MAX_AMBIENT_RMS);
+  return Math.max(
+    ASR_MIN_SPEECH_RMS,
+    ambient * ASR_SPEECH_THRESHOLD_MULTIPLIER
+  );
+}
+
+function updateTaskSelectionSnapshot() {
+  if (!taskEl) return;
+  const start = Number(taskEl.selectionStart);
+  const end = Number(taskEl.selectionEnd);
+  if (Number.isFinite(start) && start >= 0) {
+    asrState.lastKnownSelectionStart = start;
+  }
+  if (Number.isFinite(end) && end >= 0) {
+    asrState.lastKnownSelectionEnd = end;
+  }
+}
+
+function captureAsrInsertionAnchor() {
+  updateTaskSelectionSnapshot();
+  const currentText = String((taskEl && taskEl.value) || "");
+  const fallback = currentText.length;
+  const start = Number.isFinite(asrState.lastKnownSelectionStart)
+    ? asrState.lastKnownSelectionStart
+    : fallback;
+  const end = Number.isFinite(asrState.lastKnownSelectionEnd)
+    ? asrState.lastKnownSelectionEnd
+    : start;
+  asrState.insertAnchorStart = clamp(Math.floor(start), 0, currentText.length);
+  asrState.insertAnchorEnd = clamp(Math.floor(end), asrState.insertAnchorStart, currentText.length);
+}
+
+function asrDraftProtectionActive() {
+  return !!(!currentRunId && (asrState.isListening || asrState.isProcessing));
+}
+
+function insertDictationText(text) {
+  const incoming = String(text || "").trim();
+  if (!incoming || !taskEl) return;
+  const existing = String(taskEl.value || "");
+  const start = Number.isFinite(asrState.insertAnchorStart)
+    ? asrState.insertAnchorStart
+    : (Number.isFinite(taskEl.selectionStart) ? taskEl.selectionStart : existing.length);
+  const end = Number.isFinite(asrState.insertAnchorEnd)
+    ? asrState.insertAnchorEnd
+    : (Number.isFinite(taskEl.selectionEnd) ? taskEl.selectionEnd : existing.length);
+  const prefix = existing.slice(0, start);
+  const suffix = existing.slice(end);
+  const spacerLeft = prefix && !/\s$/.test(prefix) ? " " : "";
+  const spacerRight = suffix && !/^\s/.test(suffix) ? " " : "";
+  let next = `${prefix}${spacerLeft}${incoming}${spacerRight}${suffix}`;
+  if (next.length > TASK_MAX_CHARS) {
+    next = next.slice(0, TASK_MAX_CHARS);
+  }
+  taskEl.value = next;
+  const caret = Math.min(next.length, (prefix + spacerLeft + incoming).length);
+  try {
+    taskEl.setSelectionRange(caret, caret);
+  } catch (_err) {
+    // no-op
+  }
+  updateTaskCharCount();
+  alignTaskTextBottom();
+  updateLiveIntentFromInput();
+  if (!currentRunId && !startRunInFlight) {
+    runBtn.disabled = !taskEl.value.trim();
+  }
+  asrState.insertAnchorStart = caret;
+  asrState.insertAnchorEnd = caret;
+  updateTaskSelectionSnapshot();
+}
+
+function stopAsrTimers() {
+  if (asrState.silenceMonitorTimer) {
+    clearInterval(asrState.silenceMonitorTimer);
+    asrState.silenceMonitorTimer = null;
+  }
+  if (asrState.partialFlushTimer) {
+    clearInterval(asrState.partialFlushTimer);
+    asrState.partialFlushTimer = null;
+  }
+}
+
+function teardownAsrMedia() {
+  stopAsrTimers();
+  if (asrState.sourceNode) {
+    try {
+      asrState.sourceNode.disconnect();
+    } catch (_err) {
+      // no-op
+    }
+    asrState.sourceNode = null;
+  }
+  if (asrState.audioContext) {
+    try {
+      asrState.audioContext.close();
+    } catch (_err) {
+      // no-op
+    }
+    asrState.audioContext = null;
+  }
+  asrState.analyser = null;
+  if (asrState.stream) {
+    try {
+      asrState.stream.getTracks().forEach((track) => track.stop());
+    } catch (_err) {
+      // no-op
+    }
+    asrState.stream = null;
+  }
+  asrState.mediaRecorder = null;
+}
+
+function resetAsrState(opts = {}) {
+  const preserveStatus = !!opts.preserveStatus;
+  stopAsrTimers();
+  teardownAsrMedia();
+  if (asrState.ws) {
+    try {
+      asrState.ws.close();
+    } catch (_err) {
+      // no-op
+    }
+  }
+  asrState.ws = null;
+  asrState.isListening = false;
+  asrState.isProcessing = false;
+  asrState.audioChunks = [];
+  asrState.lastSpeechAt = null;
+  asrState.seq = 0;
+  asrState.sessionStartedAt = 0;
+  asrState.pendingStopReason = "";
+  asrState.lastSentBytes = 0;
+  asrState.isStopping = false;
+  asrState.speechActive = false;
+  asrState.speechDetectedAt = null;
+  asrState.speechCandidateAt = null;
+  asrState.silenceCandidateAt = null;
+  asrState.calibrationStartedAt = 0;
+  asrState.ambientRms = 0;
+  asrState.ambientRmsSamples = 0;
+  asrState.insertAnchorStart = null;
+  asrState.insertAnchorEnd = null;
+  updateAsrInterim("");
+  if (!preserveStatus) {
+    setAsrStatus("");
+  }
+  refreshAsrUiState();
+}
+
+function shouldApplyAsrFinalText() {
+  if (String(asrState.pendingStopReason || "") === "session_switch") {
+    return false;
+  }
+  return String(currentRunId || "") === String(asrState.sessionId || "");
+}
+
+async function sendAsrSnapshot() {
+  if (!asrState.ws || asrState.ws.readyState !== window.WebSocket.OPEN) return false;
+  if (!asrState.speechDetectedAt) return false;
+  if (!Array.isArray(asrState.audioChunks) || !asrState.audioChunks.length) return false;
+  const blob = new Blob(asrState.audioChunks, { type: asrState.mimeType || "audio/webm" });
+  if (!blob.size || blob.size === asrState.lastSentBytes) return false;
+  const buffer = await blob.arrayBuffer();
+  asrState.lastSentBytes = blob.size;
+  asrState.seq += 1;
+  asrState.ws.send(JSON.stringify({
+    type: "asr.audio_chunk",
+    seq: asrState.seq,
+    session_id: asrState.sessionId,
+    audio: bytesToBase64(buffer),
+    replace_buffer: true,
+  }));
+  return true;
+}
+
+function beginAsrSilenceMonitor() {
+  if (!asrState.audioContext || !asrState.analyser) return;
+  const analyser = asrState.analyser;
+  const sample = new Uint8Array(analyser.fftSize);
+  asrState.lastSpeechAt = null;
+  asrState.calibrationStartedAt = Date.now();
+  asrState.silenceMonitorTimer = setInterval(() => {
+    if (!asrState.isListening) return;
+    const now = Date.now();
+    if ((Date.now() - asrState.sessionStartedAt) > ASR_MAX_SESSION_MS) {
+      stopAsrSession("session_timeout");
+      return;
+    }
+    const rms = computeAsrRms(analyser, sample);
+    if (asrState.calibrationStartedAt && (now - asrState.calibrationStartedAt) < ASR_CALIBRATION_MS) {
+      updateAsrAmbientRms(rms);
+      return;
+    }
+    const threshold = currentAsrSpeechThreshold();
+    if (!asrState.speechActive) {
+      if (rms >= threshold) {
+        if (!asrState.speechCandidateAt) {
+          asrState.speechCandidateAt = now;
+        }
+        if ((now - asrState.speechCandidateAt) >= ASR_SPEECH_START_HOLD_MS) {
+          asrState.speechActive = true;
+          asrState.speechDetectedAt = asrState.speechDetectedAt || now;
+          asrState.lastSpeechAt = now;
+          asrState.speechCandidateAt = null;
+          asrState.silenceCandidateAt = null;
+        }
+      } else {
+        asrState.speechCandidateAt = null;
+        updateAsrAmbientRms(rms);
+      }
+    } else if (rms >= threshold) {
+      asrState.lastSpeechAt = now;
+      asrState.silenceCandidateAt = null;
+    } else {
+      if (!asrState.silenceCandidateAt) {
+        asrState.silenceCandidateAt = now;
+      }
+      if ((now - asrState.silenceCandidateAt) >= ASR_SPEECH_END_HOLD_MS) {
+        asrState.speechActive = false;
+        asrState.silenceCandidateAt = null;
+      }
+    }
+    const silenceAnchor = asrState.speechDetectedAt
+      ? (asrState.lastSpeechAt || asrState.speechDetectedAt)
+      : (asrState.calibrationStartedAt + ASR_CALIBRATION_MS);
+    if (
+      silenceAnchor
+      && (now - silenceAnchor) >= ASR_SILENCE_TIMEOUT_MS
+      && !asrState.isStopping
+    ) {
+      trackAsrEvent("asr_silence_autostop", {
+        session_id: asrState.sessionId || "",
+        silence_timeout_ms: ASR_SILENCE_TIMEOUT_MS,
+      });
+      stopAsrSession("silence_timeout");
+    }
+  }, 250);
+}
+
+async function finalizeAsrRecording() {
+  stopAsrTimers();
+  teardownAsrMedia();
+  if (asrState.ws && asrState.ws.readyState === window.WebSocket.OPEN) {
+    await sendAsrSnapshot();
+    asrState.ws.send(JSON.stringify({
+      type: "asr.stop",
+      reason: asrState.pendingStopReason || "user_stop",
+    }));
+  } else {
+    resetAsrState();
+  }
+}
+
+function stopAsrSession(reason = "user_stop") {
+  const nextReason = String(reason || "user_stop");
+  if (!ASR_ENABLED) return;
+  if (asrState.isStopping) {
+    if (nextReason === "session_switch") {
+      asrState.pendingStopReason = "session_switch";
+      setAsrStatus("Switching sessions. Discarding dictation...");
+      refreshAsrUiState();
+    }
+    return;
+  }
+  if (!asrState.isListening && !asrState.isProcessing) return;
+  asrState.isStopping = true;
+  asrState.pendingStopReason = nextReason;
+  asrState.isListening = false;
+  asrState.isProcessing = true;
+  if (nextReason === "session_switch") {
+    setAsrStatus("Switching sessions. Discarding dictation...");
+  } else {
+    setAsrStatus(
+      nextReason === "silence_timeout"
+        ? "No speech detected. Finishing dictation..."
+        : "Finishing dictation..."
+    );
+  }
+  refreshAsrUiState();
+  if (asrState.mediaRecorder && asrState.mediaRecorder.state !== "inactive") {
+    try {
+      asrState.mediaRecorder.stop();
+      return;
+    } catch (_err) {
+      // fall through
+    }
+  }
+  void finalizeAsrRecording();
+}
+
+async function startAsrSession() {
+  if (!ASR_ENABLED) return;
+  if (!asrState.supported) {
+    setAsrStatus("Voice dictation is not supported in this browser.", { error: true });
+    trackAsrEvent("asr_unsupported", {});
+    refreshAsrUiState();
+    return;
+  }
+  resetAsrState();
+  captureAsrInsertionAnchor();
+  asrState.isProcessing = true;
+  setAsrStatus("Requesting microphone access...");
+  refreshAsrUiState();
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    asrState.permissionState = "granted";
+    const audioContext = new window.AudioContext();
+    const sourceNode = audioContext.createMediaStreamSource(stream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 2048;
+    sourceNode.connect(analyser);
+    const ws = new window.WebSocket(asrWsUrl());
+    const mimeType = pickAsrMimeType();
+    const recorder = mimeType
+      ? new window.MediaRecorder(stream, { mimeType })
+      : new window.MediaRecorder(stream);
+    asrState.stream = stream;
+    asrState.audioContext = audioContext;
+    asrState.sourceNode = sourceNode;
+    asrState.analyser = analyser;
+    asrState.ws = ws;
+    asrState.mediaRecorder = recorder;
+    asrState.mimeType = recorder.mimeType || mimeType || "audio/webm";
+    asrState.audioChunks = [];
+    asrState.sessionId = String(currentRunId || "");
+    asrState.sessionStartedAt = Date.now();
+    asrState.calibrationStartedAt = 0;
+    recorder.ondataavailable = (event) => {
+      if (event && event.data && event.data.size > 0) {
+        asrState.audioChunks.push(event.data);
+      }
+    };
+    recorder.onstop = () => {
+      void finalizeAsrRecording();
+    };
+    ws.addEventListener("open", () => {
+      asrState.isListening = true;
+      asrState.isProcessing = false;
+      asrState.sessionStartedAt = Date.now();
+      ws.send(JSON.stringify({
+        type: "asr.start",
+        session_id: asrState.sessionId,
+        mime_type: asrState.mimeType,
+        model: "gpt-4o-transcribe",
+      }));
+      recorder.start(750);
+      beginAsrSilenceMonitor();
+      asrState.partialFlushTimer = setInterval(() => {
+        void sendAsrSnapshot();
+      }, ASR_PARTIAL_INTERVAL_MS);
+      setAsrStatus("Listening...");
+      refreshAsrUiState();
+      trackAsrEvent("asr_start", {
+        session_id: asrState.sessionId || "",
+        mime_type: asrState.mimeType,
+      });
+    });
+    ws.addEventListener("message", (event) => {
+      let payload = null;
+      try {
+        payload = JSON.parse(String(event.data || "{}"));
+      } catch (_err) {
+        payload = null;
+      }
+      if (!payload || typeof payload !== "object") return;
+      const type = String(payload.type || "");
+      if (type === "asr.ready") {
+        setAsrStatus("Listening...");
+        return;
+      }
+      if (type === "asr.partial") {
+        const text = String(payload.text || "").trim();
+        if (text && text !== asrState.partialText) {
+          updateAsrInterim(text);
+          setAsrStatus("Listening...");
+          trackAsrEvent("asr_partial_received", {
+            session_id: asrState.sessionId || "",
+            chars: text.length,
+          });
+        }
+        return;
+      }
+      if (type === "asr.final") {
+        const text = String(payload.text || "").trim();
+        if (text) {
+          if (shouldApplyAsrFinalText()) {
+            insertDictationText(text);
+            setAsrStatus("Dictation captured.");
+          } else {
+            setAsrStatus("Dictation discarded because the session changed.");
+          }
+          updateAsrInterim("");
+          trackAsrEvent("asr_final_received", {
+            session_id: asrState.sessionId || "",
+            chars: text.length,
+            reason: String(payload.reason || ""),
+          });
+        }
+        return;
+      }
+      if (type === "asr.error") {
+        const code = String(payload.code || "provider_error");
+        const msg = String(payload.message || "Voice dictation failed.");
+        setAsrStatus(msg, { error: true });
+        trackAsrEvent("asr_error", {
+          session_id: asrState.sessionId || "",
+          code: code,
+        });
+        if (code !== "no_speech") {
+          showTransientError(msg, 2600);
+        }
+        return;
+      }
+      if (type === "asr.done") {
+        trackAsrEvent("asr_stop", {
+          session_id: asrState.sessionId || "",
+          reason: asrState.pendingStopReason || "done",
+        });
+        resetAsrState({ preserveStatus: !!asrState.lastError });
+      }
+    });
+    ws.addEventListener("close", () => {
+      if (!asrState.isListening && !asrState.isProcessing) {
+        refreshAsrUiState();
+        return;
+      }
+      resetAsrState({ preserveStatus: !!asrState.lastError });
+    });
+    ws.addEventListener("error", () => {
+      setAsrStatus("Voice dictation connection failed.", { error: true });
+      trackAsrEvent("asr_error", {
+        session_id: asrState.sessionId || "",
+        code: "network_error",
+      });
+    });
+  } catch (err) {
+    const name = err && err.name ? String(err.name) : "";
+    asrState.permissionState = name === "NotAllowedError" ? "denied" : asrState.permissionState;
+    const msg = name === "NotAllowedError"
+      ? "Microphone access was denied."
+      : "Unable to start voice dictation.";
+    setAsrStatus(msg, { error: true });
+    trackAsrEvent("asr_error", { code: name === "NotAllowedError" ? "permission_denied" : "mic_unavailable" });
+    resetAsrState({ preserveStatus: true });
+  }
+}
+
+if (ASR_ENABLED) {
+  if (!asrState.supported) {
+    setAsrStatus("Voice dictation is not supported in this browser.", { error: true });
+    trackAsrEvent("asr_unsupported", {});
+  }
+  refreshAsrUiState();
+  document.addEventListener("sb:session-selected", () => {
+    if (asrState.isListening || asrState.isProcessing) {
+      stopAsrSession("session_switch");
+    }
+  });
 }
 
 async function responseDetail(rsp, fallback) {
@@ -3323,9 +4013,12 @@ function applySnapshot(snap) {
   runMeta.textContent = `${title ? `${title} · ` : ""}Run ID: ${snap.run_id}`;
   const isDraft = isDraftSnapshot(snap);
   const runActive = !!sid && !isDraft;
-  taskEl.value = String(snap.task || "").slice(0, TASK_MAX_CHARS);
-  updateTaskCharCount();
-  alignTaskTextBottom();
+  if (!asrDraftProtectionActive()) {
+    taskEl.value = String(snap.task || "").slice(0, TASK_MAX_CHARS);
+    updateTaskCharCount();
+    alignTaskTextBottom();
+    updateTaskSelectionSnapshot();
+  }
   setTaskBoxLocked(runActive);
   setRunConfigLocked(runActive);
   if (Number.isFinite(Number(snap.max_depth)) && Number(snap.max_depth) >= 1) {
@@ -4049,17 +4742,19 @@ taskEl.addEventListener("input", () => {
   if (taskEl.value.length > TASK_MAX_CHARS) {
     taskEl.value = taskEl.value.slice(0, TASK_MAX_CHARS);
   }
+  updateTaskSelectionSnapshot();
   updateTaskCharCount();
   alignTaskTextBottom();
   updateLiveIntentFromInput();
   if (currentRunId || startRunInFlight) return;
-  runBtn.disabled = !taskEl.value.trim();
+  refreshStartActionAvailability();
 });
 // Also align on initial load and when value is set programmatically
 requestAnimationFrame(() => {
   alignTaskTextBottom();
   updateTaskCharCount();
   updateLiveIntentFromInput();
+  refreshAsrUiState();
 });
 
 taskEl.addEventListener("keydown", (e) => {
@@ -4067,6 +4762,10 @@ taskEl.addEventListener("keydown", (e) => {
     e.preventDefault();
     if (!e.shiftKey && !runBtn.disabled) runBtn.click();
   }
+});
+
+["select", "click", "keyup", "focus"].forEach((eventName) => {
+  taskEl.addEventListener(eventName, updateTaskSelectionSnapshot);
 });
 
 /* ── Prompt example chips ── */
@@ -4078,7 +4777,7 @@ document.querySelectorAll(".prompt-example-chip").forEach((chip) => {
     updateTaskCharCount();
     alignTaskTextBottom();
     updateLiveIntentFromInput();
-    runBtn.disabled = false;
+    refreshStartActionAvailability();
   });
 });
 
@@ -4096,8 +4795,14 @@ runBtn.addEventListener("click", async () => {
   if (currentRunId || startRunInFlight) {
     return;
   }
+  if (isAsrBusy()) {
+    showTransientError("Wait for voice dictation to finish before starting.");
+    refreshStartActionAvailability();
+    return;
+  }
   startRunInFlight = true;
   runBtn.disabled = true;
+  refreshAsrUiState();
   if (planningActionBtn) {
     planningActionBtn.disabled = true;
   }
@@ -4110,6 +4815,7 @@ runBtn.addEventListener("click", async () => {
     showError(err.message || String(err));
   } finally {
     startRunInFlight = false;
+    refreshAsrUiState();
     if (!currentRunId) {
       switchRunBtnToStart();
       setTaskBoxLocked(false);
@@ -4132,15 +4838,22 @@ if (planningActionBtn) {
     if (currentRunId || startRunInFlight) {
       return;
     }
+    if (isAsrBusy()) {
+      showTransientError("Wait for voice dictation to finish before starting.");
+      refreshStartActionAvailability();
+      return;
+    }
     startRunInFlight = true;
     runBtn.disabled = true;
     planningActionBtn.disabled = true;
+    refreshAsrUiState();
     try {
       await startRun(newIdempotencyKey("start_planning"), "planning");
     } catch (err) {
       showError(err.message || String(err));
     } finally {
       startRunInFlight = false;
+      refreshAsrUiState();
       if (!currentRunId) {
         runBtn.disabled = false;
         planningActionBtn.disabled = false;
@@ -4191,6 +4904,19 @@ reportBtn.addEventListener("click", async () => {
     }
   }
 });
+
+if (asrBtn) {
+  asrBtn.addEventListener("mousedown", () => {
+    updateTaskSelectionSnapshot();
+  });
+  asrBtn.addEventListener("click", async () => {
+    if (asrState.isListening || asrState.isProcessing) {
+      stopAsrSession("user_stop");
+      return;
+    }
+    await startAsrSession();
+  });
+}
 
 if (generateReportBtn) {
   generateReportBtn.addEventListener("click", () => reportBtn.click());

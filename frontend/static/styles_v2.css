@@ -217,6 +217,32 @@ body.sessions-collapsed .auth-box-rail {
   gap: 6px;
   min-height: 24px;
 }
+.asr-status-row {
+  margin-top: 8px;
+  display: grid;
+  gap: 6px;
+}
+.asr-status {
+  font-size: 0.82rem;
+  color: var(--muted);
+  min-height: 18px;
+}
+.asr-status.is-error {
+  color: var(--danger);
+}
+.asr-interim {
+  border: 1px dashed var(--line);
+  border-radius: 10px;
+  background: #fcfcfc;
+  padding: 8px 10px;
+  font-size: 0.86rem;
+  color: var(--ink);
+  line-height: 1.45;
+}
+.asr-notice {
+  font-size: 0.74rem;
+  color: var(--muted);
+}
 .live-intent-chip {
   display: inline-flex;
   align-items: center;
@@ -249,6 +275,31 @@ body.sessions-collapsed .auth-box-rail {
   line-height: 1.4;
   border-radius: 7px;
   white-space: nowrap;
+}
+.asr-btn {
+  min-width: 94px;
+  justify-content: center;
+}
+.asr-btn.hidden {
+  display: none;
+}
+.asr-btn-icon {
+  width: 14px;
+  height: 14px;
+}
+.asr-btn.is-listening {
+  color: #fff;
+  background: #8c3a3a;
+  border-color: #8c3a3a;
+}
+.asr-btn.is-processing {
+  color: var(--ink);
+  background: #efe7d7;
+  border-color: #d1c3a2;
+}
+.asr-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 .run-inline-btn:disabled {
   opacity: 0.5;

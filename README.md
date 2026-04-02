@@ -178,6 +178,13 @@ Allowed web origins:
 - `http://localhost:8000`
 - `https://<your-domain>`
 
+If you access the app through an SSH tunnel for local testing, use the tunneled
+origin consistently for auth as well:
+
+- `http://localhost:8001/auth/callback`
+- `http://localhost:8001/`
+- `http://localhost:8001`
+
 Enable passwordless email OTP:
 
 - Auth0 Dashboard -> Authentication -> Passwordless -> Email
@@ -186,5 +193,15 @@ Enable passwordless email OTP:
 ## Deployment Note
 
 `python run_web.py` is the local entrypoint.
+
+ASR dictation requires two runtime conditions:
+
+- a trusted browser origin for microphone APIs: `https://...` or a local
+  tunneled/dev origin such as `http://localhost:8001`
+- a websocket backend in the Python environment serving the app:
+  `websockets` or `wsproto`
+
+If `asr_enabled` is true and neither websocket backend is installed, the app
+will now fail fast at startup instead of serving a broken dictation button.
 
 The repo also contains a systemd template under `infra/deploy/systemd/`, but your installed stable service may use a separate unit and env file outside the repo. Treat the repo unit as a template, not automatically as the live source of truth.
