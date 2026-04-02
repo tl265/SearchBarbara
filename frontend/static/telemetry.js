@@ -173,6 +173,13 @@
     _sessionId = String(sessionId || "");
   }
 
+  function track(type, fields) {
+    if (!type) return;
+    const evt = Object.assign({}, fields || {});
+    evt.type = String(type);
+    _enqueue(evt);
+  }
+
   // ---- page unload: flush via sendBeacon ----
   global.addEventListener("visibilitychange", function () {
     if (document.visibilityState === "hidden" && _buffer.length > 0) {
@@ -193,6 +200,7 @@
     generateTraceId: generateTraceId,
     trackSSE: trackSSE,
     trackRender: trackRender,
+    track: track,
     setSession: setSession,
     flush: _flush,
   };

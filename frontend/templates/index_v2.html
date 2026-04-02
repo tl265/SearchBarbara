@@ -115,11 +115,33 @@
               <div class="depth-dropdown-option" data-depth="4">4</div>
             </div>
             <input id="maxDepth" type="hidden" value="{{ default_max_depth }}" />
+            <button
+              id="asrBtn"
+              class="depth-dropdown-btn asr-btn hidden"
+              type="button"
+              aria-label="Start voice dictation"
+              aria-pressed="false"
+              title="Voice dictation"
+            >
+              <svg class="asr-btn-icon" viewBox="0 0 24 24" aria-hidden="true">
+                <path d="M12 4a3 3 0 0 0-3 3v5a3 3 0 0 0 6 0V7a3 3 0 0 0-3-3Z" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M7 11a5 5 0 0 0 10 0" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                <path d="M12 16v4M9 20h6" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+              <span class="asr-btn-label">Dictate</span>
+            </button>
             <button id="runBtn" class="primary run-inline-btn">Start</button>
           </div>
         </div>
       </div>
       <div id="liveIntent" class="live-intent hidden" aria-live="polite"></div>
+      <div id="asrStatusRow" class="asr-status-row hidden">
+        <div id="asrStatus" class="asr-status" aria-live="polite"></div>
+        <div id="asrInterim" class="asr-interim hidden"></div>
+        <div id="asrNotice" class="asr-notice hidden">
+          Audio is sent for transcription and not retained by SearchBarbara by default.
+        </div>
+      </div>
       <div class="prompt-examples">
         <button type="button" class="prompt-example-chip">OpenClaw的市场扫描及发展趋势分析</button>
         <button type="button" class="prompt-example-chip">美国主流信用卡积分及权益体系研究</button>
@@ -250,6 +272,16 @@
       live_intent_debounce_ms: {{ live_intent_debounce_ms|tojson }},
       live_intent_confidence_threshold: {{ live_intent_confidence_threshold|tojson }},
       ui_debug: {{ ui_debug|tojson }},
+      asr_enabled: {{ asr_enabled|tojson }},
+      asr_silence_timeout_ms: {{ asr_silence_timeout_ms|tojson }},
+      asr_partial_interval_ms: {{ asr_partial_interval_ms|tojson }},
+      asr_max_session_sec: {{ asr_max_session_sec|tojson }},
+      asr_calibration_ms: {{ asr_calibration_ms|tojson }},
+      asr_speech_start_hold_ms: {{ asr_speech_start_hold_ms|tojson }},
+      asr_speech_end_hold_ms: {{ asr_speech_end_hold_ms|tojson }},
+      asr_speech_threshold_multiplier: {{ asr_speech_threshold_multiplier|tojson }},
+      asr_min_speech_rms: {{ asr_min_speech_rms|tojson }},
+      asr_max_ambient_rms: {{ asr_max_ambient_rms|tojson }},
     };
   </script>
   <div id="reportModal" class="report-modal-overlay hidden">
